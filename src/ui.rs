@@ -1435,20 +1435,20 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         fence_hovered,
         active,
         marquee,
-        wp_for_fence,
         gdi_labels,
     );
     let t_draw = resize_now_ms() - t_draw0;
-    let t_gdi0 = resize_now_ms();
-    if gdi_labels {
-        // GDI ClearType 文字画在 D2D EndDraw 之后、ULW 呈现之前(与 Explorer 同源)
-        render::gdi_draw_labels(surf_ref, &jobs);
-    }
-    let t_gdi = resize_now_ms() - t_gdi0;
     let pos = POINT {
         x: fence.rect.x.round() as i32,
         y: fence.rect.y.round() as i32,
     };
+    let t_gdi0 = resize_now_ms();
+    if let Some(wp) = wp_for_fence {
+        // ink 常驻:以快照为种子烘焙 GDI ClearType 文字,墨水外像素保持
+        // 透明——背景透出实时壁纸,换壁纸时与桌面同帧跟随
+        render::gdi_draw_labels_seeded(surf_ref, &jobs, wp, pos.x, pos.y);
+    }
+    let t_gdi = resize_now_ms() - t_gdi0;
     let t_pres0 = resize_now_ms();
     let ok = render::present_surface(surf_ref, hwnd, pos.x, pos.y);
     let t_pres = resize_now_ms() - t_pres0;
@@ -1575,11 +1575,10 @@ fn warm_renderer_scratch() {
         false,
         false,
         None,
-        wp,
         wp.is_some(),
     );
-    // 空作业时 gdi_draw_labels 会早退,补一个 1 字符作业触发
-    // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化
+    // 空作业时标签绘制会早退,补一个 1 字符作业触发
+    // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
     let warm_job = [render::GdiLabelJob {
         text: "W".into(),
         x: 2.0,
@@ -1587,7 +1586,10 @@ fn warm_renderer_scratch() {
         w: 60.0,
         h: 30.0,
     }];
-    render::gdi_draw_labels(&sf, &warm_job);
+    match wp {
+        Some(w) => render::gdi_draw_labels_seeded(&sf, &warm_job, w, 0, 0),
+        None => render::gdi_draw_labels(&sf, &warm_job),
+    }
     render::release_surface(sf);
     log(&format!("boot renderer warm-up took {}ms", resize_now_ms() - t0));
 }

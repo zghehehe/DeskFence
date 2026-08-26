@@ -454,6 +454,166 @@ pub fn gdi_draw_labels(s: &Surface, jobs: &[GdiLabelJob]) {
     }
 }
 
+/// ink 常驻精确模式:在透明表面的标签矩形上烘焙 GDI ClearType 文字。
+/// 过程(与旧精确模式同渲染器、同参数,输出逐位同源):
+/// 1) 把矩形内像素垫成"真实背景色"种子 = 表面覆盖层预乘色 P 合成到
+///    不透明快照壁纸色 W 上(P + W*(1-a),即 hover/选中/边框压在壁纸上的
+///    straight 结果——与旧模式 D2D 先把覆盖层画到不透明壁纸底上完全等价);
+/// 2) 用同一 DrawShadowText/ClearType 对种子画字(边缘色与原生同源);
+/// 3) RGB 与种子有差异的像素=墨水,置 alpha=255;其余像素恢复垫种子前
+///    的原状(透明底+覆盖层)——背景透出实时壁纸。
+/// 壁纸切换期间种子暂为旧快照(墨水边缘色停在旧底色版本),与原生过渡
+/// 期行为一致;快照重捕获完成后 refresh 即换新种子。
+/// fence_x/fence_y 为栅栏呈现位置(与 present 的取整一致),用于把
+/// 标签矩形映射到快照坐标系。
+pub fn gdi_draw_labels_seeded(
+    s: &Surface,
+    jobs: &[GdiLabelJob],
+    wp: &WallpaperPixels,
+    fence_x: i32,
+    fence_y: i32,
+) {
+    if jobs.is_empty() {
+        return;
+    }
+    let Some(lf) = shell::icon_title_logfont() else {
+        return;
+    };
+    let shadow_fn = draw_shadow_text_proc();
+    let sw = s.w as usize;
+    let sh = s.h as usize;
+    if s.bits.is_null() || sw == 0 || sh == 0 {
+        return;
+    }
+    unsafe {
+        let hf = CreateFontIndirectW(&lf as *const _);
+        if hf.is_invalid() {
+            return;
+        }
+        let old = SelectObject(s.dc, HGDIOBJ(hf.0));
+        let old_bk: i32 = SetBkMode(s.dc, TRANSPARENT);
+        let fmt = DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let flags = fmt.0;
+        let bits = std::slice::from_raw_parts_mut(s.bits as *mut u8, sw * sh * 4);
+        for job in jobs {
+            let w16 = shell::wide(&job.text);
+            if w16.len() <= 1 {
+                continue;
+            }
+            let rc = RECT {
+                left: job.x.round() as i32,
+                top: job.y.round() as i32,
+                right: (job.x + job.w).round() as i32,
+                bottom: (job.y + job.h).round() as i32,
+            };
+            if rc.right <= rc.left || rc.bottom <= rc.top {
+                continue;
+            }
+            let text = &w16[..w16.len() - 1];
+            let x0 = rc.left.max(0) as usize;
+            let y0 = rc.top.max(0) as usize;
+            let x1 = (rc.right as usize).min(sw);
+            let y1 = (rc.bottom as usize).min(sh);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let rw = x1 - x0;
+            let rh = y1 - y0;
+            let mut pre: Vec<u8> = vec![0u8; rw * rh * 4];
+            let mut seed: Vec<u8> = vec![0u8; rw * rh * 4];
+            // 垫种子:pre=垫前原状(预乘),seed=覆盖层合成到壁纸上的 straight 色
+            for yy in 0..rh {
+                let srow = (y0 + yy) * sw + x0;
+                let wy = fence_y + (y0 + yy) as i32 - wp.origin_y;
+                for xx in 0..rw {
+                    let so = (srow + xx) * 4;
+                    let po = (yy * rw + xx) * 4;
+                    pre[po] = bits[so];
+                    pre[po + 1] = bits[so + 1];
+                    pre[po + 2] = bits[so + 2];
+                    pre[po + 3] = bits[so + 3];
+                    // 快照壁纸色(直色);栅栏超出快照覆盖范围按黑
+                    let wx = fence_x + (x0 + xx) as i32 - wp.origin_x;
+                    let (wb, wg, wr) = if wx >= 0
+                        && wy >= 0
+                        && (wx as u32) < wp.w
+                        && (wy as u32) < wp.h
+                    {
+                        let wo = ((wy as u32 * wp.w + wx as u32) * 4) as usize;
+                        (wp.px[wo], wp.px[wo + 1], wp.px[wo + 2])
+                    } else {
+                        (0u8, 0u8, 0u8)
+                    };
+                    let inv = 255 - pre[po + 3] as u32;
+                    let sb = (pre[po] as u32 + (wb as u32 * inv + 127) / 255).min(255) as u8;
+                    let sg = (pre[po + 1] as u32 + (wg as u32 * inv + 127) / 255).min(255) as u8;
+                    let sr2 = (pre[po + 2] as u32 + (wr as u32 * inv + 127) / 255).min(255) as u8;
+                    seed[po] = sb;
+                    seed[po + 1] = sg;
+                    seed[po + 2] = sr2;
+                    seed[po + 3] = 255;
+                    bits[so] = sb;
+                    bits[so + 1] = sg;
+                    bits[so + 2] = sr2;
+                    bits[so + 3] = 255;
+                }
+            }
+            if let Some(draw) = shadow_fn {
+                // 原生桌面图标名:白字 + 1px 偏移黑色阴影(高字节=阴影不透明度,约 55%)
+                let _ = draw(
+                    s.dc,
+                    text.as_ptr(),
+                    text.len() as i32,
+                    &rc,
+                    flags,
+                    COLORREF(0x00FF_FFFF),
+                    COLORREF(0x8C00_0000),
+                    1,
+                    1,
+                );
+            } else {
+                // 降级(无 comctl32 v6):黑色偏移一遍 + 白色正文一遍
+                let mut shifted = RECT {
+                    left: rc.left + 1,
+                    top: rc.top + 1,
+                    right: rc.right + 1,
+                    bottom: rc.bottom + 1,
+                };
+                let mut main_rc = rc;
+                let mut buf = text.to_vec();
+                SetTextColor(s.dc, COLORREF(0x0000_0000));
+                let _ = DrawTextW(s.dc, &mut buf, &mut shifted, fmt);
+                let mut buf2 = text.to_vec();
+                SetTextColor(s.dc, COLORREF(0x00FF_FFFF));
+                let _ = DrawTextW(s.dc, &mut buf2, &mut main_rc, fmt);
+            }
+            // 墨水判定与还原:RGB 偏离种子=GDI 画过的像素,置不透明;
+            // 其余像素恢复垫种子前的原状(保住 1/255 隐形底与覆盖层的命中/观感)
+            for yy in 0..rh {
+                let srow = (y0 + yy) * sw + x0;
+                for xx in 0..rw {
+                    let so = (srow + xx) * 4;
+                    let po = (yy * rw + xx) * 4;
+                    if bits[so] != seed[po]
+                        || bits[so + 1] != seed[po + 1]
+                        || bits[so + 2] != seed[po + 2]
+                    {
+                        bits[so + 3] = 255;
+                    } else {
+                        bits[so] = pre[po];
+                        bits[so + 1] = pre[po + 1];
+                        bits[so + 2] = pre[po + 2];
+                        bits[so + 3] = pre[po + 3];
+                    }
+                }
+            }
+        }
+        SetBkMode(s.dc, BACKGROUND_MODE(old_bk as u32));
+        SelectObject(s.dc, old);
+        let _ = DeleteObject(HGDIOBJ(hf.0));
+    }
+}
+
 /// 图标像素缓存。主路径按目标物理像素直接向 Shell 请求原生 bitmap；
 /// 旧 HICON 路径仅作兼容降级，避免低分辨率图标被强制放大。
 pub fn get_icon_buffer(
@@ -499,8 +659,11 @@ pub static ICON_EXTRACT_COUNT: std::sync::atomic::AtomicU64 =
 
 /// 绘制整个栅栏到表面。
 /// 默认完全透明(与原生桌面一致);悬停或拖动时浮现极淡卡片与标题/滚动条等 chrome。
-/// 精确模式(wallpaper=Some):底为不透明壁纸裁剪,gdi_labels=true 时图标名不在
-/// D2D 里画,而是收集为作业返回,由调用方在 EndDraw 后用 GDI ClearType 绘制。
+/// ink 常驻渲染(2026-08-26):栅栏背景不再烙壁纸快照,而是铺 1/255 隐形底
+/// (ULW 按逐像素 alpha 命中,保证鼠标可点)——真壁纸从窗口底下逐帧透出,
+/// 换壁纸时背景与桌面同帧跟随(DWM 合成),栅栏无需任何"换底"动作。
+/// gdi_labels=true 时图标名仍收集为作业,由调用方在 EndDraw 后用
+/// gdi_draw_labels_seeded 以快照"种子"现场烘焙 GDI ClearType。
 #[allow(clippy::too_many_arguments)]
 pub fn draw_fence(
     rt: &ID2D1DCRenderTarget,
@@ -516,7 +679,6 @@ pub fn draw_fence(
     fence_hovered: bool,
     active: bool,
     marquee: Option<(f32, f32, f32, f32)>,
-    wallpaper: Option<&WallpaperPixels>,
     gdi_labels: bool,
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
@@ -527,67 +689,20 @@ pub fn draw_fence(
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
 
         // 原生桌面外观:默认(未悬停/未激活)底色/标题完全隐藏,只显示图标本身;
-        // 但保留一条极淡的 1px 边框,让用户能找到栅栏边界和上下左右拖拽调整大小的热区。
+        // 但保留一条极淡的 1px 边框,让用户能找到栅栏边界和上下左右拖拽调整大小热区。
         // 悬停时浮现稍清晰的轮廓,便于辨认分区。
         // 关键:分层窗口按逐像素 alpha 做命中测试,alpha=0 的区域会点击穿透,
         // 因此整个栅栏矩形必须铺一层 alpha=1/255 的"不可见底"(视觉无感知,但鼠标可命中)。
-
-        let mut has_wp = false;
-        if let Some(wp) = wallpaper {
-            // 精确模式:贴"背后壁纸"的不透明裁剪(与屏幕同像素)
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            let size = D2D_SIZE_U {
-                width: wp.w,
-                height: wp.h,
-            };
-            if let Ok(bmp) =
-                rt.CreateBitmap(size, Some(wp.px.as_ptr() as *const _), wp.w * 4, &props)
-            {
-                let sx = (fence.rect.x.round() as i32 - wp.origin_x).max(0);
-                let sy = (fence.rect.y.round() as i32 - wp.origin_y).max(0);
-                let dw = (w as i32).min(wp.w as i32 - sx).max(0);
-                let dh = (h as i32).min(wp.h as i32 - sy).max(0);
-                if dw > 0 && dh > 0 {
-                    if dw < w as i32 || dh < h as i32 {
-                        // 栅栏超出壁纸覆盖范围:超出部分用不透明深色兜底
-                        // (GDI 阶段整面置 alpha=255,不能用 1/255 隐形底)
-                        if let Some(bg) = brush(rt, &color(0.10, 0.11, 0.13, 1.0)) {
-                            rt.FillRectangle(&rect(0.0, 0.0, w, h), as_brush(&bg));
-                        }
-                    }
-                    let src = rect(sx as f32, sy as f32, (sx + dw) as f32, (sy + dh) as f32);
-                    rt.DrawBitmap(
-                        &bmp,
-                        Some(&rect(0.0, 0.0, dw as f32, dh as f32)),
-                        1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                        Some(&src),
-                    );
-
-                    has_wp = true;
-                }
-            }
-        }
-        if !has_wp {
-            // 透明模式:铺不可见底(视觉无感知,但鼠标可命中)
-            if let Some(bg) = brush(
-                rt,
-                &if r.light {
-                    color(1.0, 1.0, 1.0, 1.0 / 255.0)
-                } else {
-                    color(0.0, 0.0, 0.0, 1.0 / 255.0)
-                },
-            ) {
-                let rr = rounded(rect(0.0, 0.0, w, h), 7.0);
-                rt.FillRoundedRectangle(&rr, as_brush(&bg));
-            }
+        if let Some(bg) = brush(
+            rt,
+            &if r.light {
+                color(1.0, 1.0, 1.0, 1.0 / 255.0)
+            } else {
+                color(0.0, 0.0, 0.0, 1.0 / 255.0)
+            },
+        ) {
+            let rr = rounded(rect(0.0, 0.0, w, h), 7.0);
+            rt.FillRoundedRectangle(&rr, as_brush(&bg));
         }
         let show_chrome = fence_hovered || active;
         let border = if r.light {
