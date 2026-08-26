@@ -147,35 +147,11 @@ fn rebuild_pins() {
     model::rebuild_pinned_registry(&s.fences);
 }
 
-/// 检测第三方动态壁纸(壁纸层 WorkerW 是否被注入):
-/// 正常桌面 SHELLDLL_DefView 的父窗口是 Progman;动态壁纸程序会把渲染窗口
-/// 插进壁纸层,使 DefView 的父窗口变成 WorkerW —— 精确模式此时自动降级。
-fn dynamic_wallpaper_active() -> bool {
-    let Some(lv) = desktop_listview() else {
-        return false;
-    };
-    unsafe {
-        let dv = GetParent(lv);
-        if dv.0 == 0 {
-            return false;
-        }
-        let parent = GetParent(dv);
-        if parent.0 == 0 {
-            return false;
-        }
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(parent, &mut buf);
-        if n <= 0 {
-            return false;
-        }
-        let name = String::from_utf16_lossy(&buf[..n as usize]);
-        name.eq_ignore_ascii_case("WorkerW")
-    }
-}
-
-/// 精确模式是否生效(用户开启 且 未检测到动态壁纸 且 壁纸捕获成功)
+/// 精确模式是否生效(用户开启)。动态壁纸检测已退役(2026-08-26):ink 常驻
+/// 后背景实时透出、阴影背景无关,动态壁纸不再构成降级理由;两模式共用同一
+/// 条 seeded 文字管线,区别仅剩启动守卫(精确模式等首帧种子就绪再呈现)。
 pub fn precise_mode_on() -> bool {
-    render_mode() == "precise" && !dynamic_wallpaper_active()
+    render_mode() == "precise"
 }
 
 const TIMER_GLOBAL: usize = 1;
@@ -2008,11 +1984,11 @@ pub fn startup() {
     {
         let _ = auto_category(); // 预热开关(读设置文件)
     }
-    // 精确模式首帧壁纸来源:优先加载持久化缓存(快,且免去"原生图标可见时
-    // 现场捕获"的残影/闪烁问题);无缓存(首次运行)才同步暖场捕获
-    // (最多重试 ~0.5s,捕获期间临时隐藏原生图标防残影)。暖场失败不计入
-    // 稳态回退计数;后续由 200ms 追赶定时器接管直至成功。
-    if render_mode() == "precise" {
+    // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载
+    // 持久化缓存(快,且免去"原生图标可见时现场捕获"的残影/闪烁问题);无缓存
+    // (首次运行)才同步暖场捕获(最多重试 ~0.5s,捕获期间临时隐藏原生图标防
+    // 残影)。暖场失败不计入稳态回退计数;后续由 200ms 追赶定时器接管直至成功。
+    {
         let cached = load_wallpaper_cache();
         let mut tries = 0u32;
         let mut ok = false;
@@ -2214,10 +2190,11 @@ fn global_tick() {
     }
     reconcile_desktop_icons();
     sync_icon_size();
-    // 精确模式守护:配置为精确但环境不允许时,真正切回透明并落盘——
-    // 托盘/桌面菜单的"渲染模式"勾选随之落到"透明",用户能清楚看到回退发生了
+    // 精确模式守护:捕获反复失败(无任何可用快照)时真正切回透明并落盘——
+    // 托盘/桌面菜单的"渲染模式"勾选随之落到"透明",用户能清楚看到回退发生了。
+    // (动态壁纸强制回退已退役 2026-08-26:统一 seeded 渲染后背景/阴影不再
+    // 依赖快照新鲜度,降级没有意义且会静默改写用户配置。)
     if render_mode() == "precise" {
-        let dynamic = dynamic_wallpaper_active();
         // 捕获失败回退带双重保险:必须"当前没有任何可用快照"(有旧快照就继续用,
         // 等 10min 兜底/事件重试恢复)且失败计数达阈值且过了 10s 启动宽限——
         // 登录早期/壁纸切换过渡期的瞬态失败绝不能把"精确"误落盘成"透明"
@@ -2229,17 +2206,15 @@ fn global_tick() {
                     && resize_now_ms() > 10_000
             })
             .unwrap_or(false);
-        if dynamic {
-            set_render_mode("transparent");
-            log("precise mode: dynamic wallpaper detected -> fallback to transparent");
-        } else if capture_failed {
+        if capture_failed {
             set_render_mode("transparent");
             log("precise mode: wallpaper capture failed repeatedly -> fallback to transparent");
         }
     }
-    // 精确模式:壁纸跟随。快照到期时重捕获,内容有变(带容差:捕获亮度
-    // 有 ~4% 时序波动,严格比较会引发无谓全量重绘=闪)才刷新栅栏。
-    if precise_mode_on() && t % 3 == 0 {
+    // 壁纸跟随(两模式共用,2026-08-26 起透明模式同样需要快照作文字种子)。
+    // 快照到期时重捕获,内容有变(带容差:捕获亮度有 ~4% 时序波动,严格比较
+    // 会引发无谓全量重绘=闪)才刷新栅栏。
+    if t % 3 == 0 {
         let changed = {
             let mut s = state().lock().unwrap();
             if s.wallpapers.is_empty() {
@@ -2255,7 +2230,8 @@ fn global_tick() {
     // 填充模式)。幻灯片轮换时注册表与 TranscodedWallpaper 缓存都可能不更新
     // (实测本机换壁纸不写该目录),但 GetWallpaper 反映当前帧。1s 一次纯
     // COM 字符串比较,开销可忽略;变化即触发"捕获-比对-重绘"跟随。
-    if precise_mode_on() {
+    // (两模式共用:透明模式也要种子)
+    {
         match shell::wallpaper_signature() {
             Some(sig) => {
                 let mut last = WALLPAPER_SIG.lock().unwrap();
@@ -5589,11 +5565,9 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         }
                     }
                     drop(s);
-                    if precise_mode_on() {
-                        refresh_fence(fence_id);
-                    } else {
-                        present_fence_only(fence_id);
-                    }
+                    // 两模式统一(2026-08-26):透明模式同样用快照种子,栅栏
+                    // 移动到新壁纸区域必须重渲染(重新取该处壁纸作种子)
+                    refresh_fence(fence_id);
                     update_guides(None, None);
                     return;
                 }
