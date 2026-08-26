@@ -22,8 +22,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_GDI_CLASSIC, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
+    DWRITE_MEASURING_MODE_GDI_CLASSIC,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -375,85 +374,6 @@ fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
     })
 }
 
-/// 精确模式:在表面 DC 上用 GDI 绘制图标名——与 Explorer 桌面(ListView)
-/// 同一 LOGFONT、同一 DrawShadowText 路径,ClearType 子像素渲染,输出逐位一致。
-/// GDI 不写 alpha,画完把整面 alpha 置 255(精确模式整窗不透明,颜色已是合成结果)。
-pub fn gdi_draw_labels(s: &Surface, jobs: &[GdiLabelJob]) {
-    if jobs.is_empty() {
-        return;
-    }
-    let Some(lf) = shell::icon_title_logfont() else {
-        return;
-    };
-    let shadow_fn = draw_shadow_text_proc();
-    unsafe {
-        let hf = CreateFontIndirectW(&lf as *const _);
-        if hf.is_invalid() {
-            return;
-        }
-        let old = SelectObject(s.dc, HGDIOBJ(hf.0));
-        let old_bk: i32 = SetBkMode(s.dc, TRANSPARENT);
-        let fmt = DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS | DT_NOPREFIX;
-        let flags = fmt.0;
-        for job in jobs {
-            let w16 = shell::wide(&job.text);
-            if w16.len() <= 1 {
-                continue;
-            }
-            let rc = RECT {
-                left: job.x.round() as i32,
-                top: job.y.round() as i32,
-                right: (job.x + job.w).round() as i32,
-                bottom: (job.y + job.h).round() as i32,
-            };
-            if rc.right <= rc.left || rc.bottom <= rc.top {
-                continue;
-            }
-            let text = &w16[..w16.len() - 1];
-            if let Some(draw) = shadow_fn {
-                // 原生桌面图标名:白字 + 1px 偏移黑色阴影(高字节=阴影不透明度,约 55%)
-                let _ = draw(
-                    s.dc,
-                    text.as_ptr(),
-                    text.len() as i32,
-                    &rc,
-                    flags,
-                    COLORREF(0x00FF_FFFF),
-                    COLORREF(0x8C00_0000),
-                    1,
-                    1,
-                );
-            } else {
-                // 降级(无 comctl32 v6):黑色偏移一遍 + 白色正文一遍
-                let mut shifted = RECT {
-                    left: rc.left + 1,
-                    top: rc.top + 1,
-                    right: rc.right + 1,
-                    bottom: rc.bottom + 1,
-                };
-                let mut main_rc = rc;
-                let mut buf = text.to_vec();
-                SetTextColor(s.dc, COLORREF(0x0000_0000));
-                let _ = DrawTextW(s.dc, &mut buf, &mut shifted, fmt);
-                let mut buf2 = text.to_vec();
-                SetTextColor(s.dc, COLORREF(0x00FF_FFFF));
-                let _ = DrawTextW(s.dc, &mut buf2, &mut main_rc, fmt);
-            }
-        }
-        SetBkMode(s.dc, BACKGROUND_MODE(old_bk as u32));
-        SelectObject(s.dc, old);
-        let _ = DeleteObject(HGDIOBJ(hf.0));
-        // 整窗不透明:统一置 alpha=255(ULW 预乘格式下 alpha=255 时直乘等价)
-        let n = (s.w as usize) * (s.h as usize) * 4;
-        if !s.bits.is_null() && n > 0 {
-            let bits = std::slice::from_raw_parts_mut(s.bits as *mut u8, n);
-            for px in bits.chunks_exact_mut(4) {
-                px[3] = 255;
-            }
-        }
-    }
-}
-
 /// ink 常驻精确模式:在透明表面的标签矩形上烘焙 GDI ClearType 文字。
 /// 过程(与旧精确模式同渲染器、同参数,输出逐位同源):
 /// 1) 把矩形内像素垫成"真实背景色"种子 = 表面覆盖层预乘色 P 合成到
@@ -469,7 +389,7 @@ pub fn gdi_draw_labels(s: &Surface, jobs: &[GdiLabelJob]) {
 pub fn gdi_draw_labels_seeded(
     s: &Surface,
     jobs: &[GdiLabelJob],
-    wp: &WallpaperPixels,
+    wp: Option<&WallpaperPixels>,
     fence_x: i32,
     fence_y: i32,
 ) {
@@ -524,7 +444,7 @@ pub fn gdi_draw_labels_seeded(
             // 垫种子:pre=垫前原状(预乘),seed=覆盖层合成到壁纸上的 straight 色
             for yy in 0..rh {
                 let srow = (y0 + yy) * sw + x0;
-                let wy = fence_y + (y0 + yy) as i32 - wp.origin_y;
+                let wy = fence_y + (y0 + yy) as i32 - wp.map(|w| w.origin_y).unwrap_or(0);
                 for xx in 0..rw {
                     let so = (srow + xx) * 4;
                     let po = (yy * rw + xx) * 4;
@@ -532,17 +452,19 @@ pub fn gdi_draw_labels_seeded(
                     pre[po + 1] = bits[so + 1];
                     pre[po + 2] = bits[so + 2];
                     pre[po + 3] = bits[so + 3];
-                    // 快照壁纸色(直色);栅栏超出快照覆盖范围按黑
-                    let wx = fence_x + (x0 + xx) as i32 - wp.origin_x;
-                    let (wb, wg, wr) = if wx >= 0
-                        && wy >= 0
-                        && (wx as u32) < wp.w
-                        && (wy as u32) < wp.h
-                    {
-                        let wo = ((wy as u32 * wp.w + wx as u32) * 4) as usize;
-                        (wp.px[wo], wp.px[wo + 1], wp.px[wo + 2])
-                    } else {
-                        (0u8, 0u8, 0u8)
+                    // 快照壁纸色(直色);无快照或超出覆盖范围按黑种子兜底
+                    let wx = fence_x + (x0 + xx) as i32 - wp.map(|w| w.origin_x).unwrap_or(0);
+                    let (wb, wg, wr) = match wp {
+                        Some(w)
+                            if wx >= 0
+                                && wy >= 0
+                                && (wx as u32) < w.w
+                                && (wy as u32) < w.h =>
+                        {
+                            let wo = ((wy as u32 * w.w + wx as u32) * 4) as usize;
+                            (w.px[wo], w.px[wo + 1], w.px[wo + 2])
+                        }
+                        _ => (0u8, 0u8, 0u8),
                     };
                     let inv = 255 - pre[po + 3] as u32;
                     let sb = (pre[po] as u32 + (wb as u32 * inv + 127) / 255).min(255) as u8;
@@ -659,11 +581,12 @@ pub static ICON_EXTRACT_COUNT: std::sync::atomic::AtomicU64 =
 
 /// 绘制整个栅栏到表面。
 /// 默认完全透明(与原生桌面一致);悬停或拖动时浮现极淡卡片与标题/滚动条等 chrome。
-/// ink 常驻渲染(2026-08-26):栅栏背景不再烙壁纸快照,而是铺 1/255 隐形底
+/// ink 常驻渲染(2026-08-26):栅栏背景不烙壁纸快照,铺 1/255 隐形底
 /// (ULW 按逐像素 alpha 命中,保证鼠标可点)——真壁纸从窗口底下逐帧透出,
 /// 换壁纸时背景与桌面同帧跟随(DWM 合成),栅栏无需任何"换底"动作。
-/// gdi_labels=true 时图标名仍收集为作业,由调用方在 EndDraw 后用
-/// gdi_draw_labels_seeded 以快照"种子"现场烘焙 GDI ClearType。
+/// 图标名统一收集为作业,由调用方在 EndDraw 后用 gdi_draw_labels_seeded
+/// 烘焙 GDI ClearType:有快照用真实种子(精确模式,逐位同原生),无快照
+/// 黑种子兜底(透明模式降级态,引擎/几何仍同原生)。
 #[allow(clippy::too_many_arguments)]
 pub fn draw_fence(
     rt: &ID2D1DCRenderTarget,
@@ -679,7 +602,6 @@ pub fn draw_fence(
     fence_hovered: bool,
     active: bool,
     marquee: Option<(f32, f32, f32, f32)>,
-    gdi_labels: bool,
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
     let w = fence.rect.w;
@@ -738,7 +660,7 @@ pub fn draw_fence(
                 let focused = focused_path == Some(item.path.as_str());
                 draw_item(
                     rt, r, item, ix, iy, metrics, icon_cache, hovered, selected, focused, accent,
-                    gdi_labels, &mut jobs,
+                    &mut jobs,
                 );
             }
             if layout.total_rows > layout.rows && show_chrome {
@@ -873,64 +795,6 @@ pub fn trim_to_lines(
     }
     label_cache().lock().unwrap().insert(key, cur.clone());
     cur
-}
-
-/// 图标名标签:与原生桌面一致——平时最多 2 行+省略号;选中时展开(最多 4 行)。
-fn draw_label(
-    rt: &ID2D1DCRenderTarget,
-    txt: &str,
-    fmt: &IDWriteTextFormat,
-    dw: &IDWriteFactory,
-    main: &ID2D1Brush,
-    shadow: &ID2D1Brush,
-    r: D2D_RECT_F,
-    max_lines: u32,
-) {
-    let txt = &trim_to_lines(dw, txt, fmt, r.right - r.left, r.bottom - r.top, max_lines);
-    let w = shell::wide(txt);
-    if w.len() <= 1 {
-        return;
-    }
-    unsafe {
-        // 原生桌面(ListView/GDI)按 GDI 经典度量排字;useGdiNatural=false
-        // 即 GDI_CLASSIC,换行/截断位置与 Explorer 对齐
-        if let Ok(layout) = dw.CreateGdiCompatibleTextLayout(
-            &w[..w.len() - 1],
-            fmt,
-            r.right - r.left,
-            r.bottom - r.top,
-            1.0,
-            None,
-            BOOL(0),
-        ) {
-            // Explorer wraps desktop icon captions at any character boundary
-            // (emergency break), and only trims at word level when the label
-            // truly exceeds two lines.
-            let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK);
-            // Explorer 对图标名是字符级裁剪(词级会整词整词地少显示)
-            let trim = DWRITE_TRIMMING {
-                granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                delimiter: 0,
-                delimiterCount: 0,
-            };
-            let _ = layout.SetTrimming(&trim, None);
-            // Explorer centers desktop icon captions within each icon cell.
-            let _ = layout.SetTextAlignment(
-                windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_CENTER,
-            );
-            // Explorer-style single offset shadow keeps small labels crisp.
-            let origin_shadow = D2D_POINT_2F {
-                x: r.left + 1.0,
-                y: r.top + 1.0,
-            };
-            let _ = rt.DrawTextLayout(origin_shadow, &layout, shadow, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            let origin = D2D_POINT_2F {
-                x: r.left,
-                y: r.top,
-            };
-            let _ = rt.DrawTextLayout(origin, &layout, main, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        }
-    }
 }
 
 /// 绘制对齐参考线到全屏透明 overlay：透明背景 + 竖线(gx)/横线(gy)。
@@ -1321,7 +1185,6 @@ fn draw_item(
     selected: bool,
     focused: bool,
     accent: [f32; 3],
-    gdi_labels: bool,
     jobs: &mut Vec<GdiLabelJob>,
 ) {
     unsafe {
@@ -1420,41 +1283,24 @@ fn draw_item(
             label_top + label_h,
         );
         let txt = display_name(&item.name);
-        if gdi_labels {
-            // 精确模式:截断仍按 GDI 经典度量算好,文字交给 GDI ClearType(DrawShadowText)
-            let trimmed = trim_to_lines(
-                &r.dw,
-                &txt,
-                &r.name_fmt,
-                lr.right - lr.left,
-                lr.bottom - lr.top,
-                max_lines,
-            );
-            jobs.push(GdiLabelJob {
-                text: trimmed,
-                x: lr.left,
-                y: lr.top,
-                w: lr.right - lr.left,
-                h: lr.bottom - lr.top,
-            });
-        } else {
-            // 原生桌面图标名固定为白字+黑阴影(不随系统明暗主题变)
-            let main_c = color(1.0, 1.0, 1.0, 1.0);
-            // 原生 DWM 文字阴影视觉浓度约 50~65%,0.9 的纯黑硬影会明显发糊
-            let shadow_c = color(0.0, 0.0, 0.0, 0.55);
-            if let (Some(t), Some(ts)) = (brush(rt, &main_c), brush(rt, &shadow_c)) {
-                draw_label(
-                    rt,
-                    &txt,
-                    &r.name_fmt,
-                    &r.dw,
-                    as_brush(&t),
-                    as_brush(&ts),
-                    lr,
-                    max_lines,
-                );
-            }
-        }
+        // 文字统一交给 GDI ClearType(DrawShadowText,截断按 GDI 经典度量):
+        // 有快照时用真实壁纸种子(逐位同原生),无快照时黑种子兜底(引擎/几何
+        // 仍与原生一致,仅 ClearType 边缘色近似)。
+        let trimmed = trim_to_lines(
+            &r.dw,
+            &txt,
+            &r.name_fmt,
+            lr.right - lr.left,
+            lr.bottom - lr.top,
+            max_lines,
+        );
+        jobs.push(GdiLabelJob {
+            text: trimmed,
+            x: lr.left,
+            y: lr.top,
+            w: lr.right - lr.left,
+            h: lr.bottom - lr.top,
+        });
     }
 }
 

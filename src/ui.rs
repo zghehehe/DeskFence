@@ -1405,20 +1405,16 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     let active = matches!(&s.drag, Some(d) if d.fence_id == fence_id
         && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
     let marquee = s.marquee;
-    // 精确模式:选出覆盖本栅栏中心的那块壁纸快照
-    let wp_for_fence = if precise {
-        let cx = fence.rect.x + fence.rect.w * 0.5;
-        let cy = fence.rect.y + fence.rect.h * 0.5;
-        s.wallpapers.iter().find(|wp| {
-            cx >= wp.origin_x as f32
-                && cx < (wp.origin_x + wp.w as i32) as f32
-                && cy >= wp.origin_y as f32
-                && cy < (wp.origin_y + wp.h as i32) as f32
-        })
-    } else {
-        None
-    };
-    let gdi_labels = wp_for_fence.is_some();
+    // 种子快照:选出覆盖本栅栏中心的那块壁纸(精确模式必有;透明模式有则
+    // 边缘色更准,无则黑种子兜底——两种渲染模式共用同一条 seeded 文字管线)
+    let cx = fence.rect.x + fence.rect.w * 0.5;
+    let cy = fence.rect.y + fence.rect.h * 0.5;
+    let wp_for_fence = s.wallpapers.iter().find(|wp| {
+        cx >= wp.origin_x as f32
+            && cx < (wp.origin_x + wp.w as i32) as f32
+            && cy >= wp.origin_y as f32
+            && cy < (wp.origin_y + wp.h as i32) as f32
+    });
     let surf_ref = s.surfaces.get(&fence_id).unwrap();
     let t_draw0 = resize_now_ms();
     let jobs = render::draw_fence(
@@ -1435,7 +1431,6 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         fence_hovered,
         active,
         marquee,
-        gdi_labels,
     );
     let t_draw = resize_now_ms() - t_draw0;
     let pos = POINT {
@@ -1443,11 +1438,9 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         y: fence.rect.y.round() as i32,
     };
     let t_gdi0 = resize_now_ms();
-    if let Some(wp) = wp_for_fence {
-        // ink 常驻:以快照为种子烘焙 GDI ClearType 文字,墨水外像素保持
-        // 透明——背景透出实时壁纸,换壁纸时与桌面同帧跟随
-        render::gdi_draw_labels_seeded(surf_ref, &jobs, wp, pos.x, pos.y);
-    }
+    // ink 常驻:统一 seeded GDI ClearType 文字。有快照=真实底色种子(逐位
+    // 同原生),无=黑种子兜底;墨水外像素保持透明,背景透出实时壁纸
+    render::gdi_draw_labels_seeded(surf_ref, &jobs, wp_for_fence, pos.x, pos.y);
     let t_gdi = resize_now_ms() - t_gdi0;
     let t_pres0 = resize_now_ms();
     let ok = render::present_surface(surf_ref, hwnd, pos.x, pos.y);
@@ -1462,9 +1455,9 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         let first_ever = BOOT_FIRST_PRESENT.swap(false, Ordering::Relaxed);
         if first_ever {
             log(&format!(
-                "boot first fence presented (id={}, gdi_labels={}, {}ms)",
+                "boot first fence presented (id={}, seeded={}, {}ms)",
                 fence_id,
-                gdi_labels,
+                wp_for_fence.is_some(),
                 resize_now_ms()
             ));
         }
@@ -1575,7 +1568,6 @@ fn warm_renderer_scratch() {
         false,
         false,
         None,
-        wp.is_some(),
     );
     // 空作业时标签绘制会早退,补一个 1 字符作业触发
     // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
@@ -1586,10 +1578,7 @@ fn warm_renderer_scratch() {
         w: 60.0,
         h: 30.0,
     }];
-    match wp {
-        Some(w) => render::gdi_draw_labels_seeded(&sf, &warm_job, w, 0, 0),
-        None => render::gdi_draw_labels(&sf, &warm_job),
-    }
+    render::gdi_draw_labels_seeded(&sf, &warm_job, wp, 0, 0);
     render::release_surface(sf);
     log(&format!("boot renderer warm-up took {}ms", resize_now_ms() - t0));
 }
