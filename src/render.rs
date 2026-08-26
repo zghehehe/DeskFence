@@ -655,16 +655,41 @@ pub fn draw_fence(
             rt.FillRoundedRectangle(&rr, as_brush(&bg));
         }
         let show_chrome = fence_hovered || active;
-        let border = if r.light {
-            color(0.08, 0.09, 0.12, if show_chrome { 0.30 } else { 0.14 })
-        } else {
-            color(1.0, 1.0, 1.0, if show_chrome { 0.34 } else { 0.16 })
-        };
-        if let Some(b) = brush(rt, &border) {
-            let rr = rounded(rect(0.5, 0.5, w - 0.5, h - 0.5), 7.0);
-            rt.DrawRoundedRectangle(&rr, as_brush(&b), 1.0, None);
-        }
+        // 无边框常显(2026-08-26):默认完全隐身,悬停/拖拽时才浮现边框+四角
+        // 手柄+标题。命中与缩放热区均为位置判定,不受边框可见性影响;悬停
+        // 信号复用 fence_hover(400ms 延迟提交,与"关菜单闪屏"修复同源保护)。
         if show_chrome {
+            let border = if r.light {
+                color(0.08, 0.09, 0.12, 0.30)
+            } else {
+                color(1.0, 1.0, 1.0, 0.34)
+            };
+            if let Some(b) = brush(rt, &border) {
+                let rr = rounded(rect(0.5, 0.5, w - 0.5, h - 0.5), 7.0);
+                rt.DrawRoundedRectangle(&rr, as_brush(&b), 1.0, None);
+            }
+            // 四角 L 形手柄:提示角部可拖拽缩放(分栏控件惯例),物理像素对齐
+            let handle = if r.light {
+                color(0.08, 0.09, 0.12, 0.55)
+            } else {
+                color(1.0, 1.0, 1.0, 0.62)
+            };
+            if let Some(hb) = brush(rt, &handle) {
+                let len = 8.0 * metrics.scale;
+                let t = metrics.scale.max(1.0);
+                // 左上
+                rt.FillRectangle(&rect(0.5, 0.5, len, 0.5 + t), as_brush(&hb));
+                rt.FillRectangle(&rect(0.5, 0.5, 0.5 + t, len), as_brush(&hb));
+                // 右上
+                rt.FillRectangle(&rect(w - len, 0.5, w - 0.5, 0.5 + t), as_brush(&hb));
+                rt.FillRectangle(&rect(w - 0.5 - t, 0.5, w - 0.5, len), as_brush(&hb));
+                // 左下
+                rt.FillRectangle(&rect(0.5, h - 0.5 - t, len, h - 0.5), as_brush(&hb));
+                rt.FillRectangle(&rect(0.5, h - len, 0.5 + t, h - 0.5), as_brush(&hb));
+                // 右下
+                rt.FillRectangle(&rect(w - len, h - 0.5 - t, w - 0.5, h - 0.5), as_brush(&hb));
+                rt.FillRectangle(&rect(w - 0.5 - t, h - len, w - 0.5, h - 0.5), as_brush(&hb));
+            }
             let fill = if r.light {
                 color(1.0, 1.0, 1.0, 0.10)
             } else {
