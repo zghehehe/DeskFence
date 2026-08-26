@@ -361,6 +361,9 @@ struct UiState {
     pub wallpaper_ms: u64,
     /// 壁纸捕获连续失败次数(≥2 触发精确模式自动回退透明)
     pub wallpaper_fails: u32,
+    /// 壁纸已失效待重捕获的时刻(0=无待办)。ink 常驻后快照只作文字种子,
+    /// 重捕获走"懒化"路径:淡入结束+足够安静才执行,不与用户交互赛跑
+    pub wallpaper_dirty_since: u64,
 }
 
 fn state() -> &'static Mutex<UiState> {
@@ -406,6 +409,7 @@ fn state() -> &'static Mutex<UiState> {
             wallpapers: Vec::new(),
             wallpaper_ms: 0,
             wallpaper_fails: 0,
+            wallpaper_dirty_since: 0,
         })
     })
 }
@@ -996,7 +1000,19 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
     // 交互刚结束:推迟捕获。PrintWindow 会强制桌面宿主重绘,宿主在前台
     // 切换后的未稳定态下重绘会产生 ±4% 的亮度跳变(用户看到的"点桌面/
     // 关菜单后闪一下");稳态下的重绘无感。保持哨兵让下一个 tick 再试。
-    if now.saturating_sub(LAST_INTERACTION_MS.load(Ordering::Relaxed)) < 2500 {
+    //
+    // 换壁纸后的重捕获懒化(2026-08-26):ink 常驻后快照只作文字种子,
+    // 背景已实时透出,捕获没有抢时间的必要;而宿主颜色状态刚被壁纸切换
+    // 重建,过早强制重绘会闪(用户"换壁纸后几秒内点击闪一下")。要求
+    // 距壁纸失效>1.5s(DWM 淡入结束)且>5s 无交互才捕获;常规场景维持
+    // 2.5s 推移不变。阴影已墨水化,种子晚到没有视觉代价。
+    let dirty = s.wallpaper_dirty_since != 0;
+    if dirty && now.saturating_sub(s.wallpaper_dirty_since) < 1500 {
+        s.wallpaper_ms = 0;
+        return false;
+    }
+    let quiet_ms = if dirty { 5000 } else { 2500 };
+    if now.saturating_sub(LAST_INTERACTION_MS.load(Ordering::Relaxed)) < quiet_ms {
         s.wallpaper_ms = 0;
         return false;
     }
@@ -1073,6 +1089,7 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
         false
     } else {
         s.wallpaper_fails = 0;
+        s.wallpaper_dirty_since = 0; // 懒捕获任务完成:种子已就绪
         let changed = wallpaper_content_changed(&s.wallpapers, &caps);
         s.wallpapers = caps;
         if changed {
@@ -1221,6 +1238,7 @@ fn invalidate_wallpaper() {
     if let Ok(mut s) = state().try_lock() {
         s.wallpaper_ms = 0;
         s.wallpaper_fails = 0;
+        s.wallpaper_dirty_since = resize_now_ms();
     }
     arm_wallpaper_catchup();
     arm_wallpaper_follow();

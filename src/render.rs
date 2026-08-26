@@ -509,23 +509,51 @@ pub fn gdi_draw_labels_seeded(
                 SetTextColor(s.dc, COLORREF(0x00FF_FFFF));
                 let _ = DrawTextW(s.dc, &mut buf2, &mut main_rc, fmt);
             }
-            // 墨水判定与还原:RGB 偏离种子=GDI 画过的像素,置不透明;
-            // 其余像素恢复垫种子前的原状(保住 1/255 隐形底与覆盖层的命中/观感)
+            // 墨水判定与还原,分三类(2026-08-26 阴影墨水化):
+            // 1) RGB==种子:未画到 → 恢复垫种子前的原状(隐形底/覆盖层);
+            // 2) RGB 全通道变暗:阴影像素(纯黑按覆盖率压暗) → 反推覆盖率
+            //    c=1-D/S,输出"纯黑+c"的背景无关墨水(叠加表面覆盖层贡献)。
+            //    覆盖率与种子取值无关——旧种子提取的覆盖率先行正确,换壁纸
+            //    瞬间阴影即精确,重烘焙时阴影不再变化(消除"1s 后阴影跳变");
+            // 3) 其余(变亮/混合):字形墨水(白字+ClearType 边缘需要底色
+            //    知识) → 保持烘焙 alpha=255;重烘焙仅 1px 边缘换色,不可感知。
             for yy in 0..rh {
                 let srow = (y0 + yy) * sw + x0;
                 for xx in 0..rw {
                     let so = (srow + xx) * 4;
                     let po = (yy * rw + xx) * 4;
-                    if bits[so] != seed[po]
-                        || bits[so + 1] != seed[po + 1]
-                        || bits[so + 2] != seed[po + 2]
-                    {
-                        bits[so + 3] = 255;
-                    } else {
+                    let db = bits[so] as i32;
+                    let dg = bits[so + 1] as i32;
+                    let dr = bits[so + 2] as i32;
+                    let sb = seed[po] as i32;
+                    let sg = seed[po + 1] as i32;
+                    let sr = seed[po + 2] as i32;
+                    if db == sb && dg == sg && dr == sr {
                         bits[so] = pre[po];
                         bits[so + 1] = pre[po + 1];
                         bits[so + 2] = pre[po + 2];
                         bits[so + 3] = pre[po + 3];
+                        continue;
+                    }
+                    if db < sb && dg < sg && dr < sr {
+                        // 阴影:覆盖率反推(三通道平均,黑色阴影逐通道一致;
+                        // db<sb 已保证 S>=1 无除零)
+                        let cov = ((1.0 - db as f32 / sb as f32)
+                            + (1.0 - dg as f32 / sg as f32)
+                            + (1.0 - dr as f32 / sr as f32))
+                            / 3.0;
+                        let a = (cov.clamp(0.0, 1.0) * 255.0).round() as u32;
+                        // 墨水叠在表面覆盖层之上:保留其贡献
+                        // premult_out = P*(1-c);alpha_out = 1-(1-a_p)(1-c)
+                        let inv = 255 - a;
+                        let pa = pre[po + 3] as u32;
+                        let out_a = 255 - (255 - pa) * inv / 255;
+                        bits[so] = (pre[po] as u32 * inv / 255) as u8;
+                        bits[so + 1] = (pre[po + 1] as u32 * inv / 255) as u8;
+                        bits[so + 2] = (pre[po + 2] as u32 * inv / 255) as u8;
+                        bits[so + 3] = out_a as u8;
+                    } else {
+                        bits[so + 3] = 255;
                     }
                 }
             }
