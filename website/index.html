@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeskFence 桌面整理 — 像素级还原原生的桌面栅栏</title>
+<style>
+:root{
+  --ink:#0d1424; --ink2:#151f38; --paper:#f7f9fd; --line:#e4e9f4;
+  --brand:#4f6ef7; --brand2:#7c5cf6; --txt:#1c2444; --dim:#5a6682; --accent:#e8313f;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font:16px/1.75 "Microsoft YaHei","Segoe UI",system-ui,sans-serif;color:var(--txt);background:var(--paper)}
+a{color:inherit;text-decoration:none}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 34px;border-radius:12px;font-size:17px;font-weight:600;transition:.2s}
+.btn.primary{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;box-shadow:0 10px 30px rgba(79,110,247,.35)}
+.btn.primary:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(79,110,247,.45)}
+.btn.ghost{border:1.5px solid #c8d3f0;color:var(--txt)}
+.btn.ghost:hover{border-color:var(--brand);color:var(--brand)}
+/* nav */
+nav{position:sticky;top:0;z-index:50;background:rgba(247,249,253,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;height:64px;gap:36px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:20px}
+.logo .mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:900}
+nav .links{display:flex;gap:28px;margin-left:auto;font-size:15px;color:var(--dim)}
+nav .links a:hover{color:var(--brand)}
+nav .btn{padding:9px 22px;font-size:15px;border-radius:9px}
+/* hero */
+header{background:radial-gradient(1200px 600px at 70% -10%,#dfe8ff 0%,transparent 60%),linear-gradient(180deg,#eef2fd 0%,var(--paper) 100%);padding:88px 0 64px}
+.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:56px;align-items:center}
+.kicker{display:inline-flex;align-items:center;gap:8px;font-size:13.5px;color:var(--brand);background:#e8edff;border:1px solid #d4defc;padding:6px 14px;border-radius:999px;font-weight:600;margin-bottom:18px}
+h1{font-size:44px;line-height:1.25;letter-spacing:-.5px;margin-bottom:18px}
+h1 em{font-style:normal;background:linear-gradient(120deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:18px;color:var(--dim);margin-bottom:30px;max-width:34em}
+.cta{display:flex;gap:14px;align-items:center;margin-bottom:22px}
+.meta{font-size:13.5px;color:#8a94ad;display:flex;gap:18px;flex-wrap:wrap}
+.hero-shot{position:relative}
+.hero-shot img{width:100%;border-radius:16px;box-shadow:0 30px 80px rgba(20,32,80,.25);border:1px solid #dfe5f2}
+.float{position:absolute;background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 16px;font-size:13px;box-shadow:0 12px 30px rgba(20,32,80,.12);display:flex;gap:8px;align-items:center}
+.float b{color:var(--brand)}
+.f1{left:-26px;top:36px}.f2{right:-14px;bottom:52px}
+/* sections */
+section{padding:76px 0}
+.sec-head{text-align:center;max-width:640px;margin:0 auto 46px}
+.sec-head .tag{color:var(--brand);font-weight:700;font-size:14px;letter-spacing:2px;text-transform:uppercase}
+.sec-head h2{font-size:32px;margin:8px 0 12px}
+.sec-head p{color:var(--dim)}
+/* features */
+.features{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+.feat{background:#fff;border:1px solid var(--line);border-radius:16px;padding:28px 26px;transition:.25s}
+.feat:hover{transform:translateY(-4px);box-shadow:0 18px 44px rgba(20,32,80,.1);border-color:#cdd9f5}
+.feat .ic{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px;background:linear-gradient(135deg,#eef1ff,#f4efff)}
+.feat h3{font-size:18px;margin-bottom:8px}
+.feat p{font-size:14.5px;color:var(--dim)}
+/* gallery */
+.gallery{background:linear-gradient(180deg,#fff 0%,var(--paper) 100%);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.shot{display:grid;grid-template-columns:1.2fr .8fr;gap:44px;align-items:center;margin-bottom:64px}
+.shot:last-child{margin-bottom:0}
+.shot img{width:100%;border-radius:14px;border:1px solid var(--line);box-shadow:0 18px 50px rgba(20,32,80,.12)}
+.shot h3{font-size:22px;margin-bottom:10px}
+.shot p{color:var(--dim);font-size:15.5px;margin-bottom:14px}
+.shot ul{list-style:none;font-size:14.5px;color:var(--dim)}
+.shot ul li{padding-left:22px;position:relative;margin-bottom:6px}
+.shot ul li::before{content:"✓";position:absolute;left:0;color:var(--brand);font-weight:800}
+.shot.rev{grid-template-columns:.8fr 1.2fr}
+.shot.rev .txt{order:-1}
+/* docs */
+.doc-toc{background:#fff;border:1px solid var(--line);border-radius:14px;padding:22px 26px;margin-bottom:40px;display:flex;flex-wrap:wrap;gap:10px}
+.doc-toc a{font-size:14px;padding:7px 16px;border-radius:999px;background:#eef1fa;color:#41507a}
+.doc-toc a:hover{background:var(--brand);color:#fff}
+.doc{background:#fff;border:1px solid var(--line);border-radius:18px;padding:40px 44px;margin-bottom:26px}
+.doc h3{font-size:22px;display:flex;align-items:center;gap:12px;margin-bottom:6px}
+.doc h3 .num{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.doc .sub{color:var(--dim);font-size:14.5px;margin-bottom:18px}
+.doc p{margin-bottom:12px}
+.doc figure{margin:18px 0}
+.doc figure img{width:100%;border-radius:12px;border:1px solid var(--line)}
+.doc figcaption{font-size:13px;color:var(--dim);text-align:center;margin-top:8px}
+.doc ul,.doc ol{padding-left:22px;margin-bottom:12px;color:#2a3556}
+.doc li{margin-bottom:6px}
+.tip{background:#f0f4ff;border-left:4px solid var(--brand);border-radius:0 10px 10px 0;padding:12px 18px;font-size:14.5px;color:#33416e;margin:14px 0}
+.warn{background:#fff5f5;border-left:4px solid var(--accent);border-radius:0 10px 10px 0;padding:12px 18px;font-size:14.5px;color:#7a2c33;margin:14px 0}
+kbd{background:#eef1fa;border:1px solid #d5dcee;border-bottom-width:2px;border-radius:6px;padding:1px 8px;font-size:13px;font-family:Consolas,monospace}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin:14px 0}
+th,td{padding:10px 14px;border:1px solid var(--line);text-align:left}
+th{background:#f2f5fc}
+/* tech */
+.tech{background:linear-gradient(135deg,#101a3a,#1b2a5e);color:#e7ecff;border-radius:24px;padding:64px 56px;display:grid;grid-template-columns:repeat(4,1fr);gap:36px}
+.tech .t b{display:block;font-size:30px;background:linear-gradient(120deg,#9db4ff,#d5c6ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:4px}
+.tech .t span{font-size:14px;color:#a9b6dd}
+.tech .t p{font-size:13px;color:#8b9ac6;margin-top:6px}
+/* faq */
+details{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin-bottom:12px}
+details summary{cursor:pointer;font-weight:600;font-size:15.5px}
+details p{color:var(--dim);font-size:14.5px;margin-top:10px}
+/* footer */
+footer{background:#0d1424;color:#8b96b8;padding:40px 0;font-size:14px}
+footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
+@media (max-width:960px){
+  .hero{grid-template-columns:1fr}.features{grid-template-columns:1fr 1fr}
+  .shot,.shot.rev{grid-template-columns:1fr}.shot.rev .txt{order:0}
+  .tech{grid-template-columns:1fr 1fr;padding:40px 32px}
+  nav .links{display:none}
+  h1{font-size:34px}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="logo" href="#"><span class="mark">D</span>DeskFence</a>
+    <div class="links">
+      <a href="#features">核心特性</a>
+      <a href="#gallery">功能一览</a>
+      <a href="#docs">使用文档</a>
+      <a href="#faq">常见问题</a>
+    </div>
+    <a class="btn primary" href="#download">免费下载</a>
+  </div>
+</nav>
+
+<header id="download">
+  <div class="wrap hero">
+    <div>
+      <span class="kicker">🖥 Windows 11 / 10 · 原生 Rust 实现 · 纯本地运行</span>
+      <h1>把杂乱桌面,<br>一键变成<em>秩序井然的栅栏</em></h1>
+      <p class="lead">DeskFence 将桌面文件按类型自动归入透明栅栏分区。图标与文字和原生桌面<strong>像素级一致</strong>,启动秒级接管,关掉它桌面立刻还原——像给桌面请了一位看不见的整理师。</p>
+      <div class="cta">
+        <a class="btn primary" href="#">⬇ 下载 Windows 版(v1.0 · 0.9 MB)</a>
+        <a class="btn ghost" href="#docs">查看使用文档</a>
+      </div>
+      <div class="meta">
+        <span>✔ 免费</span><span>✔ 无广告 · 无联网</span><span>✔ 开机自启</span><span>✔ 一键还原原生桌面</span>
+      </div>
+    </div>
+    <div class="hero-shot">
+      <img src="assets/01-desktop.png" alt="DeskFence 桌面整理效果">
+      <div class="float f1">📁 <b>自动分类</b> 8 大类自动归组</div>
+      <div class="float f2">🔍 <b>像素级一致</b> 与原生桌面无差别</div>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="tag">FEATURES</div>
+      <h2>为什么选择 DeskFence</h2>
+      <p>我们不改变你的桌面,我们只是让它井井有条。</p>
+    </div>
+    <div class="features">
+      <div class="feat"><div class="ic">🗂</div><h3>自动分类,放进对应栅栏</h3><p>软件、文件夹、文档、图片、媒体、代码、压缩包、其他——新文件落桌面即自动归位,8 大类永久保持整齐。</p></div>
+      <div class="feat"><div class="ic">🎯</div><h3>像素级原生观感</h3><p>图标提取、ClearType 文字渲染、悬停高亮全部与 Windows 原生桌面逐像素一致,不用就没有"换了桌面"的感觉。</p></div>
+      <div class="feat"><div class="ic">⚡</div><h3>秒级启动,零感知切换</h3><p>启动并行预热,首帧即最终画面;换壁纸毫秒级跟随。全程无闪屏、无中间态。</p></div>
+      <div class="feat"><div class="ic">🖐</div><h3>拖拽整理,随手归位</h3><p>拖动图标即现跟手残影与插入线,松手完成排序;拖到别的栅栏即转移分类,拖到回收站即删除。</p></div>
+      <div class="feat"><div class="ic">🛡</div><h3>纯本地,零打扰</h3><p>不联网、不上传、无广告无弹窗。原生 Rust 单文件实现,内存占用低至 100 MB 级。</p></div>
+      <div class="feat"><div class="ic">🧹</div><h3>随开随关,来去干净</h3><p>退出或卸载即刻恢复原生桌面,图标位置、文件本身分毫未动;异常崩溃下次启动也会自动恢复。</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="gallery" id="gallery">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="tag">GALLERY</div>
+      <h2>功能一览</h2>
+      <p>每一处交互都为"和原生一样"而设计。</p>
+    </div>
+
+    <div class="shot">
+      <img src="assets/02-fence-menu.png" alt="栅栏操作菜单">
+      <div class="txt">
+        <h3>栅栏操作菜单</h3>
+        <p>每个栅栏右上角的倒三角是它的"管理中心"。</p>
+        <ul>
+          <li>折叠 / 展开:临时收起栅栏</li>
+          <li>锁定:防止误拖动位置</li>
+          <li>重命名 / 删除栅栏</li>
+          <li>排序:常用 / 时间 / 名称 / 手动</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="shot rev">
+      <div class="txt">
+        <h3>托盘总控菜单</h3>
+        <p>任务栏托盘图标(左键或右键)打开全局菜单,所有系统级设置都在这里。</p>
+        <ul>
+          <li>显示 / 隐藏全部栅栏</li>
+          <li>对齐方式:自动 / 网格 / 自由移动</li>
+          <li>渲染模式:精确 / 透明</li>
+          <li>开机自启、使用说明、退出</li>
+        </ul>
+      </div>
+      <img src="assets/03-tray-menu.png" alt="托盘菜单">
+    </div>
+
+    <div class="shot">
+      <img src="assets/04-context-menu.png" alt="文件右键菜单">
+      <div class="txt">
+        <h3>与原生一致的右键菜单</h3>
+        <p>右键栅栏里的文件,打开、复制、删除、重命名、属性……与原生桌面完全同源,第三方扩展菜单同样可用。</p>
+        <ul>
+          <li>就地重命名(与资源管理器同款)</li>
+          <li>删除进回收站,可还原</li>
+          <li>多选:Ctrl 单选 / Shift 连选 / 框选</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="docs">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="tag">USER GUIDE</div>
+      <h2>使用文档</h2>
+      <p>从安装到进阶,5 分钟全部掌握。</p>
+    </div>
+    <div class="doc-toc">
+      <a href="#d1">1 · 安装与启动</a>
+      <a href="#d2">2 · 自动分类</a>
+      <a href="#d3">3 · 拖拽整理</a>
+      <a href="#d4">4 · 文件操作</a>
+      <a href="#d5">5 · 栅栏管理</a>
+      <a href="#d6">6 · 全局设置</a>
+      <a href="#d7">7 · 安全与还原</a>
+    </div>
+
+    <div class="doc" id="d1">
+      <h3><span class="num">1</span>安装与启动</h3>
+      <p class="sub">无需安装,双击即用。</p>
+      <ol>
+        <li>双击 <code>deskfence.exe</code>,约 1 秒后桌面自动完成整理——原生散落的图标消失,取而代之的是按类型分好的栅栏。</li>
+        <li>想开机自动运行:打开托盘菜单,勾选<b>「开机自启」</b>。</li>
+        <li>再次双击 exe 不会开第二个实例,只会把已隐藏的栅栏重新显示出来。</li>
+      </ol>
+      <div class="tip">💡 DeskFence 是单文件绿色软件,放在任何目录都可以;放好后不要再移动位置,否则开机自启会失效(可在托盘菜单重新勾选一次)。</div>
+    </div>
+
+    <div class="doc" id="d2">
+      <h3><span class="num">2</span>自动分类:文件自己回家</h3>
+      <p class="sub">默认模式,开箱即用。</p>
+      <p>桌面文件按类型自动进入对应栅栏,某类栅栏不存在时会在该类第一个文件出现时自动创建:</p>
+      <table>
+        <tr><th>栅栏</th><th>收集的文件类型</th></tr>
+        <tr><td>🖥 软件</td><td>exe / msi / lnk / bat 等程序与快捷方式</td></tr>
+        <tr><td>📁 文件夹</td><td>所有目录</td></tr>
+        <tr><td>📄 文档</td><td>txt / md / Office / PDF 等</td></tr>
+        <tr><td>🖼 图片</td><td>jpg / png / gif / svg 等</td></tr>
+        <tr><td>🎬 媒体</td><td>mp3 / wav / mp4 / mkv 等音视频</td></tr>
+        <tr><td>💻 代码</td><td>py / js / ts / rs / go / c / cpp / html / json 等</td></tr>
+        <tr><td>📦 压缩包</td><td>zip / rar / 7z / tar / gz 等</td></tr>
+        <tr><td>❓ 其他</td><td>以上未覆盖的类型</td></tr>
+      </table>
+      <div class="tip">💡 回收站图标固定显示在「软件」栅栏第一位,把文件拖上去即删除,和原生桌面一样。</div>
+    </div>
+
+    <div class="doc" id="d3">
+      <h3><span class="num">3</span>拖拽整理:随手一拖就位</h3>
+      <p class="sub">被拖的图标跟手移动,其他图标纹丝不动,松手才重排。</p>
+      <figure><img src="assets/05-drag.png" alt="拖拽残影"><figcaption>拖动中:被拖图标以半透明残影跟手,其余图标不动</figcaption></figure>
+      <ul>
+        <li><b>调整顺序</b>:按住图标拖到目标位置,出现插入线后松手。</li>
+        <li><b>跨栅栏转移</b>:拖到另一个栅栏上松手,文件即改换分类(自定义分类模式下即完成"归档")。</li>
+        <li><b>删除</b>:拖到回收站图标上松手。</li>
+        <li>拖动中按 <kbd>Esc</kbd> 取消,一切还原。</li>
+        <li>拖动<b>栅栏本身</b>(标题区)可以移动栅栏;靠近边缘自动吸附,靠近其他栅栏自动保持间距;栅栏之间出现插入线可调换顺序。</li>
+      </ul>
+      <div class="tip">💡 悬停高亮也有——鼠标在图标上停留约 0.4 秒出现高亮,和原生桌面手感完全一致。</div>
+      <figure><img src="assets/06-hover.png" alt="悬停高亮"><figcaption>悬停高亮:与原生桌面一致的延迟与样式</figcaption></figure>
+    </div>
+
+    <div class="doc" id="d4">
+      <h3><span class="num">4</span>文件操作:双击、右键、重命名</h3>
+      <p class="sub">所有操作与原生桌面同源。</p>
+      <ul>
+        <li><b>打开文件</b>:双击图标,与在桌面双击完全一致。</li>
+        <li><b>右键菜单</b>:打开、打开方式、复制、删除、属性……与原生逐项一致(含系统第三方扩展)。</li>
+        <li><b>重命名</b>:右键 → 重命名,或选中后按 <kbd>F2</kbd>,在原图标位置就地编辑,回车确认、Esc 取消。</li>
+        <li><b>多选</b>:<kbd>Ctrl</kbd> 点选、<kbd>Shift</kbd> 连选、空白处按住左键框选。</li>
+        <li><b>滚轮</b>:栅栏内容超出时滚动查看。</li>
+      </ul>
+      <figure><img src="assets/04-context-menu.png" alt="右键菜单"><figcaption>右键菜单与原生桌面完全一致,支持多选与就地重命名</figcaption></figure>
+    </div>
+
+    <div class="doc" id="d5">
+      <h3><span class="num">5</span>栅栏管理:折叠、锁定、新建、删除</h3>
+      <p class="sub">点栅栏右上角的「倒三角」打开管理菜单。</p>
+      <figure><img src="assets/02-fence-menu.png" alt="栅栏菜单"><figcaption>倒三角菜单:折叠 / 锁定 / 重命名 / 删除 / 排序方式</figcaption></figure>
+      <ul>
+        <li><b>折叠 / 展开</b>:临时收起栅栏只留标题条,再点一次展开。</li>
+        <li><b>锁定</b>:锁定后栅栏位置不可拖动,防误碰。</li>
+        <li><b>排序方式</b>:常用(按使用频率)/ 最近修改 / 名称 / 手动(完全由拖动决定)。</li>
+        <li><b>自定义分类模式</b>:托盘菜单取消勾选「自动分类」后,文件不再按类型归类——拖进哪个栅栏就属于哪个栅栏,未分配的集中在「未分类」;右键标题可重命名 / 删除栅栏。重新勾选「自动分类」即回到 8 类模式。</li>
+        <li><b>调整大小</b>:拖动栅栏边缘/四角;高度不足时自动出现滚动条。</li>
+      </ul>
+    </div>
+
+    <div class="doc" id="d6">
+      <h3><span class="num">6</span>全局设置:一切在托盘菜单</h3>
+      <p class="sub">任务栏右下角托盘图标,左键或右键均可打开。</p>
+      <figure><img src="assets/03-tray-menu.png" alt="托盘菜单"><figcaption>托盘菜单:显示/隐藏、撤销、恢复默认布局、对齐方式、渲染模式、开机自启、退出</figcaption></figure>
+      <table>
+        <tr><th>菜单项</th><th>作用</th></tr>
+        <tr><td>显示 / 隐藏全部栅栏</td><td>一键在"整理桌面"与"原生桌面"间切换(Win+D 后也能自动恢复)</td></tr>
+        <tr><td>撤销上次布局调整</td><td>还原最近一次移动 / 重排</td></tr>
+        <tr><td>恢复默认布局</td><td>栅栏回到初始的自动排布</td></tr>
+        <tr><td>对齐方式</td><td><b>自动对齐</b>(固定间隔,推荐)/ <b>网格对齐</b>(图标格倍数)/ <b>自由移动</b>(栅栏任意摆放不受限)</td></tr>
+        <tr><td>渲染模式</td><td><b>精确</b>(默认,与原生逐像素一致)/ <b>透明</b>(使用动态壁纸软件时选这个)</td></tr>
+        <tr><td>自动分类(默认 8 类)</td><td>勾选=按类型自动归类;取消=自定义分类模式</td></tr>
+        <tr><td>开机自启</td><td>随 Windows 启动</td></tr>
+        <tr><td>退出</td><td>恢复原生桌面并退出程序</td></tr>
+      </table>
+    </div>
+
+    <div class="doc" id="d7">
+      <h3><span class="num">7</span>安全与还原:来去干净</h3>
+      <p class="sub">DeskFence 只"接管显示",从不移动或修改你的文件。</p>
+      <ul>
+        <li>所有文件仍原封不动地放在桌面目录里,用资源管理器打开桌面看到的就是原样。</li>
+        <li>退出、卸载、结束进程,桌面立刻恢复原生图标。</li>
+        <li>即使程序异常崩溃,下次启动也会检测到并自动恢复原生桌面;极端情况下可运行 <code>deskfence.exe --restore-desktop</code> 一键自救。</li>
+        <li>布局与偏好保存在 <code>%APPDATA%\DeskFence\</code>,删除该文件夹即完全清除痕迹。</li>
+      </ul>
+      <div class="warn">⚠ 唯一需要注意:使用 Wallpaper Engine 等动态壁纸软件时,请在托盘菜单把渲染模式切换为「透明」,以获得最佳兼容性。</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="tag">QUALITY</div>
+      <h2>工程品质</h2>
+    </div>
+    <div class="tech">
+      <div class="t"><b>&lt; 1.5s</b><span>冷启动接管桌面</span><p>并行预热 + 首帧即最终帧</p></div>
+      <div class="t"><b>100%</b><span>像素级还原</span><p>图标/ClearType 文字与原生逐像素比对</p></div>
+      <div class="t"><b>0</b><span>联网请求</span><p>纯本地运行,无遥测无广告</p></div>
+      <div class="t"><b>1</b><span>单文件</span><p>原生 Rust,无需运行时依赖</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <div class="sec-head">
+      <div class="tag">FAQ</div>
+      <h2>常见问题</h2>
+    </div>
+    <details open><summary>我的文件会被移动或修改吗?</summary><p>不会。DeskFence 只接管"图标的显示方式",文件本身始终留在桌面目录原位。退出即恢复原生桌面,位置都不变。</p></details>
+    <details><summary>双击后没反应?</summary><p>程序可能已在后台运行(单实例)。再双击一次会唤醒它显示全部栅栏;或检查任务栏托盘是否已有 DeskFence 图标。</p></details>
+    <details><summary>和 Fences 等同类软件比有什么不同?</summary><p>DeskFence 追求"无感":图标和文字与原生桌面像素级一致、启动无中间态、退出零残留,并且完全免费、纯本地、无任何订阅。</p></details>
+    <details><summary>支持多显示器吗?</summary><p>支持。每个显示器的桌面区域都会被接管,栅栏可在各屏之间自由摆放。</p></details>
+    <details><summary>桌面文件很多,性能会慢吗?</summary><p>图标像素有缓存,文件变更只增量刷新;稳态下每秒只做一次轻量自检。几百个文件的桌面依然流畅。</p></details>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div>© 2026 DeskFence · 桌面整理,秩序而来</div>
+    <div>Windows 11 / 10 · x64 · 纯本地软件</div>
+  </div>
+</footer>
+
+</body>
+</html>
