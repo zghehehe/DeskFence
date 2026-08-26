@@ -117,10 +117,34 @@
    - **CLSID_DesktopWallpaper = {C2CF3110-460E-4FC1-...}**——是 **3**110 不是
      5110，windows 0.52 未导出此常量需手写 GUID；写错 CoCreateInstance 报
      REGDB_E_CLASSNOTREG 静默降级。
+8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
+   烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
+   测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**
+   （DWM 合成），换壁纸背景同帧跟随，"先保留 1s 旧壁纸再切换"结构性消失。
+   快照管线（ensure_wallpaper/PrintWindow/wallpaper.bin）原样保留，角色变为
+   **标签种子**。文字统一走 `gdi_draw_labels_seeded`（两种渲染模式共用）：
+   标签矩形先垫种子（表面覆盖层预乘色 P 合成到快照壁纸色 W：P+W*(1-a)，
+   即 hover/选中/边框压在壁纸上的 straight 结果），DrawShadowText ClearType
+   对种子烘焙（与旧精确模式同渲染器同参数），RGB 偏离种子的像素=墨水置
+   alpha=255，其余像素恢复垫前原状。无快照时黑种子兜底。旧的
+   gdi_draw_labels（整面 alpha=255）与 D2D draw_label 已删。
+   稳态已验证：与旧精确模式全屏 diff 逐位一致（仅桌面时钟/托盘像素差，
+   栅栏区 0 差）。**待人工验证**（被 9 的锁屏阻塞）：栅栏空白区点击命中、
+   换壁纸过渡观感、两态 NCC 基线。
+9. **SPES 拦截模拟输入（2026-08-26 实测）**：mouse_event/keybd_event 的
+   **按键/点击**类合成输入会立即触发锁屏（前台变"Windows 默认锁屏界面"），
+   随后 CopyFromScreen 报"句柄无效"、SendKeys 报"拒绝访问"、#32768 菜单
+   枚举全空——全部是锁屏的表现，不是代码 bug。纯 SetCursorPos /
+   MOUSEEVENTF_MOVE 不触发。**自动化点击/键盘验证在本机已不可用**
+   （历史上 uitest 鼠标测试可用，策略显然收紧了）；截图/WindowFromPoint/
+   枚举类 API 探测在解锁态可用。显示器休眠后 SetCursorPos 挪一下即醒。
+   另：桌面壁纸本身带**实时时钟**（动态壁纸，约 (791,192)-(1120,299)），
+   截图对比时该区域永远在变，diff 结论要把它排除。
 
 ## 代码位置备忘
 
-- 渲染：src/render.rs（透明模式 D2D；精确模式壁纸底 + GDI 文字）
+- 渲染：src/render.rs（ink 常驻：透明底+1/255 隐形命中层+seeded GDI 文字；
+  透明/精确两模式共用同一文字管线，区别仅种子来源与启动守卫）
 - 拖拽管线（2026-08-24 改为**插入式**）：拖动中被拖者跟手、其余完全不动，
   指示线（UiState.insert_line，overlay 绘制）提示插入点，松手才拼接重排；
   栅栏 = ui.rs `fence_insertion_plan` + model.rs `chain_positions`（整链紧凑、
