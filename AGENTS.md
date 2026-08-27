@@ -173,6 +173,22 @@
    - **CLSID_DesktopWallpaper = {C2CF3110-460E-4FC1-...}**——是 **3**110 不是
      5110，windows 0.52 未导出此常量需手写 GUID；写错 CoCreateInstance 报
      REGDB_E_CLASSNOTREG 静默降级。
+   - **自启动首帧加速（2026-08-27，勿回退）**：冷启动慢的主因是"每次启动
+     全量现提"——SHGFI 显示名解析 + 图标提取（.lnk/exe 冷盘+杀软单文件可达
+     数百 ms）零持久化。已加 **%APPDATA%\DeskFence\iconcache.bin**：键=
+     `{path}\0{px}`（与内存缓存一致）、逐条校验 mtime+字节长==4*px*px
+     （render::icon_pixels 的 DIB 32bpp 契约），含 DFNM 显示名段；不合规
+     条目跳过不中断。启动未命中项照旧后台提取，落盘由 global_tick 监视
+     ICON_EXTRACT_COUNT 变化、安静 4s 后异步写（tmp+rename），启动关键
+     路径零 IO——运行期懒提取/DPI 切换/新文件自动覆盖。warm_renderer_
+     scratch 已并行化（show 前 join）。实测二次启动 bg_names 213→41ms、
+     bg_icons 595→176ms（残余 miss≈回收站伪条目属预期，其键无真实文件
+     mtime 不入缓存）、首栅栏呈现 ~303ms；冷盘真开机收益更大。注意：
+     mtime 以 ms 截断存取同源一致；改名/换目标会更新 .lnk mtime 所以能
+     正确失效；改 UI 排序逻辑时记得 finalize_scan_with 的预填值必须等于
+     全量解析输出，否则去重/排序在热启与冷启不一致。自启动注册为 HKCU
+     CurrentVersion\Run（shell.rs），与 Explorer 构建桌面同窗口启动，没有
+     更早的合法时机可抢——进程拉起前的耗时属于系统/杀软范畴。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**

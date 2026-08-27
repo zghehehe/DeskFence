@@ -287,7 +287,17 @@ pub fn scan_desktop() -> Vec<FileItem> {
 
 /// 显示名解析 + 同名去重 + 排序(Explorer 桌面按显示名排序,必须在解析后)。
 pub fn finalize_scan(files: &mut Vec<FileItem>) {
-    resolve_display_names(files);
+    finalize_scan_with(files, None);
+}
+
+/// 同上,但带预填显示名缓存(冷启动优化):缓存命中的条目直接跳过
+/// SHGFI 解析。显示名缓存值必须是 resolve_display_names 的原样输出,
+/// 去重/排序结果才能与全解析启动逐位一致。
+pub fn finalize_scan_with(
+    files: &mut Vec<FileItem>,
+    prefill: Option<&std::collections::HashMap<String, String>>,
+) {
+    resolve_display_names(files, prefill);
     dedup_by_display_name(files);
     files.sort_by(|a, b| {
         if a.is_dir != b.is_dir {
@@ -374,7 +384,12 @@ fn scan_desktop_dir(dir: &std::path::Path) -> Vec<FileItem> {
 
 /// 并行解析显示名(SHGFI_DISPLAYNAME,.lnk 的显示名可能与文件名不同,
 /// 且受"隐藏已知扩展名"设置影响)。失败时保留原名(fallback=当前 name)。
-pub fn resolve_display_names(files: &mut [FileItem]) {
+/// prefill:path→显示名 命中表——命中的条目跳过解析并直接采用值(与上次
+/// 启动的解析输出逐位一致,保证去重/排序确定性);未命中照旧走 shell。
+pub fn resolve_display_names(
+    files: &mut [FileItem],
+    prefill: Option<&std::collections::HashMap<String, String>>,
+) {
     const THREADS: usize = 4;
     let n = files.len();
     if n == 0 {
@@ -398,6 +413,10 @@ pub fn resolve_display_names(files: &mut [FileItem]) {
                     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 }
                 for f in chunk.iter_mut() {
+                    if let Some(hit) = prefill.and_then(|m| m.get(&f.path)) {
+                        f.name = hit.clone();
+                        continue;
+                    }
                     let p = std::path::PathBuf::from(&f.path);
                     let fallback = f.name.clone();
                     f.name = shell_display_name(&p, &fallback);

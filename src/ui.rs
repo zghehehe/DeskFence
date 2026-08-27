@@ -1,7 +1,7 @@
 //! 窗口管理与交互：栅栏窗口、命中测试、移动/缩放/滚动、右键菜单、重命名、刷新
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
@@ -1279,6 +1279,212 @@ fn wallpaper_cache_path() -> std::path::PathBuf {
     model::config_dir().join("wallpaper.bin")
 }
 
+fn icon_cache_path() -> std::path::PathBuf {
+    model::config_dir().join("iconcache.bin")
+}
+
+/// 图标像素字节必须是 size×size×4(DIB 32bpp,见 render::icon_pixels),
+/// 加载时逐条校验,不符即丢弃该条(防御旧版/损坏文件)。
+const ICON_ENTRY_MAX_BYTES: usize = 4 * 256 * 256;
+
+/// 持久化图标/显示名缓存——冷启动加速核心。此前每次启动都对全部桌面
+/// 条目跑 SHGFI 显示名解析 + 图标提取(.lnk/exe 冷盘+杀软扫描单个可达
+/// 数百 ms),这是"开机后栅栏比原生桌面晚好几秒"的主要可控来源。
+///
+/// 键与内存缓存一致:{path}\0{px};校验:mtime 与 raw 扫描一致 + 长度
+/// ==4*px*px。返回 (图标命中表, 显示名命中表)。
+fn load_icon_cache_file(
+    raw: &[model::FileItem],
+) -> (std::collections::HashMap<String, Vec<u8>>, std::collections::HashMap<String, String>) {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(icon_cache_path()) {
+        Ok(f) => f,
+        Err(_) => return Default::default(),
+    };
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() || buf.len() < 12 || &buf[0..4] != b"DFIC" {
+        return Default::default();
+    }
+    let ver = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
+    if ver != 1 {
+        return Default::default();
+    }
+    let px = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
+    // px 由调用方条目键的后缀再核一次;这里只挡住荒谬值
+    if px < 16 || px > 256 {
+        return Default::default();
+    }
+    let expected_len = (px as usize) * (px as usize) * 4;
+    let count = u32::from_le_bytes(
+        buf.get(12..16)
+            .map(|s| s.try_into().unwrap_or([0; 4]))
+            .unwrap_or([0; 4]),
+    ) as usize;
+    let mut off = 16usize;
+    let mut icons: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let expect_mtime: std::collections::HashMap<&str, u64> =
+        raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
+    for _ in 0..count.min(8192) {
+        if off + 2 > buf.len() {
+            break;
+        }
+        let klen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
+        off += 2;
+        if klen == 0 || klen > 1024 || off + klen + 12 > buf.len() {
+            break;
+        }
+        let key = String::from_utf8_lossy(&buf[off..off + klen]).to_string();
+        off += klen;
+        let mtime = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]));
+        off += 8;
+        let blen = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
+        off += 4;
+        if blen > ICON_ENTRY_MAX_BYTES || off + blen > buf.len() {
+            break;
+        }
+        // 键的路径部分必须存在于本次扫描且 mtime 一致(px 后缀也须匹配当前
+        // DPI);单条不合规只跳过该条,不再中断整表。
+        let path_part = key.split('\0').next().unwrap_or("");
+        if blen == expected_len
+            && key.ends_with(&format!("\0{px}"))
+            && expect_mtime.get(path_part).copied() == Some(mtime)
+            && mtime != 0
+        {
+            icons.insert(key, buf[off..off + blen].to_vec());
+        }
+        off += blen;
+    }
+    // 第二段:显示名表(path→display)。段头 magic 缺失不算错误(纯图标版兼容)。
+    let mut names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if off + 4 <= buf.len() && &buf[off..off + 4] == b"DFNM" {
+        off += 4;
+        if off + 4 <= buf.len() {
+            let ncnt = u32::from_le_bytes(
+                buf[off..off + 4].try_into().unwrap_or([0; 4]),
+            ) as usize;
+            off += 4;
+            for _ in 0..ncnt.min(8192) {
+                if off + 2 > buf.len() {
+                    break;
+                }
+                let plen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
+                off += 2;
+                if plen == 0 || plen > 1024 || off + plen > buf.len() {
+                    break;
+                }
+                let p = String::from_utf8_lossy(&buf[off..off + plen]).to_string();
+                off += plen;
+                if off + 2 > buf.len() {
+                    break;
+                }
+                let dlen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
+                off += 2;
+                if dlen > 512 || off + dlen > buf.len() {
+                    break;
+                }
+                let d = String::from_utf8_lossy(&buf[off..off + dlen]).to_string();
+                off += dlen;
+                if !p.is_empty() && !d.is_empty() {
+                    names.insert(p, d);
+                }
+            }
+        }
+    }
+    log(&format!(
+        "boot icon cache loaded: icons={} names={}",
+        icons.len(),
+        names.len()
+    ));
+    (icons, names)
+}
+
+/// 把当前 icon_cache 与 files 的显示名快照落盘(tmp+rename 原子替换)。
+/// 只收 px==当前系统图标像素 的条目(文件头单值 px,保证与加载端逐条
+/// 长度校验一致);字节流恒为 px×px×4(render::icon_pixels 契约)。
+/// ~56 项 ≈ 0.5MB,后台线程序列化无感知。由全局 tick 检测到提取计数
+/// 变化后延迟调用——运行期懒提取(DPI 切换/新文件/残影预览)自动覆盖。
+fn save_icon_cache_file_now(px_expected: u32) {
+    // 1) 短暂持锁克隆快照
+    let mut entries: Vec<(String, u64, std::sync::Arc<Vec<u8>>)> = Vec::new();
+    let mut names: Vec<(String, String)> = Vec::new();
+    {
+        let s = state().lock().unwrap();
+        let by_path: HashMap<&str, &model::FileItem> =
+            s.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        for (key, buf) in s.icon_cache.iter() {
+            let Some((p, pxs)) = key.split_once('\0') else {
+                continue;
+            };
+            if pxs.parse::<u32>().ok() != Some(px_expected) {
+                continue;
+            }
+            let blen = (px_expected as usize) * (px_expected as usize) * 4;
+            if buf.len() != blen || blen > ICON_ENTRY_MAX_BYTES {
+                continue;
+            }
+            let Some(fi) = by_path.get(p) else { continue };
+            if fi.mtime_ms == 0 {
+                continue;
+            }
+            entries.push((
+                key.clone(),
+                fi.mtime_ms,
+                std::sync::Arc::new(buf.clone()),
+            ));
+        }
+        for f in s.files.iter() {
+            names.push((f.path.clone(), f.name.clone()));
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    if entries.len() > 512 {
+        entries.sort_by_key(|(_, mt, _)| *mt);
+        entries.drain(..entries.len() - 512);
+    }
+    // 2) 后台序列化+写盘
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let total: usize = entries.iter().map(|e| e.2.len()).sum();
+        let mut buf: Vec<u8> = Vec::with_capacity(total + 4096);
+        buf.extend_from_slice(b"DFIC");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&px_expected.to_le_bytes());
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (key, mtime, bytes) in &entries {
+            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&mtime.to_le_bytes());
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        buf.extend_from_slice(b"DFNM");
+        buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        for (p, d) in &names {
+            buf.extend_from_slice(&(p.len() as u16).to_le_bytes());
+            buf.extend_from_slice(p.as_bytes());
+            buf.extend_from_slice(&(d.len() as u16).to_le_bytes());
+            buf.extend_from_slice(d.as_bytes());
+        }
+        let path = icon_cache_path();
+        let tmp = path.with_extension("bin.tmp");
+        let ok = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(&buf)?;
+                f.sync_all()
+            })
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .is_ok();
+        if !ok {
+            log("icon cache save failed");
+        }
+    });
+}
+
+
 fn save_wallpaper_cache(caps: &[render::WallpaperPixels]) {
     use std::io::Write;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
@@ -2096,19 +2302,41 @@ pub fn startup() {
     let warm_px = model::DpiMetrics::system().icon_px;
     let warm_paths: Vec<String> = raw_files.iter().map(|f| f.path.clone()).collect();
     let t_raw = resize_now_ms() - t_scan0;
+    // 冷启动加速(2026-08-27):持久化图标+显示名缓存。命中=零 SHGFI/零图标
+    // 提取——此前每次启动全量现提(~57 项,.lnk 冷盘+杀软扫描单文件可达数百
+    // ms),是"开机后栅栏比原生桌面晚数秒"的主要可控来源。校验 mtime+px+
+    // 定长字节,不合规条目跳过;未命中项照旧后台提取,落盘由 global_tick
+    // 检测提取计数变化后安静 4s 自动完成(启动关键路径零 IO)。
+    let boot_px = warm_px.round().clamp(16.0, 256.0) as u32;
+    let (boot_icons, boot_names) = load_icon_cache_file(&raw_files);
+    let n_boot_icons = boot_icons.len();
     // 显示名解析+去重+排序在后台完成后再注入回收站虚拟条目(与旧行为一致:
     // 回收站不受桌面同名文件的去重影响)
     let bg_names = std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
         let mut files = raw_files;
-        shell::finalize_scan(&mut files);
+        shell::finalize_scan_with(&mut files, Some(&boot_names));
         files = with_recycle_bin(files);
         (files, t0.elapsed().as_millis() as u64)
     });
+    // 图标提取只做缓存未命中的路径
+    let icon_misses: Vec<String> = warm_paths
+        .iter()
+        .filter(|p| !boot_icons.contains_key(&format!("{p}\0{boot_px}")))
+        .cloned()
+        .collect();
+    let n_icon_misses = icon_misses.len();
     let bg_icons = std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let cache = shell::prewarm_icon_cache(&warm_paths, warm_px);
+        let cache = shell::prewarm_icon_cache(&icon_misses, warm_px);
         (cache, t0.elapsed().as_millis() as u64)
+    });
+    // 渲染器预热(D2D/GDI 首用路径烧 ~100-170ms)同样移出关键路径:
+    // 与壁纸暖场/shell 后台线程并行,show 之前 join。
+    let renderer_warm = std::thread::spawn(|| {
+        let t0 = resize_now_ms();
+        warm_renderer_scratch();
+        resize_now_ms() - t0
     });
     // 配置加载不依赖文件列表,先做;空配置(首次运行)的默认布局
     // 生成需要文件列表,推迟到 join 之后
@@ -2201,7 +2429,7 @@ pub fn startup() {
             resize_now_ms()
         ));
     }
-    warm_renderer_scratch();
+    let t_warm_render = renderer_warm.join().unwrap_or(0);
     // join 后台 shell 预热:合并文件列表与图标缓存,补齐依赖文件列表的
     // 首次运行默认布局
     let (files, t_names) = bg_names.join().unwrap_or_else(|_| (Vec::new(), 0));
@@ -2211,6 +2439,10 @@ pub fn startup() {
         let mut s = state().lock().unwrap();
         let n_files = files.len();
         s.files = files;
+        // 启动持久化缓存命中先入,后台新提取覆盖同键(构造上 fresh 优先)
+        for (k, v) in boot_icons {
+            s.icon_cache.entry(k).or_insert(v);
+        }
         for (k, v) in icon_prewarm {
             s.icon_cache.insert(k, v);
         }
@@ -2244,12 +2476,15 @@ pub fn startup() {
     }
     rebuild_pins();
     log(&format!(
-        "boot raw_scan={}ms bg_names={}ms bg_icons={}ms prewarmed={} files={} ({}ms)",
+        "boot raw_scan={}ms bg_names={}ms bg_icons={}ms icon_hits={}/misses={} prewarmed={} files={} warmrender={}ms ({}ms)",
         t_raw,
         t_names,
         t_icons,
+        n_boot_icons,
+        n_icon_misses,
         render::ICON_EXTRACT_COUNT.load(Ordering::Relaxed),
         state().lock().unwrap().files.len(),
+        t_warm_render,
         resize_now_ms()
     ));
     settle_all_fences();
@@ -2321,6 +2556,23 @@ fn global_tick() {
     finish_rename_if_clicked_outside();
 
     let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // 图标缓存落盘调度:运行期懒提取(DPI 切换/新文件/残影预览等任何
+    // icon_cache 增量)都体现在提取计数上;计数变化→记脏,安静 4s 后写盘。
+    // 启动冷提取的首次落盘也由此自动完成,无需在启动关键路径上做 IO。
+    {
+        let seen = ICON_EXTRACT_SEEN.load(Ordering::Relaxed);
+        let now = render::ICON_EXTRACT_COUNT.load(Ordering::Relaxed);
+        if now != seen {
+            ICON_EXTRACT_SEEN.store(now, Ordering::Relaxed);
+            ICON_SAVE_DIRTY_MS.store(resize_now_ms(), Ordering::Relaxed);
+        }
+        let dirty = ICON_SAVE_DIRTY_MS.load(Ordering::Relaxed);
+        if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t % 4 == 0 {
+            ICON_SAVE_DIRTY_MS.store(0, Ordering::Relaxed);
+            let px = model::DpiMetrics::system().icon_px.round().clamp(16.0, 256.0) as u32;
+            save_icon_cache_file_now(px);
+        }
+    }
     // 注意:不要用 0x052C 消息生成 WorkerW —— 每次调用都会让 Win11 桌面层
     // 在 Progman/WorkerW 之间切换宿主,导致桌面反复重建(栅栏消失、桌面空白)。
     // 只用现有宿主,缺失时等待 Explorer 自然重建,由 ensure_all_attached 自愈。
@@ -2743,6 +2995,10 @@ static NATIVE_DESKTOP_OVERRIDE: AtomicBool = AtomicBool::new(false);
 /// 图标协调逻辑在此状态下不因"无栅栏呈现"而恢复原生图标(那正是旧的
 /// "隐藏栅栏=回到原生桌面"重复感的来源)。仅在本次运行内生效,重启回正常态。
 static ZEN_MODE: AtomicBool = AtomicBool::new(false);
+
+/// 图标缓存落盘调度状态(见 global_tick 内说明)
+static ICON_EXTRACT_SEEN: AtomicU64 = AtomicU64::new(0);
+static ICON_SAVE_DIRTY_MS: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn find_workerw_lv(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let slot: &mut Option<HWND> = &mut *(lparam.0 as *mut Option<HWND>);
