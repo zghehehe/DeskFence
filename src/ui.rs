@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect,
     HBRUSH, HDC, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
 };
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Ole::RevokeDragDrop;
 use windows::Win32::UI::HiDpi::{
@@ -369,6 +370,11 @@ struct UiState {
     /// 壁纸已失效待重捕获的时刻(0=无待办)。ink 常驻后快照只作文字种子,
     /// 重捕获走"懒化"路径:淡入结束+足够安静才执行,不与用户交互赛跑
     pub wallpaper_dirty_since: u64,
+    /// z 链失位防抖计数:连续两拍失位才修。菜单开合瞬间系统瞬态窗(EdgeUi
+    /// 输入条/SPES ScW 全屏钩子/cloaked CoreWindow)会短暂插进宿主与栅栏之间
+    /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
+    /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
+    pub walk_strikes: HashMap<u32, u32>,
 }
 
 fn state() -> &'static Mutex<UiState> {
@@ -384,6 +390,7 @@ fn state() -> &'static Mutex<UiState> {
             surfaces: HashMap::new(),
             presented: HashSet::new(),
             attached: HashSet::new(),
+            walk_strikes: HashMap::new(),
             hover: HashMap::new(),
             hover_pending: HashMap::new(),
             hover_hit: HashMap::new(),
@@ -878,6 +885,57 @@ fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
         .filter(|h| h.visible)
         .find(|h| cx >= h.x && cx < h.x + h.w && cy >= h.y && cy < h.y + h.h)
         .copied()
+}
+
+/// DWM cloaked 判定:窗口"可见"位有效但 DWM 不合成其像素——物理上遮不住任何东西。
+/// 典型:SystemSettings/TextInputHost 的全屏 CoreWindow(cloak=2)、Shell 经验宿主、
+/// SPES 等钩子层的全屏瞬态。菜单开合瞬间它们被塞进宿主与栅栏之间,曾触发整链
+/// 重排(每次=z 序重排闪屏),必须跳过。
+fn window_is_cloaked(w: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(
+            w,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+    }
+    .is_ok();
+    ok && cloaked != 0
+}
+
+/// 拖拽提升锚点:被拖栅栏需要压过其他兄弟栅栏(拖过邻居时不被盖住),
+/// 但绝不能高于正常窗口——HWND_TOP 曾把它顶到整个 z 栈顶端(浮窗)。
+/// 返回"最高兄弟栅栏"的句柄(插到它之后=兄弟之上、正常窗口之下);
+/// 没有其他兄弟栅栏时返回 None(无需提升)。
+fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
+    let mut anchor: Option<HWND> = None;
+    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    for _ in 0..64 {
+        if w.0 == 0 {
+            break;
+        }
+        if w == dragged {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        // 只沿"连续的兄弟栅栏段"向上找;段结束(遇到非栅栏窗)即停
+        let mut cls_buf = [0u16; 32];
+        let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+        let is_fence = n == 14
+            && cls_buf[..14]
+                == [
+                    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65,
+                    0x6E, 0x63, 0x65,
+                ];
+        if !is_fence {
+            break;
+        }
+        anchor = Some(w);
+        w = unsafe { GetWindow(w, GW_HWNDPREV) };
+    }
+    anchor
 }
 
 /// SetWindowPos places a window *behind* hWndInsertAfter. Passing WorkerW directly
@@ -2455,12 +2513,27 @@ fn ensure_all_attached() {
         const TRAY_CLASS: [u16; 13] = [
             0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
         ];
+        // EdgeUiInputTopWndClass:系统触摸/输入边缘条,band 内常驻半透明,只覆盖
+        // 屏幕边角几像素且自身透明,不可能视觉遮挡桌面内容。它在前后台切换
+        //(菜单开合)时会上下漂移穿过我们的 band,逐次引发"检出→修复→又漂回"
+        // 的循环,按 band 原生系统窗容忍。
+        const EDGEUI_CLASS: [u16; 22] = [
+            0x45, 0x64, 0x67, 0x65, 0x55, 0x69, 0x49, 0x6E, 0x70, 0x75, 0x74, 0x54, 0x6F, 0x70,
+            0x57, 0x6E, 0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
+        ];
         let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
         let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
         let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
         let mut to_move: Vec<u32> = Vec::new();
         for (id, h) in s.windows.clone() {
+            // 被拖栅栏拖拽期间提升到最高兄弟栅栏之上(band 内,见 handle_mousemove),
+            // 自愈豁免;拖拽结束由 handle_lbuttonup 归位底带
+            if matches!(&s.drag, Some(d) if d.fence_id == id) {
+                s.walk_strikes.remove(&id);
+                s.attached.insert(id);
+                continue;
+            }
             let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
                 continue;
             };
@@ -2493,13 +2566,20 @@ fn ensure_all_attached() {
                 }
                 let mut wr = RECT::default();
                 let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
+                // "不可见"判据含退化尺寸(宽或高<=2):GDI+ 钩子/锁屏残留的
+                // CoreWindow 等以 1x1@0,0 常驻,间歇插进宿主与栅栏之间会
+                // 触发修复+zombie 菜单(2026-08-27 实测),实际不可能遮挡。
                 let invisible = !rect_ok
                     || unsafe { IsIconic(w).as_bool() }
                     || !unsafe { IsWindowVisible(w).as_bool() }
+                    || wr.right - wr.left <= 2
+                    || wr.bottom - wr.top <= 2
                     || wr.right <= vx
                     || wr.bottom <= vy
                     || wr.left >= vx + vw
-                    || wr.top >= vy + vh;
+                    || wr.top >= vy + vh
+                    // cloaked:见 window_is_cloaked——visible 但 DWM 不合成,遮不住
+                    || window_is_cloaked(w);
                 if invisible {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
@@ -2508,18 +2588,56 @@ fn ensure_all_attached() {
                 let n = unsafe { GetClassNameW(w, &mut cls_buf) };
                 let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
                 let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
-                let aux = host1 == Some(w) || trayw == Some(w) || is_menu_popup || is_taskbar;
+                let is_edgeui = n == 22 && cls_buf[..22] == EDGEUI_CLASS;
+                let aux = host1 == Some(w)
+                    || trayw == Some(w)
+                    || is_menu_popup
+                    || is_taskbar
+                    || is_edgeui;
                 if aux {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
                 // 可见在屏内外来窗口先于栅栏出现:栅栏出带
                 out_of_band = true;
+                if to_move.is_empty() {
+                    let mut db = [0u16; 32];
+                    let dn = unsafe { GetClassNameW(w, &mut db) };
+                    let mut dr = RECT::default();
+                    unsafe { GetWindowRect(w, &mut dr) };
+                    log(&format!(
+                        "walk-break: fence {id} blocked by cls={} rect=({},{})-({},{}) vis={} iconic={}",
+                        String::from_utf16_lossy(&db[..dn.max(0) as usize]),
+                        dr.left, dr.top, dr.right, dr.bottom,
+                        unsafe { IsWindowVisible(w).as_bool() },
+                        unsafe { IsIconic(w).as_bool() }
+                    ));
+                }
                 break;
             }
             if out_of_band || !found {
-                to_move.push(id);
+                // 防抖(勿回退):菜单开合瞬间系统瞬态窗插入 band 又即刻退出,
+                // 驻留 ≤2s 的路过者绝不触发(实测 500ms 周期注入可对齐两个
+                // 1s tick);连续三拍失位才动手。真实浮出带/沉底会持续命中,
+                // 自愈延迟 2-3s(elevtest 验收放宽到 4s 内)。
+                // 退避:修复后若同栅栏再次失位(外来者反复插队,如 SPES 钩子层
+                // 周期性洗牌),只按 第3、13、23…拍 间隔出手——防"每秒全链
+                // SetWindowPos"复活成周期闪屏源。
+                let strikes = s.walk_strikes.entry(id).or_insert(0);
+                *strikes += 1;
+                let attempt = *strikes == 3 || (*strikes > 3 && (*strikes - 3) % 10 == 0);
+                if !found && !out_of_band && to_move.is_empty() {
+                    log(&format!(
+                        "walk-break: fence {id} NOT FOUND in 320 steps (top reached), strikes={}"
+                    , *strikes));
+                }
+                if attempt {
+                    to_move.push(id);
+                } else if *strikes == 1 {
+                    log(&format!("walk-break: fence {id} flagged strike 1/3, waiting confirm"));
+                }
             } else {
+                s.walk_strikes.remove(&id);
                 s.attached.insert(id);
             }
         }
@@ -2534,6 +2652,9 @@ fn ensure_all_attached() {
                 let Some(after) = desktop_insert_after(host.hwnd) else {
                     continue;
                 };
+                // 纯 z 修复(NOMOVE|NOSIZE):位置由交互/布局路径负责,z 自愈只动
+                // 层叠次序。带位移的同值 SetWindowPos 会让 DWM 连无效区一起重算
+                //=可感知的重排闪底。
                 let attached = unsafe {
                     SetWindowPos(
                         h,
@@ -2542,7 +2663,7 @@ fn ensure_all_attached() {
                         frect.y.round() as i32,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     )
                     .is_ok()
                 };
@@ -2560,10 +2681,13 @@ fn ensure_all_attached() {
                         let invisible = !rect_ok
                             || unsafe { IsIconic(w).as_bool() }
                             || !unsafe { IsWindowVisible(w).as_bool() }
+                            || wr.right - wr.left <= 2
+                            || wr.bottom - wr.top <= 2
                             || wr.right <= vx
                             || wr.bottom <= vy
                             || wr.left >= vx + vw
-                            || wr.top >= vy + vh;
+                            || wr.top >= vy + vh
+                            || window_is_cloaked(w);
                         if invisible {
                             w = unsafe { GetWindow(w, GW_HWNDPREV) };
                             continue;
@@ -2572,7 +2696,12 @@ fn ensure_all_attached() {
                         let n = unsafe { GetClassNameW(w, &mut cls_buf) };
                         let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
                         let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
-                        let aux = host1 == Some(w) || trayw == Some(w) || is_menu_popup || is_taskbar;
+                        let is_edgeui = n == 22 && cls_buf[..22] == EDGEUI_CLASS;
+                        let aux = host1 == Some(w)
+                            || trayw == Some(w)
+                            || is_menu_popup
+                            || is_taskbar
+                            || is_edgeui;
                         if aux {
                             w = unsafe { GetWindow(w, GW_HWNDPREV) };
                             continue;
@@ -3910,6 +4039,18 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
         // z-band,自愈定时器拉回桌面层时分层窗口跨 band 移动引发整体
         // 重合成闪屏(表面内容并没有变)。
         let _guard = shell::menu_foreground(menu_host_or(hwnd));
+        // 前台权诊断:TrackPopupMenu 无前台会立即返回 0(zombie 菜单)。正常应
+        // 打印 host match=true;出现其他类名即可定位是谁抢的前台。
+        {
+            let fg = unsafe { GetForegroundWindow() };
+            let mut fb = [0u16; 32];
+            let fn_ = unsafe { GetClassNameW(fg, &mut fb) };
+            log(&format!(
+                "menu open: foreground={} (host match={})",
+                String::from_utf16_lossy(&fb[..fn_.max(0) as usize]),
+                menu_host_or(hwnd) == fg
+            ));
+        }
         let r = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, menu_host_or(hwnd), None);
         if r.0 == 0 {
             log("track: menu dismissed without selection");
@@ -5821,20 +5962,32 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         f.rect = nr;
                     }
                     s.insert_line = line;
-                    // 被拖栅栏浮到其他栅栏上层("走上面"),穿过邻居时不被盖住
+                    // 被拖栅栏需压过其他兄弟栅栏(穿过邻居时不被盖住),但
+                    // 任何时候都不得高于正常窗口:提升锚点=最高兄弟栅栏
+                    // (仍在桌面 band 内)。旧的 HWND_TOP 曾把它顶到整个 z 栈
+                    // 顶端,拖完浮在所有窗口上方。
                     if let Some(&h) = s.windows.get(&fence_id) {
-                        unsafe {
-                            let _ = SetWindowPos(
-                                h,
-                                HWND_TOP,
-                                0,
-                                0,
-                                0,
-                                0,
-                                SWP_NOACTIVATE
-                                    | SWP_NOSIZE
-                                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
-                            );
+                        let hosts = desktop_hosts();
+                        let anchor = s
+                            .fences
+                            .iter()
+                            .find(|f| f.id == fence_id)
+                            .and_then(|f| host_for_rect(&f.rect, &hosts))
+                            .and_then(|host| drag_elevate_anchor(host.hwnd, h));
+                        if let Some(anchor) = anchor {
+                            unsafe {
+                                let _ = SetWindowPos(
+                                    h,
+                                    anchor,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOACTIVATE
+                                        | SWP_NOSIZE
+                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
+                                );
+                            }
                         }
                     }
                     drop(s);
@@ -6937,6 +7090,37 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         update_guides(None, None);
         unsafe {
             let _ = ReleaseCapture();
+        }
+        // 拖拽期间被拖栅栏被提升到兄弟栅栏之上(仅 band 内);拖拽结束立即归位
+        // 底带(宿主正上方)。若等自愈兜底,栅栏会在其他窗口上方漂移=用户看到的
+        // "栅栏浮在别的窗口上方"。
+        {
+            let s = state().lock().unwrap();
+            let hosts = desktop_hosts();
+            let target = s.fences.iter().find(|f| f.id == fence_id).map(|f| {
+                (f.hidden, f.rect)
+            });
+            if let Some((hidden, rect)) = target {
+                if !hidden {
+                    if let Some(host) = host_for_rect(&rect, &hosts) {
+                        if let Some(after) = desktop_insert_after(host.hwnd) {
+                            if let Some(fh) = s.windows.get(&fence_id) {
+                                unsafe {
+                                    let _ = SetWindowPos(
+                                        *fh,
+                                        after,
+                                        rect.x.round() as i32,
+                                        rect.y.round() as i32,
+                                        0,
+                                        0,
+                                        SWP_NOSIZE | SWP_NOACTIVATE,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

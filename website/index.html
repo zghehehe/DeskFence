@@ -112,8 +112,10 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
 
 /* ============ SVG 演示动画(纯 CSS,自动循环,等效视频) ============ */
 @keyframes fadeIO{0%,12%{opacity:0}22%,78%{opacity:1}92%,100%{opacity:0}}
-@keyframes scatteredIO{0%,26%{opacity:1}40%,90%{opacity:0}100%{opacity:1}}
-@keyframes fenceIO{0%,44%{opacity:0}58%,88%{opacity:1}100%{opacity:0}}
+@keyframes scatteredIO{0%,22%{opacity:1}32%,94%{opacity:0}100%{opacity:1}}
+@keyframes fenceIO{0%,34%{opacity:0}46%,86%{opacity:1}94%,100%{opacity:0}}
+@keyframes fenceIO2{0%,40%{opacity:0}52%,86%{opacity:1}94%,100%{opacity:0}}
+@keyframes fenceIO3{0%,46%{opacity:0}58%,86%{opacity:1}94%,100%{opacity:0}}
 @keyframes cursorA{0%,10%{transform:translate(0,0);opacity:0}16%{opacity:1}30%{transform:translate(96px,52px)}46%,58%{transform:translate(96px,52px)}70%{transform:translate(150px,84px)}82%,90%{transform:translate(150px,84px);opacity:1}96%,100%{opacity:0}}
 @keyframes chromeIn{0%,24%{opacity:0}34%,60%{opacity:1}74%,100%{opacity:0}}
 @keyframes fenceGrow{0%,46%{transform:scale(1)}58%,84%{transform:scale(1.14,1.2)}96%,100%{transform:scale(1)}}
@@ -202,8 +204,8 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
         </g>
         <style>
           .f1{animation:fenceIO 7s ease-in-out infinite}
-          .f2{animation:fenceIO 7s .35s ease-in-out infinite}
-          .f3{animation:fenceIO 7s .7s ease-in-out infinite}
+          .f2{animation:fenceIO2 7s ease-in-out infinite}
+          .f3{animation:fenceIO3 7s ease-in-out infinite}
         </style>
         <g>
           <rect x="240" y="300" width="400" height="44" rx="22" fill="#1d1d1f" opacity=".82"/>
@@ -444,8 +446,8 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
           <text x="260" y="50" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif">软件</text>
           <g><rect x="260" y="64" width="32" height="32" rx="7" fill="#9d8cf0"/><text x="276" y="112" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">工具</text></g>
           <g>
-            <rect x="86" y="196" width="288" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
-            <text x="230" y="216" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">壁纸切换 → 栅栏背景同帧跟随,文字稳定如初</text>
+            <rect x="60" y="200" width="340" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">壁纸切换 → 栅栏背景同帧跟随,文字稳定如初</text>
           </g>
         </svg>
         <div class="meta"><h3><span class="play-dot"></span>换壁纸零感知</h3><p>背景实时透出真实壁纸;标签阴影与壁纸底色无关,切换瞬间即正确。</p></div>
@@ -470,7 +472,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
             <path d="M0 0 L0 16 L4.5 12.5 L7.5 19 L10.5 17.5 L7.5 11 L13 11 Z" fill="#1d1d1f" stroke="#fff" stroke-width="1.2"/>
           </g>
           <g>
-            <rect x="96" y="200" width="268" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <rect x="60" y="200" width="340" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
             <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">平时隐形 → 悬停浮现边框与手柄</text>
           </g>
         </svg>
@@ -480,15 +482,15 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
         <svg viewBox="0 0 460 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="原生观感对比演示">
           <rect width="460" height="240" fill="#bfe0f5"/>
           <path d="M0 180 Q140 145 280 175 T460 168 V240 H0 Z" fill="#a8cfe8"/>
-          <text x="120" y="26" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">原生桌面</text>
-          <g><rect x="86" y="44" width="34" height="34" rx="7" fill="#ffd34d"/><text x="103" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
-          <g><rect x="150" y="44" width="34" height="34" rx="7" fill="#7ee08a"/><text x="167" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
-          <line x1="230" y1="20" x2="230" y2="120" stroke="#9ab8d8" stroke-dasharray="4 4"/>
-          <text x="345" y="26" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">DeskFence 栅栏</text>
-          <g><rect x="311" y="44" width="34" height="34" rx="7" fill="#ffd34d"/><text x="328" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
-          <g><rect x="375" y="44" width="34" height="34" rx="7" fill="#7ee08a"/><text x="392" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
+          <text x="115" y="74" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">原生桌面</text>
+          <g><rect x="66" y="92" width="34" height="34" rx="7" fill="#ffd34d"/><text x="83" y="142" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
+          <g><rect x="130" y="92" width="34" height="34" rx="7" fill="#7ee08a"/><text x="147" y="142" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
+          <line x1="230" y1="68" x2="230" y2="168" stroke="#9ab8d8" stroke-dasharray="4 4"/>
+          <text x="345" y="74" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">DeskFence 栅栏</text>
+          <g><rect x="296" y="92" width="34" height="34" rx="7" fill="#ffd34d"/><text x="313" y="142" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
+          <g><rect x="360" y="92" width="34" height="34" rx="7" fill="#7ee08a"/><text x="377" y="142" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
           <g>
-            <rect x="55" y="200" width="350" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <rect x="60" y="200" width="340" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
             <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">同一字体、同一阴影 —— 逐像素一致</text>
           </g>
         </svg>
@@ -511,7 +513,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
           <text x="282" y="64" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif" style="animation:crashFences 9s ease-in-out infinite">软件</text>
           <g style="animation:crashFences 9s ease-in-out infinite"><rect x="282" y="78" width="32" height="32" rx="7" fill="#9d8cf0"/></g>
           <g>
-            <rect x="96" y="200" width="268" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <rect x="60" y="200" width="340" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
             <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">Explorer 重启 / 进程被杀 → 栅栏与桌面自动恢复</text>
           </g>
         </svg>

@@ -35,5 +35,5 @@ $f = [EH]::FindFence(512, 0)
 # HWND_TOP (0) + SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE = 0x0002|0x0001|0x0010
 [void][EH]::SetWindowPos($f, [IntPtr]::Zero, 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0010)
 "elevated to HWND_TOP, waiting 3s for self-heal..."
-Start-Sleep -Milliseconds 3000
+Start-Sleep -Milliseconds 4500
 & powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\z00897910\Desktop\DeskFence\tools\fenceloc.ps1

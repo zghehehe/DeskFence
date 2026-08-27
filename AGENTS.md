@@ -121,6 +121,31 @@
      重发）：旧的 10s TTL 等于每 10 秒唤醒一次宿主，菜单交互后的未稳态里
      这次唤醒表现为"点桌面偶发闪 ~4% 亮度"——就是"刚开始不闪、后面点
      倒三角/托盘再点桌面有时闪"的根因。托盘 tooltip 为纯 "DeskFence"。
+   - **⑤ 终修第二轮（2026-08-27 下午，勿回退）**：
+     **浮窗最后入口**：handle_mousemove 拖栅栏时曾 `SetWindowPos(HWND_TOP)`
+     把被拖栅栏顶到全栈顶且松手无人放回="看到过 1 次浮到 ZCode 上"的根源。
+     已改：提升只到最高兄弟栅栏之上（ui.rs `drag_elevate_anchor`，band 内）、
+     handle_lbuttonup 立即插回 `desktop_insert_after`、自愈豁免被拖者。
+     **菜单后点桌面闪的真根源**：菜单开合瞬间系统瞬态窗插进宿主与栅栏 band
+     （实抓三类：SPES epc_pxs 的 ScW 全屏钩子层；EdgeUiInputTopWndClass 输入
+     条；cloak=2 的全屏 CoreWindow——SystemSettings/TextInputHost 等 visible
+     位有效但 DWM 不合成像素，物理遮不住）→ 每次触发整链 z-chain repair=
+     整面 DWM 重合成闪。此前判为"DWM 固有洗色不可修"是误诊。修三件套
+     （ensure_all_attached）：① 容忍集扩容——DWMWA_CLOAKED 任意非零跳过
+     （window_is_cloaked）+ EdgeUiInputTopWndClass 按 band 原生系统窗跳过；
+     ② walk_strikes 防抖——连续 **3** 拍失位才修（tools/bandtest.ps1 实测
+     150ms 存活/350ms 间隔的过路者在两拍制下会对齐两个 tick 造成漏网），
+     真出带自愈延迟 2-3s（elevtest 验收窗已放宽至 4.5s）；重犯退避＝仅
+     第 3、13、23…拍出手，杜绝周期性风暴复活；
+     ③ 修复动作纯 z（SWP_NOMOVE|SWP_NOSIZE），位置归交互路径管，同位也
+     触发的 DWM 重算降到最小。
+     工具与基线：tools/bandtest.ps1（无输入注入：瞬态过路者零修复＋常驻
+     外来者标记→单批修复→静默，当前 PASS）；tools/bandwalk.ps1（从宿主
+     GW_HWNDPREV 向上走 = band 真值。**EnumWindows 枚举顺序对 TOOLWINDOW
+     不可靠**，判断栅栏 z 别再用全局枚举序）；tools/zprobe.ps1（全局属性
+     快照）。验收：fenceloc.ps1 五栅栏 aboveHost+1..+5；稳态 80s 日志零
+     walk-break 零 repair。菜单开合仍存在的 DWM 颜色缓存洗色（前条"残余
+     现象"）与原生同级、低于感知阈，不在修复范围。
 7. **启动首帧/壁纸快照(2026-08-25 修复，勿回退）**：
    - `ensure_wallpaper` 的 `wallpaper_ms==0` 是"强制重捕获"哨兵（不能用饱和减法
      判断：进程启动前 15s 内 `now-0<15000` 会把清零操作整个吞掉，快照迟到一整个
