@@ -3,367 +3,575 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DeskFence 桌面整理 — 像素级还原原生的桌面栅栏</title>
+<title>DeskFence — 让桌面井然有序</title>
+<meta name="description" content="DeskFence 桌面栅栏:自动分类桌面图标,与 Windows 原生观感逐像素一致,换壁纸零感知,轻量、稳定、开箱即用。">
 <style>
+/* ============ 基础(Apple 式留白 + 系统字体栈) ============ */
 :root{
-  --ink:#0d1424; --ink2:#151f38; --paper:#f7f9fd; --line:#e4e9f4;
-  --brand:#4f6ef7; --brand2:#7c5cf6; --txt:#1c2444; --dim:#5a6682; --accent:#e8313f;
+  --bg:#ffffff; --bg2:#f5f5f7; --txt:#1d1d1f; --dim:#6e6e73;
+  --acc:#0071e3; --acc-dark:#0058b0; --line:#d2d2d7;
+  --green:#34c759; --radius:18px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
-body{font:16px/1.75 "Microsoft YaHei","Segoe UI",system-ui,sans-serif;color:var(--txt);background:var(--paper)}
-a{color:inherit;text-decoration:none}
-.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
-.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 34px;border-radius:12px;font-size:17px;font-weight:600;transition:.2s}
-.btn.primary{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;box-shadow:0 10px 30px rgba(79,110,247,.35)}
-.btn.primary:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(79,110,247,.45)}
-.btn.ghost{border:1.5px solid #c8d3f0;color:var(--txt)}
-.btn.ghost:hover{border-color:var(--brand);color:var(--brand)}
-/* nav */
-nav{position:sticky;top:0;z-index:50;background:rgba(247,249,253,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
-nav .wrap{display:flex;align-items:center;height:64px;gap:36px}
-.logo{display:flex;align-items:center;gap:10px;font-weight:800;font-size:20px}
-.logo .mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--brand),var(--brand2));display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:900}
-nav .links{display:flex;gap:28px;margin-left:auto;font-size:15px;color:var(--dim)}
-nav .links a:hover{color:var(--brand)}
-nav .btn{padding:9px 22px;font-size:15px;border-radius:9px}
-/* hero */
-header{background:radial-gradient(1200px 600px at 70% -10%,#dfe8ff 0%,transparent 60%),linear-gradient(180deg,#eef2fd 0%,var(--paper) 100%);padding:88px 0 64px}
-.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:56px;align-items:center}
-.kicker{display:inline-flex;align-items:center;gap:8px;font-size:13.5px;color:var(--brand);background:#e8edff;border:1px solid #d4defc;padding:6px 14px;border-radius:999px;font-weight:600;margin-bottom:18px}
-h1{font-size:44px;line-height:1.25;letter-spacing:-.5px;margin-bottom:18px}
-h1 em{font-style:normal;background:linear-gradient(120deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
-.lead{font-size:18px;color:var(--dim);margin-bottom:30px;max-width:34em}
-.cta{display:flex;gap:14px;align-items:center;margin-bottom:22px}
-.meta{font-size:13.5px;color:#8a94ad;display:flex;gap:18px;flex-wrap:wrap}
-.hero-shot{position:relative}
-.hero-shot img{width:100%;border-radius:16px;box-shadow:0 30px 80px rgba(20,32,80,.25);border:1px solid #dfe5f2}
-.float{position:absolute;background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 16px;font-size:13px;box-shadow:0 12px 30px rgba(20,32,80,.12);display:flex;gap:8px;align-items:center}
-.float b{color:var(--brand)}
-.f1{left:-26px;top:36px}.f2{right:-14px;bottom:52px}
-/* sections */
-section{padding:76px 0}
-.sec-head{text-align:center;max-width:640px;margin:0 auto 46px}
-.sec-head .tag{color:var(--brand);font-weight:700;font-size:14px;letter-spacing:2px;text-transform:uppercase}
-.sec-head h2{font-size:32px;margin:8px 0 12px}
-.sec-head p{color:var(--dim)}
-/* features */
-.features{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
-.feat{background:#fff;border:1px solid var(--line);border-radius:16px;padding:28px 26px;transition:.25s}
-.feat:hover{transform:translateY(-4px);box-shadow:0 18px 44px rgba(20,32,80,.1);border-color:#cdd9f5}
-.feat .ic{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px;background:linear-gradient(135deg,#eef1ff,#f4efff)}
-.feat h3{font-size:18px;margin-bottom:8px}
-.feat p{font-size:14.5px;color:var(--dim)}
-/* gallery */
-.gallery{background:linear-gradient(180deg,#fff 0%,var(--paper) 100%);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
-.shot{display:grid;grid-template-columns:1.2fr .8fr;gap:44px;align-items:center;margin-bottom:64px}
-.shot:last-child{margin-bottom:0}
-.shot img{width:100%;border-radius:14px;border:1px solid var(--line);box-shadow:0 18px 50px rgba(20,32,80,.12)}
-.shot h3{font-size:22px;margin-bottom:10px}
-.shot p{color:var(--dim);font-size:15.5px;margin-bottom:14px}
-.shot ul{list-style:none;font-size:14.5px;color:var(--dim)}
-.shot ul li{padding-left:22px;position:relative;margin-bottom:6px}
-.shot ul li::before{content:"✓";position:absolute;left:0;color:var(--brand);font-weight:800}
-.shot.rev{grid-template-columns:.8fr 1.2fr}
-.shot.rev .txt{order:-1}
-/* docs */
-.doc-toc{background:#fff;border:1px solid var(--line);border-radius:14px;padding:22px 26px;margin-bottom:40px;display:flex;flex-wrap:wrap;gap:10px}
-.doc-toc a{font-size:14px;padding:7px 16px;border-radius:999px;background:#eef1fa;color:#41507a}
-.doc-toc a:hover{background:var(--brand);color:#fff}
-.doc{background:#fff;border:1px solid var(--line);border-radius:18px;padding:40px 44px;margin-bottom:26px}
-.doc h3{font-size:22px;display:flex;align-items:center;gap:12px;margin-bottom:6px}
-.doc h3 .num{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.doc .sub{color:var(--dim);font-size:14.5px;margin-bottom:18px}
-.doc p{margin-bottom:12px}
-.doc figure{margin:18px 0}
-.doc figure img{width:100%;border-radius:12px;border:1px solid var(--line)}
-.doc figcaption{font-size:13px;color:var(--dim);text-align:center;margin-top:8px}
-.doc ul,.doc ol{padding-left:22px;margin-bottom:12px;color:#2a3556}
-.doc li{margin-bottom:6px}
-.tip{background:#f0f4ff;border-left:4px solid var(--brand);border-radius:0 10px 10px 0;padding:12px 18px;font-size:14.5px;color:#33416e;margin:14px 0}
-.warn{background:#fff5f5;border-left:4px solid var(--accent);border-radius:0 10px 10px 0;padding:12px 18px;font-size:14.5px;color:#7a2c33;margin:14px 0}
-kbd{background:#eef1fa;border:1px solid #d5dcee;border-bottom-width:2px;border-radius:6px;padding:1px 8px;font-size:13px;font-family:Consolas,monospace}
-table{width:100%;border-collapse:collapse;font-size:14.5px;margin:14px 0}
-th,td{padding:10px 14px;border:1px solid var(--line);text-align:left}
-th{background:#f2f5fc}
-/* tech */
-.tech{background:linear-gradient(135deg,#101a3a,#1b2a5e);color:#e7ecff;border-radius:24px;padding:64px 56px;display:grid;grid-template-columns:repeat(4,1fr);gap:36px}
-.tech .t b{display:block;font-size:30px;background:linear-gradient(120deg,#9db4ff,#d5c6ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:4px}
-.tech .t span{font-size:14px;color:#a9b6dd}
-.tech .t p{font-size:13px;color:#8b9ac6;margin-top:6px}
-/* faq */
-details{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin-bottom:12px}
-details summary{cursor:pointer;font-weight:600;font-size:15.5px}
-details p{color:var(--dim);font-size:14.5px;margin-top:10px}
-/* footer */
-footer{background:#0d1424;color:#8b96b8;padding:40px 0;font-size:14px}
-footer .wrap{display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px}
-@media (max-width:960px){
-  .hero{grid-template-columns:1fr}.features{grid-template-columns:1fr 1fr}
-  .shot,.shot.rev{grid-template-columns:1fr}.shot.rev .txt{order:0}
-  .tech{grid-template-columns:1fr 1fr;padding:40px 32px}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro SC","Segoe UI","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;line-height:1.6}
+a{color:var(--acc);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+h1,h2,h3{letter-spacing:-.01em}
+.sec-title{font-size:44px;font-weight:700;text-align:center;margin-bottom:12px}
+.sec-sub{font-size:20px;color:var(--dim);text-align:center;margin-bottom:52px}
+section{padding:96px 0}
+.badge{display:inline-block;font-size:13px;font-weight:600;color:var(--acc);background:#e8f1ff;border-radius:999px;padding:4px 14px;margin-bottom:16px}
+
+/* ============ 导航 ============ */
+nav{position:sticky;top:0;z-index:100;background:rgba(255,255,255,.72);backdrop-filter:saturate(180%) blur(20px);border-bottom:1px solid rgba(0,0,0,.06)}
+nav .wrap{display:flex;align-items:center;justify-content:space-between;height:48px}
+nav .logo{font-weight:700;font-size:17px;color:var(--txt);display:flex;align-items:center;gap:8px}
+nav .links{display:flex;gap:28px;font-size:13.5px}
+nav .links a{color:var(--txt);opacity:.8}
+nav .links a:hover{opacity:1;text-decoration:none}
+
+/* ============ Hero ============ */
+.hero{padding:88px 0 64px;text-align:center;background:linear-gradient(180deg,#fbfbfd 0%,#f2f3f7 100%)}
+.hero h1{font-size:60px;font-weight:800;line-height:1.12}
+.hero .sub{font-size:24px;color:var(--dim);margin:16px 0 30px}
+.hero .cta{display:inline-flex;gap:16px;align-items:center}
+.btn{display:inline-block;background:var(--acc);color:#fff;font-size:17px;font-weight:600;border-radius:999px;padding:12px 32px;transition:background .2s}
+.btn:hover{background:var(--acc-dark);text-decoration:none}
+.btn.ghost{background:transparent;color:var(--acc);border:1.5px solid var(--acc)}
+.btn.ghost:hover{background:#e8f1ff}
+.hero-note{font-size:13px;color:var(--dim);margin-top:14px}
+.hero-anim{margin:56px auto 0;max-width:880px;border-radius:var(--radius);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.16),0 2px 10px rgba(0,0,0,.06);background:#fff}
+.hero-anim svg{display:block;width:100%;height:auto}
+
+/* ============ 能力卡片 ============ */
+.features{background:var(--bg2)}
+.grid6{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.grid6 .card{background:#fff;border-radius:var(--radius);padding:34px 30px;box-shadow:0 1px 3px rgba(0,0,0,.05);transition:transform .25s,box-shadow .25s}
+.grid6 .card:hover{transform:translateY(-4px);box-shadow:0 12px 32px rgba(0,0,0,.10)}
+.card .ico{width:52px;height:52px;border-radius:14px;display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.card h3{font-size:19px;margin-bottom:8px}
+.card p{font-size:14.5px;color:var(--dim)}
+
+/* ============ 使用文档 ============ */
+.doc-block{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:center;margin-bottom:88px}
+.doc-block:nth-child(even){direction:rtl}
+.doc-block>*{direction:ltr}
+.doc-step{font-size:13px;font-weight:700;color:var(--acc);letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px}
+.doc-block h3{font-size:30px;font-weight:700;margin-bottom:14px}
+.doc-block p{font-size:16px;color:var(--dim);margin-bottom:10px}
+.doc-block ul{list-style:none;margin-top:12px}
+.doc-block li{font-size:15px;padding:7px 0;border-bottom:1px solid #ececf0;color:#3a3a3c}
+.doc-block li:last-child{border-bottom:none}
+.doc-block li b{color:var(--txt)}
+.demo-frame{background:linear-gradient(160deg,#eef4ff,#e8ecf5);border-radius:var(--radius);box-shadow:0 18px 48px rgba(0,0,0,.12);overflow:hidden}
+.demo-frame svg{display:block;width:100%;height:auto}
+.cap{font-size:12.5px;color:var(--dim);text-align:center;margin-top:10px}
+
+/* ============ 动画演示(视频段) ============ */
+.videos{background:var(--bg2)}
+.vid-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:24px}
+.vid{background:#fff;border-radius:var(--radius);overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.vid svg{display:block;width:100%;height:auto}
+.vid .meta{padding:18px 22px}
+.vid .meta h3{font-size:17px;margin-bottom:4px}
+.vid .meta p{font-size:13.5px;color:var(--dim)}
+.play-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:8px;animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ============ FAQ ============ */
+.faq{max-width:760px;margin:0 auto}
+.faq details{background:#fff;border-radius:14px;padding:20px 26px;margin-bottom:12px;box-shadow:0 1px 3px rgba(0,0,0,.05);cursor:pointer}
+.faq summary{font-size:16.5px;font-weight:600;list-style:none;position:relative;padding-right:28px}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";position:absolute;right:2px;top:-2px;font-size:22px;color:var(--acc);font-weight:400;transition:transform .2s}
+.faq details[open] summary::after{transform:rotate(45deg)}
+.faq details p{margin-top:12px;font-size:14.5px;color:var(--dim)}
+
+/* ============ 底部 ============ */
+footer{background:#1d1d1f;color:#a1a1a6;padding:56px 0 40px;font-size:13px}
+footer .cols{display:grid;grid-template-columns:2fr 1fr 1fr;gap:40px;margin-bottom:36px}
+footer h4{color:#f5f5f7;font-size:14px;margin-bottom:12px}
+footer a{color:#a1a1a6}
+footer a:hover{color:#fff}
+footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
+
+/* ============ 响应式 ============ */
+@media(max-width:860px){
+  .grid6{grid-template-columns:1fr 1fr}
+  .vid-grid{grid-template-columns:1fr}
+  .doc-block{grid-template-columns:1fr;gap:28px}
+  .doc-block:nth-child(even){direction:ltr}
+  .hero h1{font-size:40px}
+  .sec-title{font-size:32px}
   nav .links{display:none}
-  h1{font-size:34px}
+  footer .cols{grid-template-columns:1fr}
 }
+
+/* ============ SVG 演示动画(纯 CSS,自动循环,等效视频) ============ */
+@keyframes fadeIO{0%,12%{opacity:0}22%,78%{opacity:1}92%,100%{opacity:0}}
+@keyframes cursorA{0%,10%{transform:translate(0,0);opacity:0}16%{opacity:1}30%{transform:translate(96px,52px)}46%,58%{transform:translate(96px,52px)}70%{transform:translate(150px,84px)}82%,90%{transform:translate(150px,84px);opacity:1}96%,100%{opacity:0}}
+@keyframes chromeIn{0%,24%{opacity:0}34%,60%{opacity:1}74%,100%{opacity:0}}
+@keyframes fenceGrow{0%,46%{transform:scale(1)}58%,84%{transform:scale(1.14,1.2)}96%,100%{transform:scale(1)}}
+@keyframes dragMove{0%,14%{transform:translate(0,0)}40%{transform:translate(128px,64px)}74%,86%{transform:translate(128px,64px)}100%{transform:translate(0,0)}}
+@keyframes insLine{0%,30%{opacity:0}40%,72%{opacity:1}82%,100%{opacity:0}}
+@keyframes iconVanish{0%,38%{opacity:1}46%,100%{opacity:0}}
+@keyframes iconArrive{0%,44%{opacity:0}54%,86%{opacity:1}100%{opacity:0}}
+@keyframes wpShift{0%,18%{fill:#7fb2e8}30%,64%{fill:#f2b264}78%,100%{fill:#7fb2e8}}
+@keyframes wpShift2{0%,18%{fill:#5a8cc4}30%,64%{fill:#d98f47}78%,100%{fill:#5a8cc4}}
+@keyframes menuPop{0%,16%{opacity:0;transform:scale(.92)}24%,72%{opacity:1;transform:scale(1)}82%,100%{opacity:0;transform:scale(.97)}}
+@keyframes trayCursor{0%,8%{transform:translate(0,0);opacity:0}14%{opacity:1}26%{transform:translate(150px,-4px)}70%,80%{transform:translate(150px,-4px);opacity:1}94%,100%{opacity:0}}
+@keyframes menuHi{0%,30%{fill:transparent}40%,66%{fill:#0a84ff}78%,100%{fill:transparent}}
+.svgdemo{background:#e9eef6}
 </style>
 </head>
 <body>
 
+<!-- ============ 导航 ============ -->
 <nav>
   <div class="wrap">
-    <a class="logo" href="#"><span class="mark">D</span>DeskFence</a>
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 20 20"><rect x="1" y="1" width="8" height="8" rx="2.2" fill="#0071e3"/><rect x="11" y="1" width="8" height="8" rx="2.2" fill="#0071e3" opacity=".45"/><rect x="1" y="11" width="8" height="8" rx="2.2" fill="#0071e3" opacity=".45"/><rect x="11" y="11" width="8" height="8" rx="2.2" fill="#0071e3"/></svg>
+      DeskFence
+    </div>
     <div class="links">
-      <a href="#features">核心特性</a>
-      <a href="#gallery">功能一览</a>
-      <a href="#docs">使用文档</a>
+      <a href="#features">核心能力</a>
+      <a href="#guide">使用文档</a>
+      <a href="#videos">动画演示</a>
       <a href="#faq">常见问题</a>
     </div>
-    <a class="btn primary" href="#download">免费下载</a>
   </div>
 </nav>
 
-<header id="download">
-  <div class="wrap hero">
-    <div>
-      <span class="kicker">🖥 Windows 11 / 10 · 原生 Rust 实现 · 纯本地运行</span>
-      <h1>把杂乱桌面,<br>一键变成<em>秩序井然的栅栏</em></h1>
-      <p class="lead">DeskFence 将桌面文件按类型自动归入透明栅栏分区。图标与文字和原生桌面<strong>像素级一致</strong>,启动秒级接管,关掉它桌面立刻还原——像给桌面请了一位看不见的整理师。</p>
-      <div class="cta">
-        <a class="btn primary" href="#">⬇ 下载 Windows 版(v1.0 · 0.9 MB)</a>
-        <a class="btn ghost" href="#docs">查看使用文档</a>
-      </div>
-      <div class="meta">
-        <span>✔ 免费</span><span>✔ 无广告 · 无联网</span><span>✔ 开机自启</span><span>✔ 一键还原原生桌面</span>
-      </div>
+<!-- ============ Hero ============ -->
+<header class="hero">
+  <div class="wrap">
+    <span class="badge">为 Windows 10 / 11 打造 · 轻量 · 免安装</span>
+    <h1>桌面,井然有序。</h1>
+    <div class="sub">DeskFence 自动把杂乱的桌面图标分入栅栏,<br>观感与原生桌面逐像素一致,几乎察觉不到它在运行。</div>
+    <div class="cta">
+      <a class="btn" href="#guide">五分钟上手</a>
+      <a class="btn ghost" href="#videos">看动画演示</a>
     </div>
-    <div class="hero-shot">
-      <img src="assets/01-desktop.png" alt="DeskFence 桌面整理效果">
-      <div class="float f1">📁 <b>自动分类</b> 8 大类自动归组</div>
-      <div class="float f2">🔍 <b>像素级一致</b> 与原生桌面无差别</div>
+    <div class="hero-note">单个 exe · 内存占用 ~80MB · 开机自启可关 · 卸载即还原</div>
+
+    <!-- 首屏动画:图标飞入栅栏(卡通 Win11 桌面) -->
+    <div class="hero-anim">
+      <svg viewBox="0 0 880 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="桌面图标自动归入栅栏的演示动画">
+        <rect width="880" height="460" fill="#8ec9f0"/>
+        <path d="M0 340 Q220 260 440 330 T880 310 V460 H0 Z" fill="#7ab2dd"/>
+        <path d="M0 390 Q260 330 520 380 T880 370 V460 H0 Z" fill="#6aa3d2"/>
+        <rect x="0" y="432" width="880" height="28" fill="#ffffff" opacity=".82"/>
+        <rect x="12" y="438" width="16" height="16" rx="3" fill="#0078d4"/>
+        <circle cx="440" cy="446" r="3" fill="#0071e3"/>
+        <g opacity=".5"><rect x="820" y="440" width="18" height="12" rx="2" fill="#555"/></g>
+        <!-- 原生散乱图标(渐隐) -->
+        <g class="scattered">
+          <g><rect x="60" y="70" width="44" height="44" rx="8" fill="#ffd34d"/><rect x="70" y="58" width="24" height="18" rx="4" fill="#ffe289"/><text x="82" y="132" font-size="11" text-anchor="middle" fill="#333" font-family="sans-serif">报告.docx</text></g>
+          <g><rect x="200" y="90" width="44" height="44" rx="8" fill="#7ee08a"/><text x="222" y="152" font-size="11" text-anchor="middle" fill="#333" font-family="sans-serif">预算.xlsx</text></g>
+          <g><rect x="380" y="60" width="44" height="44" rx="8" fill="#f28b6b"/><text x="402" y="122" font-size="11" text-anchor="middle" fill="#333" font-family="sans-serif">照片.jpg</text></g>
+          <g><rect x="560" y="84" width="44" height="44" rx="8" fill="#9d8cf0"/><text x="582" y="146" font-size="11" text-anchor="middle" fill="#333" font-family="sans-serif">工具.exe</text></g>
+        </g>
+        <style>.scattered{animation:fadeIO 7s ease-in-out infinite}</style>
+        <!-- 三个栅栏(渐显) -->
+        <g>
+          <rect x="46" y="46" width="180" height="200" rx="12" fill="#ffffff" opacity="0" class="f1"/>
+          <rect x="46" y="46" width="180" height="200" rx="12" fill="none" stroke="#9ab8d8" stroke-width="1.5" opacity="0" class="f1"/>
+          <text x="136" y="72" font-size="13" font-weight="600" fill="#33506e" text-anchor="middle" opacity="0" class="f1">文档</text>
+          <g opacity="0" class="f1"><rect x="72" y="92" width="40" height="40" rx="8" fill="#ffd34d"/><rect x="82" y="80" width="20" height="16" rx="4" fill="#ffe289"/><text x="92" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">报告.docx</text></g>
+          <g opacity="0" class="f1"><rect x="152" y="92" width="40" height="40" rx="8" fill="#7ee08a"/><text x="172" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">预算.xlsx</text></g>
+          <g opacity="0" class="f1"><rect x="72" y="168" width="40" height="40" rx="8" fill="#6bc1e8"/><text x="92" y="226" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">笔记.txt</text></g>
+
+          <rect x="290" y="46" width="180" height="200" rx="12" fill="#ffffff" opacity="0" class="f2"/>
+          <rect x="290" y="46" width="180" height="200" rx="12" fill="none" stroke="#9ab8d8" stroke-width="1.5" opacity="0" class="f2"/>
+          <text x="380" y="72" font-size="13" font-weight="600" fill="#33506e" text-anchor="middle" opacity="0" class="f2">图片</text>
+          <g opacity="0" class="f2"><rect x="316" y="92" width="40" height="40" rx="8" fill="#f28b6b"/><text x="336" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">照片.jpg</text></g>
+          <g opacity="0" class="f2"><rect x="396" y="92" width="40" height="40" rx="8" fill="#f2b6d8"/><text x="416" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">设计.png</text></g>
+
+          <rect x="534" y="46" width="180" height="200" rx="12" fill="#ffffff" opacity="0" class="f3"/>
+          <rect x="534" y="46" width="180" height="200" rx="12" fill="none" stroke="#9ab8d8" stroke-width="1.5" opacity="0" class="f3"/>
+          <text x="624" y="72" font-size="13" font-weight="600" fill="#33506e" text-anchor="middle" opacity="0" class="f3">软件</text>
+          <g opacity="0" class="f3"><rect x="560" y="92" width="40" height="40" rx="8" fill="#9d8cf0"/><text x="580" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">工具.exe</text></g>
+          <g opacity="0" class="f3"><rect x="640" y="92" width="40" height="40" rx="8" fill="#54c7ec"/><text x="660" y="150" font-size="10" text-anchor="middle" fill="#333" font-family="sans-serif">浏览器</text></g>
+        </g>
+        <style>
+          .f1{animation:fadeIO 7s ease-in-out infinite reverse}
+          .f2{animation:fadeIO 7s .35s ease-in-out infinite reverse}
+          .f3{animation:fadeIO 7s .7s ease-in-out infinite reverse}
+        </style>
+        <g>
+          <rect x="240" y="300" width="400" height="44" rx="22" fill="#1d1d1f" opacity=".82"/>
+          <text x="440" y="328" font-size="16" fill="#fff" text-anchor="middle" font-family="sans-serif">启动 DeskFence → 图标自动归类入栅栏</text>
+        </g>
+      </svg>
     </div>
   </div>
 </header>
 
-<section id="features">
+<!-- ============ 核心能力 ============ -->
+<section id="features" class="features">
   <div class="wrap">
-    <div class="sec-head">
-      <div class="tag">FEATURES</div>
-      <h2>为什么选择 DeskFence</h2>
-      <p>我们不改变你的桌面,我们只是让它井井有条。</p>
-    </div>
-    <div class="features">
-      <div class="feat"><div class="ic">🗂</div><h3>自动分类,放进对应栅栏</h3><p>软件、文件夹、文档、图片、媒体、代码、压缩包、其他——新文件落桌面即自动归位,8 大类永久保持整齐。</p></div>
-      <div class="feat"><div class="ic">🎯</div><h3>像素级原生观感</h3><p>图标提取、ClearType 文字渲染、悬停高亮全部与 Windows 原生桌面逐像素一致,不用就没有"换了桌面"的感觉。</p></div>
-      <div class="feat"><div class="ic">⚡</div><h3>秒级启动,零感知切换</h3><p>启动并行预热,首帧即最终画面;换壁纸毫秒级跟随。全程无闪屏、无中间态。</p></div>
-      <div class="feat"><div class="ic">🖐</div><h3>拖拽整理,随手归位</h3><p>拖动图标即现跟手残影与插入线,松手完成排序;拖到别的栅栏即转移分类,拖到回收站即删除。</p></div>
-      <div class="feat"><div class="ic">🛡</div><h3>纯本地,零打扰</h3><p>不联网、不上传、无广告无弹窗。原生 Rust 单文件实现,内存占用低至 100 MB 级。</p></div>
-      <div class="feat"><div class="ic">🧹</div><h3>随开随关,来去干净</h3><p>退出或卸载即刻恢复原生桌面,图标位置、文件本身分毫未动;异常崩溃下次启动也会自动恢复。</p></div>
-    </div>
-  </div>
-</section>
-
-<section class="gallery" id="gallery">
-  <div class="wrap">
-    <div class="sec-head">
-      <div class="tag">GALLERY</div>
-      <h2>功能一览</h2>
-      <p>每一处交互都为"和原生一样"而设计。</p>
-    </div>
-
-    <div class="shot">
-      <img src="assets/02-fence-menu.png" alt="栅栏操作菜单">
-      <div class="txt">
-        <h3>栅栏操作菜单</h3>
-        <p>每个栅栏右上角的倒三角是它的"管理中心"。</p>
-        <ul>
-          <li>折叠 / 展开:临时收起栅栏</li>
-          <li>锁定:防止误拖动位置</li>
-          <li>重命名 / 删除栅栏</li>
-          <li>排序:常用 / 时间 / 名称 / 手动</li>
-        </ul>
+    <h2 class="sec-title">它替你做好的六件事</h2>
+    <p class="sec-sub">每一个能力都可以在托盘菜单里单独开关。</p>
+    <div class="grid6">
+      <div class="card">
+        <div class="ico" style="background:#e8f1ff"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="2" y="2" width="10" height="10" rx="3" fill="#0071e3"/><rect x="14" y="2" width="10" height="10" rx="3" fill="#0071e3" opacity=".4"/><rect x="2" y="14" width="10" height="10" rx="3" fill="#0071e3" opacity=".4"/><rect x="14" y="14" width="10" height="10" rx="3" fill="#0071e3"/></svg></div>
+        <h3>自动分类</h3><p>按文件类型把桌面图标分进"文档 / 图片 / 软件"等栅栏;新文件落下自动入位,无需手动整理。</p>
       </div>
-    </div>
-
-    <div class="shot rev">
-      <div class="txt">
-        <h3>托盘总控菜单</h3>
-        <p>任务栏托盘图标(左键或右键)打开全局菜单,所有系统级设置都在这里。</p>
-        <ul>
-          <li>显示 / 隐藏全部栅栏</li>
-          <li>对齐方式:自动 / 网格 / 自由移动</li>
-          <li>渲染模式:精确 / 透明</li>
-          <li>开机自启、使用说明、退出</li>
-        </ul>
+      <div class="card">
+        <div class="ico" style="background:#eafff0"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M4 20 L13 5 L22 20 Z" fill="#34c759"/><rect x="7" y="20" width="12" height="3" rx="1.5" fill="#34c759" opacity=".5"/></svg></div>
+        <h3>原生级观感</h3><p>图标、字距、ClearType 文字与系统阴影全部与 Windows 原生桌面逐像素一致——不凑近看,分不出哪个是栅栏。</p>
       </div>
-      <img src="assets/03-tray-menu.png" alt="托盘菜单">
-    </div>
-
-    <div class="shot">
-      <img src="assets/04-context-menu.png" alt="文件右键菜单">
-      <div class="txt">
-        <h3>与原生一致的右键菜单</h3>
-        <p>右键栅栏里的文件,打开、复制、删除、重命名、属性……与原生桌面完全同源,第三方扩展菜单同样可用。</p>
-        <ul>
-          <li>就地重命名(与资源管理器同款)</li>
-          <li>删除进回收站,可还原</li>
-          <li>多选:Ctrl 单选 / Shift 连选 / 框选</li>
-        </ul>
+      <div class="card">
+        <div class="ico" style="background:#fff4e5"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="3" y="4" width="20" height="15" rx="2.5" fill="none" stroke="#f59e0b" stroke-width="2"/><path d="M3 9 H23" stroke="#f59e0b" stroke-width="2"/><path d="M9 22 H17" stroke="#f59e0b" stroke-width="2"/></svg></div>
+        <h3>换壁纸零感知</h3><p>栅栏背景实时透出真实壁纸:换壁纸、用带时钟的动态壁纸,栅栏区域与周围桌面同帧切换,没有旧色块残留。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#f3edff"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="3" y="5" width="20" height="16" rx="3" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="3.5 3"/><path d="M3 13 H23" stroke="#8b5cf6" stroke-width="2"/></svg></div>
+        <h3>无边框,悬停浮现</h3><p>平时完全隐形,只留下整齐的图标。鼠标扫过栅栏,边框、标题与四角手柄才浮现,此时可以拖动、缩放。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#ffe9ee"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="2" y="4" width="9" height="18" rx="2" fill="#ff6482" opacity=".35"/><rect x="15" y="4" width="9" height="18" rx="2" fill="#ff6482" opacity=".35"/><path d="M8 13 H18 M15 10 L18 13 L15 16" stroke="#ff6482" stroke-width="2" fill="none"/></svg></div>
+        <h3>拖拽即归类</h3><p>把图标从一个栅栏拖到另一个就完成分类转移,松手才落位、其余图标纹丝不动;拖到回收站即删除。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#e5f6ff"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M13 3 L22 7 V13 C22 18.5 18.2 21.8 13 23 C7.8 21.8 4 18.5 4 13 V7 Z" fill="none" stroke="#0a84ff" stroke-width="2"/><path d="M9 13 L12 16 L17 10" stroke="#0a84ff" stroke-width="2" fill="none"/></svg></div>
+        <h3>稳如老狗</h3><p>Explorer 崩溃重启、系统休眠唤醒、误杀进程,都能自动恢复;异常退出后原生桌面自动还原,绝不留白屏。</p>
       </div>
     </div>
   </div>
 </section>
 
-<section id="docs">
+<!-- ============ 使用文档 ============ -->
+<section id="guide">
   <div class="wrap">
-    <div class="sec-head">
-      <div class="tag">USER GUIDE</div>
-      <h2>使用文档</h2>
-      <p>从安装到进阶,5 分钟全部掌握。</p>
-    </div>
-    <div class="doc-toc">
-      <a href="#d1">1 · 安装与启动</a>
-      <a href="#d2">2 · 自动分类</a>
-      <a href="#d3">3 · 拖拽整理</a>
-      <a href="#d4">4 · 文件操作</a>
-      <a href="#d5">5 · 栅栏管理</a>
-      <a href="#d6">6 · 全局设置</a>
-      <a href="#d7">7 · 安全与还原</a>
+    <span class="badge" style="display:block;text-align:center">使用文档</span>
+    <h2 class="sec-title">四步,从乱到净</h2>
+    <p class="sec-sub">每一步都有动画演示,跟着点就行。</p>
+
+    <!-- 第 1 步 -->
+    <div class="doc-block">
+      <div>
+        <div class="doc-step">第 1 步</div>
+        <h3>启动即自动分类</h3>
+        <p>双击 <b>deskfence.exe</b>,一秒内桌面完成接管:图标按类型分入栅栏,原生图标隐藏,任务栏不增不减。</p>
+        <ul>
+          <li><b>首次运行</b> 在系统托盘出现图标,悬停显示 <b>DeskFence</b></li>
+          <li><b>无需配置</b> —— 默认就是最接近原生桌面的"精确渲染"</li>
+          <li><b>想还原?</b> 托盘右键 → 显示原生桌面 / 退出</li>
+        </ul>
+      </div>
+      <div>
+        <div class="demo-frame">
+          <svg viewBox="0 0 460 260" xmlns="http://www.w3.org/2000/svg" class="svgdemo" role="img" aria-label="启动后桌面被栅栏接管">
+            <rect width="460" height="260" fill="#bfe0f5"/>
+            <path d="M0 190 Q140 150 280 185 T460 175 V260 H0 Z" fill="#a8cfe8"/>
+            <rect x="22" y="24" width="150" height="170" rx="10" fill="#ffffff" opacity=".92"/>
+            <rect x="22" y="24" width="150" height="170" rx="10" fill="none" stroke="#9ab8d8"/>
+            <text x="97" y="48" font-size="12" font-weight="600" fill="#33506e" text-anchor="middle" font-family="sans-serif">文档</text>
+            <g><rect x="42" y="66" width="34" height="34" rx="7" fill="#ffd34d"/><text x="59" y="116" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+            <g><rect x="106" y="66" width="34" height="34" rx="7" fill="#7ee08a"/><text x="123" y="116" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">预算</text></g>
+            <rect x="230" y="24" width="150" height="170" rx="10" fill="#ffffff" opacity=".92"/>
+            <rect x="230" y="24" width="150" height="170" rx="10" fill="none" stroke="#9ab8d8"/>
+            <text x="305" y="48" font-size="12" font-weight="600" fill="#33506e" text-anchor="middle" font-family="sans-serif">软件</text>
+            <g><rect x="250" y="66" width="34" height="34" rx="7" fill="#9d8cf0"/><text x="267" y="116" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">工具</text></g>
+            <g><rect x="314" y="66" width="34" height="34" rx="7" fill="#54c7ec"/><text x="331" y="116" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">浏览器</text></g>
+            <rect x="0" y="238" width="460" height="22" fill="#ffffff" opacity=".85"/>
+            <circle cx="230" cy="249" r="2.5" fill="#0071e3"/>
+            <circle cx="438" cy="249" r="7" fill="#e8f1ff" stroke="#0071e3"/>
+            <rect x="434" y="245" width="8" height="8" rx="2" fill="#0071e3"/>
+          </svg>
+        </div>
+        <div class="cap">启动后:图标归入栅栏,原生桌面图标自动隐藏</div>
+      </div>
     </div>
 
-    <div class="doc" id="d1">
-      <h3><span class="num">1</span>安装与启动</h3>
-      <p class="sub">无需安装,双击即用。</p>
-      <ol>
-        <li>双击 <code>deskfence.exe</code>,约 1 秒后桌面自动完成整理——原生散落的图标消失,取而代之的是按类型分好的栅栏。</li>
-        <li>想开机自动运行:打开托盘菜单,勾选<b>「开机自启」</b>。</li>
-        <li>再次双击 exe 不会开第二个实例,只会把已隐藏的栅栏重新显示出来。</li>
-      </ol>
-      <div class="tip">💡 DeskFence 是单文件绿色软件,放在任何目录都可以;放好后不要再移动位置,否则开机自启会失效(可在托盘菜单重新勾选一次)。</div>
+    <!-- 第 2 步 -->
+    <div class="doc-block">
+      <div>
+        <div class="doc-step">第 2 步</div>
+        <h3>悬停浮现,拖角缩放</h3>
+        <p>平时栅栏是<b>隐形的</b>,桌面只剩整齐图标。把鼠标移到图标区域,边框和四角手柄浮现:</p>
+        <ul>
+          <li><b>拖边框</b> → 栅栏移到新位置(自动吸附对齐)</li>
+          <li><b>拖四角 L 形手柄</b> → 等比放大缩小</li>
+          <li><b>点标题旁倒三角 ▾</b> → 操作菜单(改名/折叠/锁定/删除)</li>
+          <li>鼠标移开后自动隐身,桌面回归干净</li>
+        </ul>
+      </div>
+      <div>
+        <div class="demo-frame">
+          <svg viewBox="0 0 460 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="悬停浮现边框与拖角缩放动画">
+            <rect width="460" height="260" fill="#bfe0f5"/>
+            <path d="M0 190 Q140 150 280 185 T460 175 V260 H0 Z" fill="#a8cfe8"/>
+            <g style="animation:fenceGrow 7s ease-in-out infinite;transform-origin:150px 110px">
+              <rect x="40" y="30" width="220" height="170" rx="10" fill="#ffffff" opacity=".92" style="animation:chromeIn 7s ease-in-out infinite"/>
+              <rect x="40" y="30" width="220" height="170" rx="10" fill="none" stroke="#5b8fc9" stroke-width="1.6" style="animation:chromeIn 7s ease-in-out infinite"/>
+              <g style="animation:chromeIn 7s ease-in-out infinite" fill="#5b8fc9">
+                <rect x="38" y="28" width="16" height="3.5" rx="1"/><rect x="38" y="28" width="3.5" height="16" rx="1"/>
+                <rect x="246" y="28" width="16" height="3.5" rx="1"/><rect x="258.5" y="28" width="3.5" height="16" rx="1"/>
+                <rect x="38" y="198.5" width="16" height="3.5" rx="1"/><rect x="38" y="186" width="3.5" height="16" rx="1"/>
+                <rect x="246" y="198.5" width="16" height="3.5" rx="1"/><rect x="258.5" y="186" width="3.5" height="16" rx="1"/>
+              </g>
+              <text x="60" y="54" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif" style="animation:chromeIn 7s ease-in-out infinite">文档 <tspan fill="#5b8fc9">▾</tspan></text>
+              <g><rect x="60" y="70" width="34" height="34" rx="7" fill="#ffd34d"/><text x="77" y="120" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+              <g><rect x="124" y="70" width="34" height="34" rx="7" fill="#7ee08a"/><text x="141" y="120" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">预算</text></g>
+              <g><rect x="60" y="136" width="34" height="34" rx="7" fill="#6bc1e8"/><text x="77" y="186" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">笔记</text></g>
+            </g>
+            <g style="animation:cursorA 7s ease-in-out infinite">
+              <path d="M0 0 L0 16 L4.5 12.5 L7.5 19 L10.5 17.5 L7.5 11 L13 11 Z" fill="#1d1d1f" stroke="#fff" stroke-width="1.2"/>
+            </g>
+            <g>
+              <rect x="120" y="222" width="220" height="30" rx="15" fill="#1d1d1f" opacity=".8"/>
+              <text x="230" y="242" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">悬停浮现 → 拖角手柄即可缩放</text>
+            </g>
+          </svg>
+        </div>
+        <div class="cap">边框 + 四角 L 手柄 + 标题:悬停才出现</div>
+      </div>
     </div>
 
-    <div class="doc" id="d2">
-      <h3><span class="num">2</span>自动分类:文件自己回家</h3>
-      <p class="sub">默认模式,开箱即用。</p>
-      <p>桌面文件按类型自动进入对应栅栏,某类栅栏不存在时会在该类第一个文件出现时自动创建:</p>
-      <table>
-        <tr><th>栅栏</th><th>收集的文件类型</th></tr>
-        <tr><td>🖥 软件</td><td>exe / msi / lnk / bat 等程序与快捷方式</td></tr>
-        <tr><td>📁 文件夹</td><td>所有目录</td></tr>
-        <tr><td>📄 文档</td><td>txt / md / Office / PDF 等</td></tr>
-        <tr><td>🖼 图片</td><td>jpg / png / gif / svg 等</td></tr>
-        <tr><td>🎬 媒体</td><td>mp3 / wav / mp4 / mkv 等音视频</td></tr>
-        <tr><td>💻 代码</td><td>py / js / ts / rs / go / c / cpp / html / json 等</td></tr>
-        <tr><td>📦 压缩包</td><td>zip / rar / 7z / tar / gz 等</td></tr>
-        <tr><td>❓ 其他</td><td>以上未覆盖的类型</td></tr>
-      </table>
-      <div class="tip">💡 回收站图标固定显示在「软件」栅栏第一位,把文件拖上去即删除,和原生桌面一样。</div>
+    <!-- 第 3 步 -->
+    <div class="doc-block">
+      <div>
+        <div class="doc-step">第 3 步</div>
+        <h3>拖一下,完成归类</h3>
+        <p>图标拖到哪里,就归到哪类。拖动过程中其余图标<b>纹丝不动</b>,一条插入线提示落点,松手才重新排列。</p>
+        <ul>
+          <li><b>跨栅栏拖动</b> → 分类转移</li>
+          <li><b>拖到回收站</b> → 删除文件</li>
+          <li><b>按住拖空白处</b> → 框选多个图标批量移动</li>
+        </ul>
+      </div>
+      <div>
+        <div class="demo-frame">
+          <svg viewBox="0 0 460 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="跨栅栏拖拽图标动画">
+            <rect width="460" height="260" fill="#bfe0f5"/>
+            <path d="M0 190 Q140 150 280 185 T460 175 V260 H0 Z" fill="#a8cfe8"/>
+            <rect x="24" y="30" width="170" height="170" rx="10" fill="#ffffff" opacity=".92"/>
+            <text x="46" y="54" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif">文档</text>
+            <g style="animation:iconVanish 7s ease-in-out infinite"><rect x="48" y="68" width="34" height="34" rx="7" fill="#ffd34d"/><text x="65" y="118" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+            <g><rect x="112" y="68" width="34" height="34" rx="7" fill="#7ee08a"/><text x="129" y="118" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">预算</text></g>
+            <rect x="266" y="30" width="170" height="170" rx="10" fill="#ffffff" opacity=".92"/>
+            <text x="288" y="54" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif">软件</text>
+            <g><rect x="290" y="68" width="34" height="34" rx="7" fill="#9d8cf0"/><text x="307" y="118" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">工具</text></g>
+            <g style="animation:iconArrive 7s ease-in-out infinite"><rect x="354" y="68" width="34" height="34" rx="7" fill="#ffd34d"/><text x="371" y="118" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+            <rect x="348" y="62" width="3" height="48" rx="1.5" fill="#0071e3" style="animation:insLine 7s ease-in-out infinite"/>
+            <g style="animation:dragMove 7s ease-in-out infinite">
+              <rect x="48" y="68" width="34" height="34" rx="7" fill="#ffd34d" opacity=".65"/>
+              <path d="M78 78 L78 94 L82.5 90.5 L85.5 97 L88.5 95.5 L85.5 89 L91 89 Z" fill="#1d1d1f" stroke="#fff" stroke-width="1.1"/>
+            </g>
+            <g>
+              <rect x="120" y="222" width="220" height="30" rx="15" fill="#1d1d1f" opacity=".8"/>
+              <text x="230" y="242" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">蓝色插入线指示落点,松手即归类</text>
+            </g>
+          </svg>
+        </div>
+        <div class="cap">插入线提示落点;其余图标松手前完全不动</div>
+      </div>
     </div>
 
-    <div class="doc" id="d3">
-      <h3><span class="num">3</span>拖拽整理:随手一拖就位</h3>
-      <p class="sub">被拖的图标跟手移动,其他图标纹丝不动,松手才重排。</p>
-      <figure><img src="assets/05-drag.png" alt="拖拽残影"><figcaption>拖动中:被拖图标以半透明残影跟手,其余图标不动</figcaption></figure>
-      <ul>
-        <li><b>调整顺序</b>:按住图标拖到目标位置,出现插入线后松手。</li>
-        <li><b>跨栅栏转移</b>:拖到另一个栅栏上松手,文件即改换分类(自定义分类模式下即完成"归档")。</li>
-        <li><b>删除</b>:拖到回收站图标上松手。</li>
-        <li>拖动中按 <kbd>Esc</kbd> 取消,一切还原。</li>
-        <li>拖动<b>栅栏本身</b>(标题区)可以移动栅栏;靠近边缘自动吸附,靠近其他栅栏自动保持间距;栅栏之间出现插入线可调换顺序。</li>
-      </ul>
-      <div class="tip">💡 悬停高亮也有——鼠标在图标上停留约 0.4 秒出现高亮,和原生桌面手感完全一致。</div>
-      <figure><img src="assets/06-hover.png" alt="悬停高亮"><figcaption>悬停高亮:与原生桌面一致的延迟与样式</figcaption></figure>
-    </div>
-
-    <div class="doc" id="d4">
-      <h3><span class="num">4</span>文件操作:双击、右键、重命名</h3>
-      <p class="sub">所有操作与原生桌面同源。</p>
-      <ul>
-        <li><b>打开文件</b>:双击图标,与在桌面双击完全一致。</li>
-        <li><b>右键菜单</b>:打开、打开方式、复制、删除、属性……与原生逐项一致(含系统第三方扩展)。</li>
-        <li><b>重命名</b>:右键 → 重命名,或选中后按 <kbd>F2</kbd>,在原图标位置就地编辑,回车确认、Esc 取消。</li>
-        <li><b>多选</b>:<kbd>Ctrl</kbd> 点选、<kbd>Shift</kbd> 连选、空白处按住左键框选。</li>
-        <li><b>滚轮</b>:栅栏内容超出时滚动查看。</li>
-      </ul>
-      <figure><img src="assets/04-context-menu.png" alt="右键菜单"><figcaption>右键菜单与原生桌面完全一致,支持多选与就地重命名</figcaption></figure>
-    </div>
-
-    <div class="doc" id="d5">
-      <h3><span class="num">5</span>栅栏管理:折叠、锁定、新建、删除</h3>
-      <p class="sub">点栅栏右上角的「倒三角」打开管理菜单。</p>
-      <figure><img src="assets/02-fence-menu.png" alt="栅栏菜单"><figcaption>倒三角菜单:折叠 / 锁定 / 重命名 / 删除 / 排序方式</figcaption></figure>
-      <ul>
-        <li><b>折叠 / 展开</b>:临时收起栅栏只留标题条,再点一次展开。</li>
-        <li><b>锁定</b>:锁定后栅栏位置不可拖动,防误碰。</li>
-        <li><b>排序方式</b>:常用(按使用频率)/ 最近修改 / 名称 / 手动(完全由拖动决定)。</li>
-        <li><b>自定义分类模式</b>:托盘菜单取消勾选「自动分类」后,文件不再按类型归类——拖进哪个栅栏就属于哪个栅栏,未分配的集中在「未分类」;右键标题可重命名 / 删除栅栏。重新勾选「自动分类」即回到 8 类模式。</li>
-        <li><b>调整大小</b>:拖动栅栏边缘/四角;高度不足时自动出现滚动条。</li>
-      </ul>
-    </div>
-
-    <div class="doc" id="d6">
-      <h3><span class="num">6</span>全局设置:一切在托盘菜单</h3>
-      <p class="sub">任务栏右下角托盘图标,左键或右键均可打开。</p>
-      <figure><img src="assets/03-tray-menu.png" alt="托盘菜单"><figcaption>托盘菜单:显示/隐藏、撤销、恢复默认布局、对齐方式、渲染模式、开机自启、退出</figcaption></figure>
-      <table>
-        <tr><th>菜单项</th><th>作用</th></tr>
-        <tr><td>显示 / 隐藏全部栅栏</td><td>一键在"整理桌面"与"原生桌面"间切换(Win+D 后也能自动恢复)</td></tr>
-        <tr><td>撤销上次布局调整</td><td>还原最近一次移动 / 重排</td></tr>
-        <tr><td>恢复默认布局</td><td>栅栏回到初始的自动排布</td></tr>
-        <tr><td>对齐方式</td><td><b>自动对齐</b>(固定间隔,推荐)/ <b>网格对齐</b>(图标格倍数)/ <b>自由移动</b>(栅栏任意摆放不受限)</td></tr>
-        <tr><td>渲染模式</td><td><b>精确</b>(默认,与原生逐像素一致)/ <b>透明</b>(使用动态壁纸软件时选这个)</td></tr>
-        <tr><td>自动分类(默认 8 类)</td><td>勾选=按类型自动归类;取消=自定义分类模式</td></tr>
-        <tr><td>开机自启</td><td>随 Windows 启动</td></tr>
-        <tr><td>退出</td><td>恢复原生桌面并退出程序</td></tr>
-      </table>
-    </div>
-
-    <div class="doc" id="d7">
-      <h3><span class="num">7</span>安全与还原:来去干净</h3>
-      <p class="sub">DeskFence 只"接管显示",从不移动或修改你的文件。</p>
-      <ul>
-        <li>所有文件仍原封不动地放在桌面目录里,用资源管理器打开桌面看到的就是原样。</li>
-        <li>退出、卸载、结束进程,桌面立刻恢复原生图标。</li>
-        <li>即使程序异常崩溃,下次启动也会检测到并自动恢复原生桌面;极端情况下可运行 <code>deskfence.exe --restore-desktop</code> 一键自救。</li>
-        <li>布局与偏好保存在 <code>%APPDATA%\DeskFence\</code>,删除该文件夹即完全清除痕迹。</li>
-      </ul>
-      <div class="warn">⚠ 唯一需要注意:使用 Wallpaper Engine 等动态壁纸软件时,请在托盘菜单把渲染模式切换为「透明」,以获得最佳兼容性。</div>
+    <!-- 第 4 步 -->
+    <div class="doc-block">
+      <div>
+        <div class="doc-step">第 4 步</div>
+        <h3>托盘菜单,一切可调</h3>
+        <p>点击任务栏托盘的 <b>DeskFence</b> 图标,打开总控菜单:</p>
+        <ul>
+          <li><b>渲染模式</b>:精确(默认,与原生逐像素一致)/ 透明(兼容特殊环境)</li>
+          <li><b>对齐模式</b>:网格吸附 / 自由摆放</li>
+          <li><b>自动分类</b>:新文件自动入栅栏,可随时开关</li>
+          <li><b>显示原生桌面</b>:临时退回原生状态查看</li>
+          <li><b>开机自启 / 使用说明 / 退出</b></li>
+        </ul>
+      </div>
+      <div>
+        <div class="demo-frame">
+          <svg viewBox="0 0 460 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="托盘菜单动画">
+            <rect width="460" height="260" fill="#bfe0f5"/>
+            <path d="M0 190 Q140 150 280 185 T460 175 V260 H0 Z" fill="#a8cfe8"/>
+            <rect x="0" y="236" width="460" height="24" fill="#ffffff" opacity=".88"/>
+            <g style="animation:trayCursor 7s ease-in-out infinite">
+              <path d="M0 0 L0 16 L4.5 12.5 L7.5 19 L10.5 17.5 L7.5 11 L13 11 Z" fill="#1d1d1f" stroke="#fff" stroke-width="1.2" transform="translate(300,244)"/>
+            </g>
+            <circle cx="414" cy="248" r="7" fill="#e8f1ff" stroke="#0071e3"/>
+            <rect x="410" y="244" width="8" height="8" rx="2" fill="#0071e3"/>
+            <g style="animation:menuPop 7s ease-in-out infinite;transform-origin:414px 236px">
+              <rect x="256" y="60" width="180" height="172" rx="10" fill="#ffffff" stroke="#d7dce4"/>
+              <rect x="262" y="66" width="168" height="26" rx="6" style="animation:menuHi 7s ease-in-out infinite"/>
+              <text x="274" y="83" font-size="12" fill="#1d1d1f" font-family="sans-serif">显示 / 隐藏栅栏</text>
+              <text x="274" y="110" font-size="12" fill="#1d1d1f" font-family="sans-serif">自动分类 <tspan fill="#34c759">✓</tspan></text>
+              <text x="274" y="131" font-size="12" fill="#1d1d1f" font-family="sans-serif">渲染模式:精确 <tspan fill="#34c759">✓</tspan></text>
+              <text x="274" y="152" font-size="12" fill="#1d1d1f" font-family="sans-serif">对齐模式:网格</text>
+              <text x="274" y="173" font-size="12" fill="#1d1d1f" font-family="sans-serif">开机自启</text>
+              <line x1="264" y1="184" x2="428" y2="184" stroke="#ececf0"/>
+              <text x="274" y="204" font-size="12" fill="#1d1d1f" font-family="sans-serif">退出 DeskFence</text>
+            </g>
+            <g>
+              <rect x="120" y="18" width="220" height="30" rx="15" fill="#1d1d1f" opacity=".8"/>
+              <text x="230" y="38" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">点托盘图标 → 总控菜单</text>
+            </g>
+          </svg>
+        </div>
+        <div class="cap">所有开关集中在一处,勾选即时生效</div>
+      </div>
     </div>
   </div>
 </section>
 
-<section>
+<!-- ============ 动画演示(视频) ============ -->
+<section id="videos" class="videos">
   <div class="wrap">
-    <div class="sec-head">
-      <div class="tag">QUALITY</div>
-      <h2>工程品质</h2>
-    </div>
-    <div class="tech">
-      <div class="t"><b>&lt; 1.5s</b><span>冷启动接管桌面</span><p>并行预热 + 首帧即最终帧</p></div>
-      <div class="t"><b>100%</b><span>像素级还原</span><p>图标/ClearType 文字与原生逐像素比对</p></div>
-      <div class="t"><b>0</b><span>联网请求</span><p>纯本地运行,无遥测无广告</p></div>
-      <div class="t"><b>1</b><span>单文件</span><p>原生 Rust,无需运行时依赖</p></div>
+    <span class="badge" style="display:block;text-align:center">动画演示</span>
+    <h2 class="sec-title">看它怎么动</h2>
+    <p class="sec-sub">以下为自动循环播放的演示动画(卡通桌面复现真实交互),每个约 7 秒。</p>
+    <div class="vid-grid">
+      <div class="vid">
+        <svg viewBox="0 0 460 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="换壁纸零感知演示">
+          <rect width="460" height="240" style="animation:wpShift 8s ease-in-out infinite"/>
+          <path d="M0 180 Q140 145 280 175 T460 168 V240 H0 Z" style="animation:wpShift2 8s ease-in-out infinite"/>
+          <rect x="26" y="26" width="180" height="150" rx="10" fill="#ffffff" opacity=".9"/>
+          <text x="46" y="50" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif">文档</text>
+          <g><rect x="46" y="64" width="32" height="32" rx="7" fill="#ffd34d"/><text x="62" y="112" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+          <g><rect x="106" y="64" width="32" height="32" rx="7" fill="#7ee08a"/><text x="122" y="112" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">预算</text></g>
+          <rect x="240" y="26" width="180" height="150" rx="10" fill="#ffffff" opacity=".9"/>
+          <text x="260" y="50" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif">软件</text>
+          <g><rect x="260" y="64" width="32" height="32" rx="7" fill="#9d8cf0"/><text x="276" y="112" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">工具</text></g>
+          <g>
+            <rect x="86" y="196" width="288" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <text x="230" y="216" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">壁纸切换 → 栅栏背景同帧跟随,文字稳定如初</text>
+          </g>
+        </svg>
+        <div class="meta"><h3><span class="play-dot"></span>换壁纸零感知</h3><p>背景实时透出真实壁纸;标签阴影与壁纸底色无关,切换瞬间即正确。</p></div>
+      </div>
+      <div class="vid">
+        <svg viewBox="0 0 460 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="无边框悬停浮现演示">
+          <rect width="460" height="240" fill="#bfe0f5"/>
+          <path d="M0 180 Q140 145 280 175 T460 168 V240 H0 Z" fill="#a8cfe8"/>
+          <rect x="60" y="30" width="200" height="150" rx="10" fill="#ffffff" opacity="0" style="animation:chromeIn 7s ease-in-out infinite"/>
+          <rect x="60" y="30" width="200" height="150" rx="10" fill="none" stroke="#5b8fc9" stroke-width="1.6" style="animation:chromeIn 7s ease-in-out infinite"/>
+          <g style="animation:chromeIn 7s ease-in-out infinite" fill="#5b8fc9">
+            <rect x="58" y="28" width="15" height="3.4" rx="1"/><rect x="58" y="28" width="3.4" height="15" rx="1"/>
+            <rect x="247" y="28" width="15" height="3.4" rx="1"/><rect x="258.6" y="28" width="3.4" height="15" rx="1"/>
+            <rect x="58" y="178.6" width="15" height="3.4" rx="1"/><rect x="58" y="167" width="3.4" height="15" rx="1"/>
+            <rect x="247" y="178.6" width="15" height="3.4" rx="1"/><rect x="258.6" y="167" width="3.4" height="15" rx="1"/>
+          </g>
+          <text x="80" y="54" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif" style="animation:chromeIn 7s ease-in-out infinite">文档 ▾</text>
+          <g><rect x="84" y="70" width="34" height="34" rx="7" fill="#ffd34d"/><text x="101" y="120" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">报告</text></g>
+          <g><rect x="148" y="70" width="34" height="34" rx="7" fill="#7ee08a"/><text x="165" y="120" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">预算</text></g>
+          <g><rect x="212" y="70" width="34" height="34" rx="7" fill="#6bc1e8"/><text x="229" y="120" font-size="9" text-anchor="middle" fill="#333" font-family="sans-serif">笔记</text></g>
+          <g style="animation:cursorA 7s ease-in-out infinite">
+            <path d="M0 0 L0 16 L4.5 12.5 L7.5 19 L10.5 17.5 L7.5 11 L13 11 Z" fill="#1d1d1f" stroke="#fff" stroke-width="1.2"/>
+          </g>
+          <g>
+            <rect x="96" y="200" width="268" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">平时隐形 → 悬停浮现边框与手柄</text>
+          </g>
+        </svg>
+        <div class="meta"><h3><span class="play-dot"></span>无边框,悬停浮现</h3><p>默认态完全干净;边框、四角手柄与标题只在鼠标扫过时出现。</p></div>
+      </div>
+      <div class="vid">
+        <svg viewBox="0 0 460 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="原生观感对比演示">
+          <rect width="460" height="240" fill="#bfe0f5"/>
+          <path d="M0 180 Q140 145 280 175 T460 168 V240 H0 Z" fill="#a8cfe8"/>
+          <text x="120" y="26" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">原生桌面</text>
+          <g><rect x="86" y="44" width="34" height="34" rx="7" fill="#ffd34d"/><rect x="96" y="34" width="18" height="14" rx="4" fill="#ffe289"/><text x="103" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
+          <g><rect x="150" y="44" width="34" height="34" rx="7" fill="#7ee08a"/><text x="167" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
+          <line x1="230" y1="20" x2="230" y2="120" stroke="#9ab8d8" stroke-dasharray="4 4"/>
+          <text x="345" y="26" font-size="13" font-weight="700" fill="#33506e" text-anchor="middle" font-family="sans-serif">DeskFence 栅栏</text>
+          <g><rect x="311" y="44" width="34" height="34" rx="7" fill="#ffd34d"/><rect x="321" y="34" width="18" height="14" rx="4" fill="#ffe289"/><text x="328" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">报告</text></g>
+          <g><rect x="375" y="44" width="34" height="34" rx="7" fill="#7ee08a"/><text x="392" y="94" font-size="9" text-anchor="middle" fill="#fff" font-family="sans-serif" style="paint-order:stroke;stroke:#000;stroke-width:2px">预算</text></g>
+          <g>
+            <rect x="86" y="200" width="288" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">同一字体、同一 ClearType、同一阴影 —— 逐像素一致</text>
+          </g>
+        </svg>
+        <div class="meta"><h3><span class="play-dot"></span>原生级观感</h3><p>与 Explorer 桌面同源的文字引擎(DrawShadowText/ClearType),放大到像素级也对得上。</p></div>
+      </div>
+      <div class="vid">
+        <svg viewBox="0 0 460 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="自动恢复演示">
+          <rect width="460" height="240" fill="#bfe0f5"/>
+          <path d="M0 180 Q140 145 280 175 T460 168 V240 H0 Z" fill="#a8cfe8"/>
+          <g style="animation:fadeIO 8s ease-in-out infinite">
+            <rect x="40" y="60" width="380" height="90" rx="10" fill="#2b2b2e" opacity=".92"/>
+            <text x="230" y="95" font-size="13" fill="#ff6b7a" text-anchor="middle" font-family="monospace">explorer.exe 已重启…</text>
+            <text x="230" y="120" font-size="13" fill="#ffd34d" text-anchor="middle" font-family="monospace">DeskFence 自动恢复中 ✓</text>
+          </g>
+          <rect x="60" y="60" width="160" height="150" rx="10" fill="#ffffff" opacity="0" style="animation:fadeIO 8s 4s ease-in-out infinite reverse"/>
+          <text x="82" y="84" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif" style="animation:fadeIO 8s 4s ease-in-out infinite reverse">文档</text>
+          <g style="animation:fadeIO 8s 4s ease-in-out infinite reverse"><rect x="82" y="98" width="32" height="32" rx="7" fill="#ffd34d"/></g>
+          <g style="animation:fadeIO 8s 4s ease-in-out infinite reverse"><rect x="146" y="98" width="32" height="32" rx="7" fill="#7ee08a"/></g>
+          <rect x="260" y="60" width="160" height="150" rx="10" fill="#ffffff" opacity="0" style="animation:fadeIO 8s 4s ease-in-out infinite reverse"/>
+          <text x="282" y="84" font-size="12" font-weight="600" fill="#33506e" font-family="sans-serif" style="animation:fadeIO 8s 4s ease-in-out infinite reverse">软件</text>
+          <g style="animation:fadeIO 8s 4s ease-in-out infinite reverse"><rect x="282" y="98" width="32" height="32" rx="7" fill="#9d8cf0"/></g>
+          <g>
+            <rect x="96" y="200" width="268" height="30" rx="15" fill="#1d1d1f" opacity=".82"/>
+            <text x="230" y="220" font-size="12.5" fill="#fff" text-anchor="middle" font-family="sans-serif">Explorer 重启 / 进程被杀 → 栅栏与桌面自动恢复</text>
+          </g>
+        </svg>
+        <div class="meta"><h3><span class="play-dot"></span>崩溃自愈</h3><p>异常退出自动还原原生桌面,重启后自动恢复栅栏布局,数据零丢失。</p></div>
+      </div>
     </div>
   </div>
 </section>
 
+<!-- ============ FAQ ============ -->
 <section id="faq">
   <div class="wrap">
-    <div class="sec-head">
-      <div class="tag">FAQ</div>
-      <h2>常见问题</h2>
+    <h2 class="sec-title">常见问题</h2>
+    <p class="sec-sub">没找到答案?托盘菜单 → 使用说明。</p>
+    <div class="faq">
+      <details open>
+        <summary>我的文件会被移动或修改吗?</summary>
+        <p>不会。DeskFence 只接管"图标的显示方式",文件本身始终留在桌面目录原位,退出后连摆放位置都原样恢复。</p>
+      </details>
+      <details>
+        <summary>会影响系统性能吗?</summary>
+        <p>不会。空闲时几乎零活动:渲染仅在悬停、文件变化、壁纸切换等事件发生时进行;内存占用约 80MB,无后台联网,无服务注入。</p>
+      </details>
+      <details>
+        <summary>换壁纸、用动态壁纸会有问题吗?</summary>
+        <p>不会。栅栏背景"实时透出"真实壁纸(与原生图标层同原理),静态、幻灯片、带时钟的动态壁纸都逐帧跟随,文字与阴影保持稳定。</p>
+      </details>
+      <details>
+        <summary>怎么还原原生桌面 / 卸载?</summary>
+        <p>托盘菜单 → "显示原生桌面"临时还原;退出即完全恢复。删除 deskfence.exe 即完成卸载——不写注册表残留,不装驱动服务。</p>
+      </details>
+      <details>
+        <summary>双击后没反应?</summary>
+        <p>程序可能已在后台运行(单实例)。再双击一次会唤醒它显示全部栅栏;或检查托盘是否已有 DeskFence 图标。紧急情况运行 <code>deskfence.exe --restore-desktop</code> 恢复原生桌面。</p>
+      </details>
+      <details>
+        <summary>支持多显示器吗?</summary>
+        <p>支持。每个显示器的桌面区域都会被接管,栅栏可在各屏之间自由摆放,DPI 不同的混合屏幕也没问题。</p>
+      </details>
+      <details>
+        <summary>和 Fences 等同类软件比有什么不同?</summary>
+        <p>DeskFence 追求"无感":图标和文字与原生桌面像素级一致、启动无中间态、换壁纸零残留,并且完全免费、纯本地、无订阅。</p>
+      </details>
     </div>
-    <details open><summary>我的文件会被移动或修改吗?</summary><p>不会。DeskFence 只接管"图标的显示方式",文件本身始终留在桌面目录原位。退出即恢复原生桌面,位置都不变。</p></details>
-    <details><summary>双击后没反应?</summary><p>程序可能已在后台运行(单实例)。再双击一次会唤醒它显示全部栅栏;或检查任务栏托盘是否已有 DeskFence 图标。</p></details>
-    <details><summary>和 Fences 等同类软件比有什么不同?</summary><p>DeskFence 追求"无感":图标和文字与原生桌面像素级一致、启动无中间态、退出零残留,并且完全免费、纯本地、无任何订阅。</p></details>
-    <details><summary>支持多显示器吗?</summary><p>支持。每个显示器的桌面区域都会被接管,栅栏可在各屏之间自由摆放。</p></details>
-    <details><summary>桌面文件很多,性能会慢吗?</summary><p>图标像素有缓存,文件变更只增量刷新;稳态下每秒只做一次轻量自检。几百个文件的桌面依然流畅。</p></details>
   </div>
 </section>
 
+<!-- ============ Footer ============ -->
 <footer>
   <div class="wrap">
-    <div>© 2026 DeskFence · 桌面整理,秩序而来</div>
-    <div>Windows 11 / 10 · x64 · 纯本地软件</div>
+    <div class="cols">
+      <div>
+        <h4>DeskFence</h4>
+        <p style="max-width:320px">把 Windows 桌面还给你:自动分类、原生观感、零感知跟随。单文件运行,随时离开,一切如初。</p>
+      </div>
+      <div>
+        <h4>页面</h4>
+        <p><a href="#features">核心能力</a><br><a href="#guide">使用文档</a><br><a href="#videos">动画演示</a><br><a href="#faq">常见问题</a></p>
+      </div>
+      <div>
+        <h4>排障</h4>
+        <p>运行日志:<code style="color:#a1a1a6">%APPDATA%\DeskFence\run.log</code><br>恢复命令:<code style="color:#a1a1a6">deskfence.exe --restore-desktop</code></p>
+      </div>
+    </div>
+    <div class="fine">© 2026 DeskFence · 适用于 Windows 10/11 · 本页演示动画为卡通示意,实际界面以软件为准</div>
   </div>
 </footer>
 

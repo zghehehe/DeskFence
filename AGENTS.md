@@ -89,7 +89,10 @@
      合并，属分层窗口固有行为。验证工具 tools/flashdet.ps1（~25fps 全屏
      差分探测器）+ tools/uitest.ps1（click/traymenu/menuwin/shot）。
    - probe_desktop_item_spacing（LVM_GETITEMSPACING 跨进程 SendMessage）
-     有 10s 缓存：无缓存时每秒骚扰 Explorer 宿主也会引发可见异常。
+     **2026-08-26 已改粘性缓存**（键=注册表 IconSize+系统 DPI，键不变永不
+     重发）：旧的 10s TTL 等于每 10 秒唤醒一次宿主，菜单交互后的未稳态里
+     这次唤醒表现为"点桌面偶发闪 ~4% 亮度"——就是"刚开始不闪、后面点
+     倒三角/托盘再点桌面有时闪"的根因。托盘 tooltip 为纯 "DeskFence"。
 7. **启动首帧/壁纸快照(2026-08-25 修复，勿回退）**：
    - `ensure_wallpaper` 的 `wallpaper_ms==0` 是"强制重捕获"哨兵（不能用饱和减法
      判断：进程启动前 15s 内 `now-0<15000` 会把清零操作整个吞掉，快照迟到一整个
@@ -180,6 +183,7 @@
 - 应用图标：矢量源 `assets/deskfence-icon.svg`，`python tools/rebuild_icon.py`
   重建 `assets/deskfence.ico`（需 `pip install resvg-py`），随后 cargo build
   --release 重新嵌入。
-- 文档（2026-08-25 新增）：`docs/architecture.html` = 全链路架构图（启动/
-  渲染/壁纸/菜单/悬停/拖拽/自愈/退出 9 条链路 + 症状速查表，排障先看它）；
-  `website/index.html` = 商用官网首页（图文使用文档，截图在各自 assets/）。
+- 文档(2026-08-26 全面更新至 ink 常驻基线):`docs/architecture.html` = 全链路
+  架构图(渲染模型/启动/渲染/壁纸/菜单/悬停/拖拽/自愈/退出 10 条链路 + 症状
+  速查表,排障先看它);`website/index.html` = 商用官网(Apple 风格,全内联
+  SVG 卡通演示+自动循环动画段,零外部依赖,截图资产已移除)

@@ -54,8 +54,8 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
 </head>
 <body>
 
-<h1>DeskFence 全链路架构图<span class="tag">src 共 5 个模块 · main / ui / render / shell / model / ole</span></h1>
-<div class="sub">从双击启动到每一次点击的完整逻辑链。排障时先定位症状所属链路,再沿节点查对应函数与日志。</div>
+<h1>DeskFence 全链路架构图<span class="tag">src 共 6 个模块 · main / ui / render / shell / model / ole</span></h1>
+<div class="sub">架构基线:2026-08-26 ink 常驻渲染重构后。从双击启动到每一次点击的完整逻辑链,排障时先定位症状所属链路,再沿节点查对应函数与日志。</div>
 
 <div class="legend">
   <span><i style="background:#8b5cf6"></i>入口/启动</span>
@@ -66,21 +66,30 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
   <span>🔍 日志关键字:<code style="color:var(--acc)">run.log</code>(%APPDATA%\DeskFence\)</span>
 </div>
 
+<h2>⓪ 渲染模型(先读这个)<small>ink 常驻:2026-08-26 起,两种渲染模式共用</small></h2>
+<div class="desc">栅栏窗口是 WS_EX_LAYERED 分层窗口,内容 = <b>透明底 + 1/255 隐形命中层 + 图标 + 墨水文字</b>。真壁纸从窗口底下由 DWM 逐帧透出——换壁纸时背景与桌面<b>同帧跟随</b>,栅栏无需任何"换底"动作。</div>
+<div class="grid">
+  <div class="card"><h3>背景:透出,不持有</h3><p>栅栏不烙壁纸像素。整面铺 alpha=1/255 的隐形底(ULW 按逐像素 alpha 命中,没有它空白区会点击穿透),其余透明。</p><code>draw_fence</code></div>
+  <div class="card"><h3>文字:seeded GDI ClearType</h3><p>标签矩形先垫"种子"(快照壁纸色+覆盖层合成),DrawShadowText 烘焙(与 Explorer 同源),仅"有墨水"像素不透明。<b>阴影像素反推覆盖率输出纯黑 alpha 墨</b>——背景无关,换壁纸瞬间即精确。</p><code>gdi_draw_labels_seeded</code></div>
+  <div class="card"><h3>壁纸快照的角色:种子</h3><p>PrintWindow 快照不再做背景,只给文字烘焙提供底色 + 精确模式启动守卫。种子晚到无视觉代价(阴影已背景无关,重烘焙仅 1px 字形边缘)。</p><code>ensure_wallpaper / wallpaper.bin</code></div>
+  <div class="card"><h3>两种模式</h3><p><b>precise</b>(默认):等首帧种子就绪再呈现第一帧。<b>transparent</b>:立即呈现,黑种子兜底。渲染管线完全相同,菜单两档只是守卫差异。动态壁纸强制回退已退役;仅"捕获反复失败+无快照"回退透明。</p><code>precise_mode_on</code></div>
+</div>
+
 <h2>① 启动链路<small>双击 exe → 桌面被栅栏接管(目标:1 秒内、无中间态)</small></h2>
-<div class="desc">要点:shell 调用(显示名/图标)全部后台并行,主线程只做配置与壁纸缓存加载;首帧必须是"带 ClearType 阴影的最终帧",没就绪就保持原生桌面。</div>
+<div class="desc">要点:shell 调用(显示名/图标)全部后台并行,主线程只做配置与壁纸种子缓存加载;首帧必须是"带 ClearType 阴影的最终帧",没就绪就保持原生桌面。</div>
 <div class="chain">
   <div class="node start"><b>双击 deskfence.exe</b><span>单实例互斥体检查</span><span class="fn">main.rs acquire_single_instance</span></div>
   <div class="node"><b>已有实例?</b><span>是 → 唤醒旧实例显示全部栅栏后退出</span><span class="fn">ui::notify_second_instance</span></div>
   <div class="node start"><b>init()</b><span>per-monitor DPI、COM STA、D2D 渲染器、实测图标格距</span><span class="fn">ui::init · log "boot init done"</span></div>
   <div class="node"><b>startup() 并行分流</b><span>后台线程A:显示名解析(4线程) / 后台线程B:图标提取(4线程)</span><span class="fn">shell::finalize_scan / prewarm_icon_cache</span></div>
-  <div class="node io"><b>主线程同时</b><span>加载布局配置 → 壁纸缓存(wallpaper.bin,~50ms) 或现场暖场捕获 → 渲染器预热(烧掉 D2D/GDI 首次成本)</span><span class="fn">load_wallpaper_cache / warm_renderer_scratch</span></div>
+  <div class="node io"><b>主线程同时</b><span>加载布局配置 → 壁纸种子缓存(wallpaper.bin,两模式共用,~50ms) → 渲染器预热(烧掉 D2D/GDI 首次成本)</span><span class="fn">load_wallpaper_cache / warm_renderer_scratch</span></div>
   <div class="node"><b>join 后台线程</b><span>合并文件列表+图标缓存;首帧绘制全部缓存命中</span></div>
-  <div class="node ok"><b>show_all_fences()</b><span>创建/挂接窗口(插到桌面宿主之后)→ 绘制 → ULW 呈现</span><span class="fn">log "boot first fence presented gdi_labels=true"</span></div>
+  <div class="node ok"><b>show_all_fences()</b><span>创建/挂接窗口(插到桌面宿主之后)→ 绘制 → ULW 呈现</span><span class="fn">log "boot first fence presented seeded=true"</span></div>
   <div class="node ok"><b>reconcile_desktop_icons</b><span>栅栏呈现验证通过 → 隐藏原生图标(原子切换)</span><span class="fn">log "desktop icons hidden after fence presentation verified"</span></div>
   <div class="node ok"><b>托盘+钩子+watcher</b><span>托盘窗口/菜单宿主/键盘鼠标钩子/桌面与壁纸目录 watcher</span><span class="fn">init_tray · start_desktop_watcher · start_wallpaper_watcher</span></div>
   <div class="node ok"><b>进入消息循环</b><span> GetMessage 分发到 fence/tray/guide 三个 wndproc</span><span class="fn">ui::run_message_loop · log "boot done"</span></div>
 </div>
-<div class="note"><b>首帧守护:</b>精确模式下壁纸快照未就绪时 <code>refresh_fence_impl</code> 直接跳过呈现(保留原生桌面),由 200ms 追赶定时器(TIMER_WALLPAPER_CATCHUP)捕获成功后一次到位。<b>绝不能</b>先画 D2D 文字帧再切换——那就是历史上"阴影迟到/闪变"的根因。</div>
+<div class="note"><b>首帧守护:</b>精确模式下壁纸种子未就绪时 <code>refresh_fence_impl</code> 直接跳过呈现(保留原生桌面),由 200ms 追赶定时器捕获成功后一次到位。<b>绝不能</b>先画中间态帧再切换——那就是历史上"阴影迟到/闪变"的根因。透明模式无此守卫(黑种子立即呈现)。</div>
 
 <h2>② 窗口与 z 序结构<small>谁浮在谁上面</small></h2>
 <div class="layer">
@@ -88,30 +97,30 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
   <div class="lrow"><div class="z">普通窗口 band</div><div class="b">用户的浏览器/办公软件等一切普通窗口</div></div>
   <div class="lrow"><div class="z">桌面层(z 链)</div><div class="b">栅栏窗口 ×N(WS_EX_LAYERED,紧贴宿主正上方连续排列)<small> · 1px 菜单宿主与托盘窗口(点击穿透,屏幕角落,容忍于 z 链判定)</small></div></div>
   <div class="lrow"><div class="z">桌面宿主</div><div class="b">Progman / WorkerW(SHELLDLL_DefView 的图标列表按需隐藏)</div></div>
-  <div class="lrow"><div class="z">最底层</div><div class="b">壁纸(DWM 绘制;精确模式栅栏背景=它的快照)</div></div>
+  <div class="lrow"><div class="z">最底层</div><div class="b">壁纸(DWM 绘制;栅栏背景 = 它的实时透出)</div></div>
 </div>
 <div class="note"><b>z 序自愈(每秒):</b><code>ensure_all_attached</code> 做<b>整链就位判定</b>——宿主上方窗口之下恰好是全部栅栏才跳过 SetWindowPos;否则重排一次。绝不逐窗口无条件重申(历史上的"每秒洗牌"会在前台 band 变化后变成真实移动=闪屏)。</div>
 
 <h2>③ 渲染链路<small>一次 refresh_fence_impl 的完整流水线</small></h2>
 <div class="chain">
-  <div class="node start"><b>refresh_fence(id)</b><span>触发源:悬停提交/文件变更/模式切换/拖拽结束…</span></div>
-  <div class="node warn"><b>守卫检查</b><span>精确模式 && 快照空 && 无拖拽 → 跳过呈现(保旧帧/保原生桌面)</span></div>
+  <div class="node start"><b>refresh_fence(id)</b><span>触发源:悬停提交/文件变更/模式切换/拖拽结束/栅栏移动…</span></div>
+  <div class="node warn"><b>启动守卫</b><span>精确模式 && 种子空 && 无拖拽 → 跳过呈现(保旧帧/保原生桌面)</span></div>
   <div class="node"><b>表面管理</b><span>尺寸变了才重建 D2D 表面,否则复用</span><span class="fn">create_surface</span></div>
-  <div class="node io"><b>D2D 绘制</b><span>壁纸快照裁剪(精确)或透明底 + 图标(DrawIconEx)+ 标题/滚动条 chrome</span><span class="fn">render::draw_fence</span></div>
-  <div class="node io"><b>GDI 文字</b><span>EndDraw 后用 DrawShadowText 画图标名(ClearType+阴影,与原生逐像素一致)</span><span class="fn">render::gdi_draw_labels</span></div>
+  <div class="node io"><b>D2D 绘制</b><span>1/255 隐形底 + 图标(DrawIconEx)+ 悬停/选中态 + 滚动条;chrome(边框/标题/四角手柄)仅悬停或拖拽中绘制</span><span class="fn">render::draw_fence</span></div>
+  <div class="node io"><b>seeded GDI 文字</b><span>EndDraw 后垫种子 → DrawShadowText(ClearType+阴影)→ 墨水化:阴影=覆盖率纯黑墨,字形=不透明,其余恢复透明</span><span class="fn">render::gdi_draw_labels_seeded</span></div>
   <div class="node ok"><b>ULW 呈现</b><span>UpdateLayeredWindow 上屏,标记 presented</span><span class="fn">render::present_surface</span></div>
 </div>
-<div class="note"><b>透明模式:</b>无快照时跳过壁纸裁剪与 GDI,文字走 D2D(动态壁纸环境自动回退,托盘菜单"渲染模式"可手动切换;运行中捕获反复失败也会自动回退并落盘)。</div>
+<div class="note"><b>无边框常显(2026-08-26):</b>默认态完全干净(无边框/标题/底色),悬停或拖拽时 chrome 浮现(边框+四角 L 形手柄+标题+淡底)。悬停复用 fence_hover 的 400ms 延迟提交(防闪血统);命中与缩放热区是位置判定,与可见性无关。</div>
 
-<h2>④ 壁纸管线<small>信号驱动,60s 兜底</small></h2>
+<h2>④ 壁纸管线<small>事件驱动;稳态捕获已"懒化+节流"到最低限度</small></h2>
 <div class="chain">
-  <div class="node start"><b>信号源(任一触发)</b><span>① WM_SETTINGCHANGE 手动换壁纸(毫秒) ② Themes 目录 watcher 幻灯片轮换 ③ IDesktopWallpaper 签名轮询(1s,轮换) ④ 60s 兜底轮询</span><span class="fn">tray_wndproc · start_wallpaper_watcher · wallpaper_signature</span></div>
-  <div class="node warn"><b>防撞车</b><span>交互(菜单开/关、点击)后 2.5s 内推迟捕获</span><span class="fn">mark_interaction / LAST_INTERACTION_MS</span></div>
-  <div class="node io"><b>捕获</b><span>PrintWindow 拍宿主;原生图标可见时临时隐藏防"图标烙进快照"</span><span class="fn">ensure_wallpaper</span></div>
-  <div class="node"><b>容差比对</b><span>与现用快照差 &gt;8/通道 才算变化(捕获亮度有 ±4% 时序波动)</span><span class="fn">wallpaper_content_changed</span></div>
-  <div class="node ok"><b>变了 → 整帧重绘</b><span>refresh_all_fences + 快照落盘 wallpaper.bin</span></div>
+  <div class="node start"><b>信号源(任一触发)</b><span>① WM_SETTINGCHANGE 手动换壁纸(毫秒) ② Themes 目录 watcher 幻灯片轮换 ③ IDesktopWallpaper 签名轮询(1s,标准机器) ④ 10min 稳态兜底</span><span class="fn">tray_wndproc · start_wallpaper_watcher · wallpaper_signature</span></div>
+  <div class="node warn"><b>懒捕获门槛</b><span>壁纸失效后:距失效&gt;1.5s(DWM 淡入结束)且 &gt;5s 无交互才捕获;常规刷新 2.5s 推迟</span><span class="fn">wallpaper_dirty_since / LAST_INTERACTION_MS</span></div>
+  <div class="node io"><b>捕获</b><span>PrintWindow 拍宿主;原生图标可见时临时隐藏防"图标烙进快照";过渡黑帧跳过(不算失败)</span><span class="fn">ensure_wallpaper</span></div>
+  <div class="node"><b>区域感知比对</b><span>只比<b>栅栏覆盖区域内</b>的像素(容差 8/通道):栅栏外变化(时钟壁纸分钟跳动)不再触发重绘与落盘</span><span class="fn">wallpaper_changed_under_fences</span></div>
+  <div class="node ok"><b>变了 → 整帧重绘</b><span>refresh_all_fences + 快照落盘 wallpaper.bin;没变只更新种子(无感)</span></div>
 </div>
-<div class="note"><b>回退守护:</b>切换过渡期的<b>纯黑帧不算失败</b>;只有真实失败(PrintWindow 报错)累计且<b>当前无任何快照</b>且过 10s 启动宽限,才回退透明模式落盘。换壁纸后黑帧/保留旧快照都是正常路径。</div>
+<div class="note"><b>回退守护:</b>只有真实失败(PrintWindow 报错)累计、<b>当前无任何快照</b>且过 10s 启动宽限,才回退透明模式落盘(动态壁纸检测已退役——统一渲染后降级无意义且会静默改写配置)。<b>为什么稳态 10min:ink 常驻后快照只作种子,不新鲜无视觉代价;而每次 PrintWindow 都强制宿主重绘,是交互窗口期闪的来源——能不跑就不跑,真实变化由事件毫秒级跟随。</b></div>
 
 <h2>⑤ 菜单链路<small>倒三角 / 托盘 / 文件右键,三条入口一套机制</small></h2>
 <div class="chain">
@@ -121,20 +130,20 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
   <div class="node ok"><b>TrackPopupMenu</b><span>模态循环;期间栅栏消息被推迟(关闭后的陈旧 mousemove 会被光标校验丢弃)</span></div>
   <div class="node ok"><b>点菜单外任意处 / Esc / 切换窗口</b><span>菜单关闭并派发命令</span><span class="fn">dispatch_tray_command / fence_menu 后续</span></div>
 </div>
-<div class="note"><b>三个禁区(全部踩过):</b>owner 不能用栅栏窗口(z-band 提升被拉回=闪)、不能 WS_EX_LAYERED(动画损坏成两段跳)、1px 宿主不能压在栅栏上(DWM 失活波及下方分层窗口)。菜单关闭后栅栏区域偶现 ~4% 亮度抖动是 DWM 对被遮挡分层窗口的舍入差,低于感知阈值,不是缺陷。</div>
+<div class="note"><b>三个禁区(全部踩过):</b>owner 不能用栅栏窗口(z-band 提升被拉回=闪)、不能 WS_EX_LAYERED(动画损坏成两段跳)、1px 宿主不能压在栅栏上(DWM 失活波及下方分层窗口)。<b>交互后宿主骚扰清单(全部已修,勿回退):</b>壁纸稳态捕获 10min+懒化(④)、图标格距探测粘性缓存(⑧)、rescan 无变化早退(⑧)。菜单关闭后残余的 ~4% 舍入差属 DWM 固有行为,低于感知阈值。</div>
 
 <h2>⑥ 悬停链路<small>400ms 延迟提交,与原生一致</small></h2>
 <div class="chain">
   <div class="node start"><b>WM_MOUSEMOVE(栅栏)</b><span>先做陈旧校验:消息坐标 vs 真实光标偏差&gt;6px 即丢弃</span><span class="fn">fence_wndproc</span></div>
   <div class="node"><b>武装 pending</b><span>图标高亮与栅栏卡片都记 pending,SetTimer 400ms</span><span class="fn">handle_mousemove</span></div>
-  <div class="node ok"><b>停留满 400ms</b><span>TIMER_HOVER 提交并重绘(高亮浮现)</span></div>
+  <div class="node ok"><b>停留满 400ms</b><span>TIMER_HOVER 提交并重绘(高亮+边框手柄浮现)</span></div>
   <div class="node err"><b>离开/点外部/开菜单</b><span>MOUSELEAVE 或 track() 清 pending+状态并熄灭</span></div>
 </div>
 
 <h2>⑦ 拖拽链路<small>插入式:跟手的只有被拖者</small></h2>
 <div class="chain">
   <div class="node start"><b>图标左键按下</b><span>SetCapture;记录拖拽快照</span><span class="fn">handle_lbuttondown DragMode::Icon</span></div>
-  <div class="node io"><b>移动超阈值</b><span>guide overlay 绘制残影(0.65 alpha)+ 目标槽 + 插入线;图标名走与静态同源的 GDI 路径</span><span class="fn">update_ghost_preview · render::draw_guides</span></div>
+  <div class="node io"><b>移动超阈值</b><span>guide overlay 绘制残影(0.65 alpha)+ 目标槽 + 插入线;图标名走与静态同源的 seeded GDI 路径</span><span class="fn">update_ghost_preview · render::draw_guides</span></div>
   <div class="node"><b>拖到回收站</b><span>松手删除;拖到其他栅栏=分类转移;Esc 取消</span></div>
   <div class="node ok"><b>松手</b><span>拼接重排(reorder_paths_as_block),其余栅栏完全不动</span></div>
 </div>
@@ -144,9 +153,9 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
   <div class="node start"><b>WM_TIMER(TIMER_GLOBAL)</b><span>托盘窗口,1s 一次</span></div>
   <div class="node"><b>ensure_all_attached</b><span>整链 z 序判定(见②);缺宿主时延迟创建窗口</span></div>
   <div class="node warn"><b>needs_represent</b><span>presented/attached 缺失 → 用现有表面 ULW 重呈现(毫秒级),无表面才全量重绘</span></div>
-  <div class="node"><b>reconcile_desktop_icons</b><span>栅栏呈现异常 → 恢复原生图标(绝不空白桌面)</span></div>
-  <div class="node"><b>sync_icon_size</b><span>LVM_GETITEMSPACING 实测格距(10s 缓存,别每秒骚扰 Explorer)</span></div>
-  <div class="node"><b>壁纸跟随(3s)+ 签名轮询(1s)</b><span>见④</span></div>
+  <div class="node"><b>reconcile_desktop_icons</b><span>栅栏呈现异常 → 恢复原生图标(绝不空白桌面);有状态守卫,无动作零骚扰</span></div>
+  <div class="node"><b>sync_icon_size</b><span>格距探测<b>粘性缓存</b>(键=注册表 IconSize+DPI,键不变永不发 LVM 消息)——Ctrl+滚轮改图标大小仍即时跟随</span><span class="fn">probe_desktop_item_spacing</span></div>
+  <div class="node"><b>壁纸跟随(3s)+ 签名轮询(1s)</b><span>见④,两模式共用</span></div>
   <div class="node"><b>rescan(watcher dirty 或 30s)</b><span>文件集合<b>无变化直接返回</b>;有变化才清缓存+重排+入场动画</span></div>
 </div>
 
@@ -161,18 +170,18 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
 <h2>⑩ 症状 → 链路速查表</h2>
 <table>
 <tr><th style="width:32%">症状</th><th style="width:22%">先查链路</th><th>关键函数 / 日志</th></tr>
-<tr><td class="sym">启动慢 / 首帧文字不对</td><td class="chainc">① 启动</td><td><code>run.log</code> 的 boot 系列行:<code>raw_scan / bg_names / bg_icons / first fence presented / boot done</code>;gdi_labels 必须 true</td></tr>
+<tr><td class="sym">启动慢 / 首帧文字不对</td><td class="chainc">① 启动</td><td><code>run.log</code> 的 boot 系列行:<code>raw_scan / bg_names / bg_icons / first fence presented / boot done</code>;seeded 必须 true</td></tr>
 <tr><td class="sym">启动后图标重影("乱七八糟")</td><td class="chainc">④ 壁纸-捕获</td><td><code>ensure_wallpaper</code> 防污染守卫被绕过(图标可见时捕获)</td></tr>
 <tr><td class="sym">菜单弹出即退 / 点空白不消失</td><td class="chainc">⑤ 菜单-前台化</td><td><code>shell::menu_foreground</code>;日志 <code>unknown tray command: 0</code> 刷屏=前台权丢失</td></tr>
-<tr><td class="sym">点桌面/关菜单时闪</td><td class="chainc">⑤⑥⑧</td><td>四重根因:卡片立即点亮 / 陈旧 mousemove / z 链洗牌 / rescan 无条件重绘;均已修,勿回退(AGENTS.md 第 6 条)</td></tr>
-<tr><td class="sym">换壁纸后栅栏背景不对</td><td class="chainc">④ 壁纸</td><td><code>wallpaper follow/catch-up</code> 日志;黑帧是过渡态不是失败</td></tr>
-<tr><td class="sym">拖拽残影文字与静态不一致</td><td class="chainc">⑦ 拖拽</td><td><code>render::draw_guides + gdi_draw_labels_transparent</code> 必须与静态同一 GDI 几何</td></tr>
+<tr><td class="sym">点桌面/关菜单后偶发闪</td><td class="chainc">④⑤⑧</td><td>宿主骚扰三源(壁纸捕获/格距探测/rescan)均已懒化或粘性化;再犯先查 run.log 有无捕获/探测撞交互时间</td></tr>
+<tr><td class="sym">换壁纸后栅栏背景不对</td><td class="chainc">④ 壁纸</td><td>背景是实时透出,理论不可能"不对";若文字阴影色不对查 <code>wallpaper follow/catch-up</code> 与懒捕获门槛</td></tr>
+<tr><td class="sym">拖拽残影文字与静态不一致</td><td class="chainc">⑦ 拖拽</td><td><code>render::draw_guides + trim_to_lines</code> 必须与静态同一 GDI 几何</td></tr>
 <tr><td class="sym">图标像素与原生不一致</td><td class="chainc">③ 渲染</td><td>SHGFI 主路径与几何基准见 AGENTS.md 第 4 条;诊断 <code>--icondump</code></td></tr>
 <tr><td class="sym">桌面空白 / 图标全消失</td><td class="chainc">⑧ 自愈 / ⑨</td><td><code>reconcile_desktop_icons</code>;自救 <code>deskfence.exe --restore-desktop</code></td></tr>
 <tr><td class="sym">文件改动不刷新</td><td class="chainc">⑧ rescan</td><td>watcher 线程 / <code>take_desktop_dirty</code>;无变化早退是正常优化</td></tr>
 </table>
 
-<div class="note" style="margin-top:26px">配套验证工具(<code>tools/</code>):<b>uitest.ps1</b>(DPI 感知截图/点击/菜单探测/拖拽)、<b>flashdet.ps1</b>(~25fps 全屏差分闪屏探测器)。测试桌面前先 MinimizeAll。完整历史教训见仓库 <code>AGENTS.md</code>。</div>
+<div class="note" style="margin-top:26px">配套验证工具(<code>tools/</code>):<b>uitest.ps1</b>(DPI 感知截图/点击/菜单探测/拖拽)、<b>pixdiff.ps1</b>(两截图逐像素差分,自动给出差异 bbox)、<b>flashdet.ps1</b>(~25fps 全屏差分闪屏探测器)、<b>rebuild_icon.py</b>(重建应用图标)。测试桌面前先 MinimizeAll;本机模拟点击会触发 SPES 锁屏,交互验证只能人工。完整历史教训见仓库 <code>AGENTS.md</code>。</div>
 
 </body>
 </html>
