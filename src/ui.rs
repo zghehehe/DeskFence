@@ -857,12 +857,15 @@ fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
 /// therefore puts the fence below the desktop host and can produce a fully blank
 /// desktop after Show Desktop changes WorkerW ordering. Use the window immediately
 /// above the host so the fence sits between desktop and normal application windows.
-fn desktop_insert_after(host: HWND) -> HWND {
+/// 宿主之上没有任何窗口时返回 None(不移动):绝不能回退 HWND_TOP——那会把
+/// 栅栏顶到整个 z 栈顶端(2026-08-27 实测三个栅栏被顶到宿主之上 215 层,
+/// 即用户看到的"栅栏浮在别的窗口上方")。
+fn desktop_insert_after(host: HWND) -> Option<HWND> {
     let above = unsafe { GetWindow(host, GW_HWNDPREV) };
     if above.0 == 0 {
-        HWND_TOP
+        None
     } else {
-        above
+        Some(above)
     }
 }
 
@@ -937,22 +940,25 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, fence_id as isize);
         ole::register_drop_target(hwnd, fence_id);
-        let insert_after = if let Some(host) = host {
-            desktop_insert_after(host.hwnd)
-        } else {
-            // 找不到桌面宿主时的回退:插到桌面壳之后
-            desktop_shell_window().unwrap_or(HWND_TOP)
+        // 就位目标:宿主正上方(底带)。取不到锚点时不动 z——初始位置由
+        // 全局 tick 的自愈在宿主就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
+        let insert_after = match host.map(|h| desktop_insert_after(h.hwnd)).flatten() {
+            Some(a) => Some(a),
+            None => desktop_shell_window().and_then(|s| desktop_insert_after(s)),
         };
-        let attached = SetWindowPos(
-            hwnd,
-            insert_after,
-            fence.rect.x.round() as i32,
-            fence.rect.y.round() as i32,
-            w,
-            h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-        .is_ok();
+        let mut attached = false;
+        if let Some(after) = insert_after {
+            attached = SetWindowPos(
+                hwnd,
+                after,
+                fence.rect.x.round() as i32,
+                fence.rect.y.round() as i32,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+            .is_ok();
+        }
         if attached {
             s.attached.insert(fence_id);
         }
@@ -2407,16 +2413,29 @@ fn ensure_all_attached() {
             let Some(host) = host_for_rect(&fence.rect, &hosts) else {
                 continue; // 无宿主:不动窗口,保持原 z 位
             };
-            let fr = fence.rect;
-            let mut covered = false;
+            // 不变式:从宿主向上,只允许出现(可跳过的)不可见窗/自有辅助窗,
+            // 然后就是本栅栏。途中撞上任何**可见且在屏内**的外来窗口还没
+            // 找到栅栏 → 栅栏已离开桌面 band(浮在真实窗口上方),必须拉回。
+            // 注意不是"是否与栅栏相交":不重叠的外来窗口同样说明栅栏出带
+            // (2026-08-27 实测:被顶到宿主之上 215 层的栅栏因下方窗口不与
+            // 它相交而被旧判定放行=持续浮窗)。
+            let mut out_of_band = false;
+            let mut found = false;
+            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实(实测被顶到
+            // 宿主之上 236 层);预算耗尽/到栈顶仍未命中=出带,绝不静默放行
             let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-            for _ in 0..64 {
+            for _ in 0..320 {
                 if w.0 == 0 {
                     break;
                 }
                 if h == w {
-                    covered = false;
-                    break;
+                    found = true;
+                    break; // 栅栏就位
+                }
+                // 其他自家栅栏:正常(整包连续排在底带),跳过继续找自己
+                if s.windows.values().any(|v| *v == w) {
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                    continue;
                 }
                 let mut wr = RECT::default();
                 let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
@@ -2431,10 +2450,6 @@ fn ensure_all_attached() {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
-                if h == w {
-                    covered = false;
-                    break;
-                }
                 let mut cls_buf = [0u16; 32];
                 let n = unsafe { GetClassNameW(w, &mut cls_buf) };
                 let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
@@ -2444,18 +2459,11 @@ fn ensure_all_attached() {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
-                // 外来可见窗口:与该栅栏矩形相交才算遮挡
-                let fx0 = fr.x.round() as i32;
-                let fy0 = fr.y.round() as i32;
-                let fx1 = fx0 + fr.w.round() as i32;
-                let fy1 = fy0 + fr.h.round() as i32;
-                let overlap = wr.left < fx1 && wr.right > fx0 && wr.top < fy1 && wr.bottom > fy0;
-                if overlap {
-                    covered = true;
-                }
+                // 可见在屏内外来窗口先于栅栏出现:栅栏出带
+                out_of_band = true;
                 break;
             }
-            if covered {
+            if out_of_band || !found {
                 to_move.push(id);
             } else {
                 s.attached.insert(id);
@@ -2469,10 +2477,13 @@ fn ensure_all_attached() {
                 let frect = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect);
                 let Some(frect) = frect else { continue };
                 let Some(host) = host_for_rect(&frect, &hosts) else { continue };
+                let Some(after) = desktop_insert_after(host.hwnd) else {
+                    continue;
+                };
                 let attached = unsafe {
                     SetWindowPos(
                         h,
-                        desktop_insert_after(host.hwnd),
+                        after,
                         frect.x.round() as i32,
                         frect.y.round() as i32,
                         0,
@@ -3800,6 +3811,9 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
         // 重合成闪屏(表面内容并没有变)。
         let _guard = shell::menu_foreground(menu_host_or(hwnd));
         let r = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, menu_host_or(hwnd), None);
+        if r.0 == 0 {
+            log("track: menu dismissed without selection");
+        }
         // 说明:菜单遮挡期间 DWM 会丢弃分层窗口被遮区域的颜色转换缓存,
         // 菜单移走后的重转换存在 ~4% 舍入差——实测低于人眼感知阈值
         // (并排对比不可辨),且 ULW 重呈现也无法合并它,故不做任何处理。
@@ -6057,6 +6071,7 @@ fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     let hit = model::hit_test_with_metrics(&fence, &lay, x, y, n, &metrics);
     match hit {
         Hit::Collapse => {
+            log(&format!("collapse clicked fence {fence_id}"));
             // 点击箭头 = 弹出本栏操作菜单(菜单里含折叠/展开),菜单位置在箭头正下方
             let hwnd_menu = hwnd;
             let ax = fence.rect.x + fence.rect.w - metrics.collapse_w * 0.5;
