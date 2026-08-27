@@ -2375,155 +2375,164 @@ fn ensure_all_attached() {
         //    SetWindowPos 也会触发 DWM 重新合成;每秒的"洗牌式重申"在
         //    前台 band 变化(菜单交互)后会变成真实 z 移动,表现为
         //    栅栏区域整体闪一下(表面内容并没有变)。
-        let fences_sorted: Vec<u32> = {
-            let mut v: Vec<u32> = s.windows.keys().copied().collect();
-            v.sort_unstable();
-            v
-        };
-        let mut chain_ok = false;
-        let mut seen: Vec<u32> = Vec::new();
-        let mut anchor_host: Option<HWND> = None;
-        if let Some(first_fence) = s.fences.iter().next() {
-            if let Some(host) = host_for_rect(&first_fence.rect, &hosts) {
-                anchor_host = Some(host.hwnd);
-                // 从宿主向上(GW_HWNDPREV)走,直到收齐全部栅栏:
-                // - 自有辅助窗口(1px 菜单宿主/托盘窗/瞬态 #32768 菜单弹层)
-                //   跳过不计时;
-                // - **最小化窗口(IsIconic)同样跳过**:它们完全不可见,沉到
-                //   栅栏包与宿主之间或被点击栅栏的前台化搅动越层,都不构成
-                //   视觉问题(2026-08-27 实测:不跳过时,每次用户最小化窗口
-                //   +随后的栅栏点击都会触发全量 SetWindowPos=可见闪)。
-                // - 外来**可见**窗口夹在宿主与栅栏之间才视为漂移触发修复;
-                //   栅栏上方的任何窗口与本检查无关。
-                let trayw = TRAY_HWND.get().copied();
-                let host1 = MENU_HOST_HWND.get().copied();
-                let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-                for _ in 0..64 {
-                    if w.0 == 0 || seen.len() == fences_sorted.len() {
-                        break;
-                    }
-                    let mut fence_hit: Option<u32> = None;
-                    for (id, h) in s.windows.iter() {
-                        if *h == w {
-                            fence_hit = Some(*id);
-                            break;
-                        }
-                    }
-                    match fence_hit {
-                        Some(id) => seen.push(id),
-                        None => {
-                            // 不可见判据:最小化(GetWindowRect 会在 -32000)
-                            // 或矩形与虚拟屏幕完全不相交——两者都不可能
-                            // 遮挡任何栅栏,z 位置无视觉意义,跳过不计。
-                            // (实测:最小化的 Chrome/WinRar 与 SPES 的离屏
-                            // CoreWindow 都属此类,不跳过则每次用户最小化
-                            // 窗口+栅栏点击都会触发修复=可见闪。)
-                            let mut wr = RECT::default();
-                            let offscreen = unsafe {
-                                if GetWindowRect(w, &mut wr).is_ok() {
-                                    IsIconic(w).as_bool()
-                                        || !IsWindowVisible(w).as_bool()
-                                        || wr.right <= 0
-                                        || wr.bottom <= 0
-                                        || wr.left >= GetSystemMetrics(SM_CXVIRTUALSCREEN)
-                                        || wr.top >= GetSystemMetrics(SM_CYVIRTUALSCREEN)
-                                } else {
-                                    true
-                                }
-                            };
-                            if !offscreen {
-                                let mut cls_buf = [0u16; 16];
-                                let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-                                // "#32768" 的 UTF-16 码元,避免每窗走 String 分配
-                                const MENU_CLASS: [u16; 6] =
-                                    [0x23, 0x33, 0x32, 0x37, 0x36, 0x38];
-                                let is_menu_popup =
-                                    n == 6 && cls_buf[..6] == MENU_CLASS;
-                                let aux = host1 == Some(w)
-                                    || trayw == Some(w)
-                                    || is_menu_popup;
-                                if !aux {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+        // z 序自愈(逐栅栏按需,2026-08-27 终版):
+        // 对每个栅栏,从其宿主向上(GW_HWNDPREV)走,直到命中该栅栏:
+        // - 命中 → 该栅栏就位,不动它(SetWindowPos 同位也触发 DWM 重合成=闪);
+        // - 自有辅助窗(菜单宿主/托盘窗/#32768 弹层)与一切"不可见"窗
+        //   (最小化/隐藏/矩形与虚拟屏幕不相交,含最小化沉底的 Chrome、
+        //   SPES 离屏 CoreWindow)→ 跳过继续;
+        // - 自动隐藏任务栏(Shell_TrayWnd)在隐藏/弹出转换时会短暂沉到桌面
+        //   层,但弹起时本就在顶层且矩形(y≥任务栏)与栅栏(y≤内容区)不相交,
+        //   做空间相交测试后自然跳过;
+        // - 外来**可见且与该栅栏矩形相交**的窗口先于栅栏出现 → 该栅栏真被
+        //   遮挡,单独移回宿主之后(只动这一个)。
+        // 教训(勿回退):旧"单次遍历收集+不在集内就修"的写法,会在窗口沉到
+        // 栅栏包下方时提前折断,把"栅栏其实都在它上面"误判成"全部失位",
+        // 全量 SetWindowPos=每次菜单交互都闪。
+        let trayw = TRAY_HWND.get().copied();
+        let host1 = MENU_HOST_HWND.get().copied();
+        const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38];
+        const TRAY_CLASS: [u16; 13] = [
+            0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
+        ];
+        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        let mut to_move: Vec<u32> = Vec::new();
+        for (id, h) in s.windows.clone() {
+            let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
+                continue;
+            };
+            let Some(host) = host_for_rect(&fence.rect, &hosts) else {
+                continue; // 无宿主:不动窗口,保持原 z 位
+            };
+            let fr = fence.rect;
+            let mut covered = false;
+            let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+            for _ in 0..64 {
+                if w.0 == 0 {
+                    break;
                 }
-                let mut seen_sorted = seen.clone();
-                seen_sorted.sort_unstable();
-                chain_ok = seen_sorted == fences_sorted;
+                if h == w {
+                    covered = false;
+                    break;
+                }
+                let mut wr = RECT::default();
+                let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
+                let invisible = !rect_ok
+                    || unsafe { IsIconic(w).as_bool() }
+                    || !unsafe { IsWindowVisible(w).as_bool() }
+                    || wr.right <= vx
+                    || wr.bottom <= vy
+                    || wr.left >= vx + vw
+                    || wr.top >= vy + vh;
+                if invisible {
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                    continue;
+                }
+                if h == w {
+                    covered = false;
+                    break;
+                }
+                let mut cls_buf = [0u16; 32];
+                let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+                let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
+                let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
+                let aux = host1 == Some(w) || trayw == Some(w) || is_menu_popup || is_taskbar;
+                if aux {
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                    continue;
+                }
+                // 外来可见窗口:与该栅栏矩形相交才算遮挡
+                let fx0 = fr.x.round() as i32;
+                let fy0 = fr.y.round() as i32;
+                let fx1 = fx0 + fr.w.round() as i32;
+                let fy1 = fy0 + fr.h.round() as i32;
+                let overlap = wr.left < fx1 && wr.right > fx0 && wr.top < fy1 && wr.bottom > fy0;
+                if overlap {
+                    covered = true;
+                }
+                break;
+            }
+            if covered {
+                to_move.push(id);
+            } else {
+                s.attached.insert(id);
             }
         }
-        if chain_ok {
-            for id in &fences_sorted {
-                s.attached.insert(*id);
-            }
-        } else {
-            // 按需修复:只动"没被遍历到"的栅栏(掉到宿主之下或被外来可见
-            // 窗口压住);已在宿主之上的栅栏一个都不碰——SetWindowPos 即使
-            // 同位也会触发 DWM 重合成(=闪),少动一个少一分闪面。
-            let seen_set: std::collections::HashSet<u32> = seen.iter().copied().collect();
+        if !to_move.is_empty() {
             let mut moved: Vec<u32> = Vec::new();
-            for (id, h) in s.windows.clone() {
-                if seen_set.contains(&id) {
-                    s.attached.insert(id);
-                    continue;
-                }
-                let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
-                    continue;
+            let mut culprit = String::from("none");
+            for id in &to_move {
+                let Some(h) = s.windows.get(id).copied() else { continue };
+                let frect = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect);
+                let Some(frect) = frect else { continue };
+                let Some(host) = host_for_rect(&frect, &hosts) else { continue };
+                let attached = unsafe {
+                    SetWindowPos(
+                        h,
+                        desktop_insert_after(host.hwnd),
+                        frect.x.round() as i32,
+                        frect.y.round() as i32,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    )
+                    .is_ok()
                 };
-                if let Some(host) = host_for_rect(&fence.rect, &hosts) {
-                    let attached = unsafe {
-                        SetWindowPos(
-                            h,
-                            desktop_insert_after(host.hwnd),
-                            fence.rect.x.round() as i32,
-                            fence.rect.y.round() as i32,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
-                        )
-                        .is_ok()
-                    };
-                    if attached {
-                        s.attached.insert(id);
-                        moved.push(id);
+                if attached {
+                    s.attached.insert(*id);
+                    moved.push(*id);
+                    // 记录肇事窗口:该栅栏与宿主之间第一个相交的可见外来窗
+                    let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                    for _ in 0..64 {
+                        if w.0 == 0 || w == h {
+                            break;
+                        }
+                        let mut wr = RECT::default();
+                        let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
+                        let invisible = !rect_ok
+                            || unsafe { IsIconic(w).as_bool() }
+                            || !unsafe { IsWindowVisible(w).as_bool() }
+                            || wr.right <= vx
+                            || wr.bottom <= vy
+                            || wr.left >= vx + vw
+                            || wr.top >= vy + vh;
+                        if invisible {
+                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                            continue;
+                        }
+                        let mut cls_buf = [0u16; 32];
+                        let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+                        let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
+                        let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
+                        let aux = host1 == Some(w) || trayw == Some(w) || is_menu_popup || is_taskbar;
+                        if aux {
+                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                            continue;
+                        }
+                        let fx0 = frect.x.round() as i32;
+                        let fy0 = frect.y.round() as i32;
+                        let fx1 = fx0 + frect.w.round() as i32;
+                        let fy1 = fy0 + frect.h.round() as i32;
+                        let overlap =
+                            wr.left < fx1 && wr.right > fx0 && wr.top < fy1 && wr.bottom > fy0;
+                        if overlap {
+                            culprit = String::from_utf16_lossy(&cls_buf[..n.max(0) as usize]);
+                        }
+                        break;
                     }
                 }
-                // 无宿主:不动窗口,保持原 z 位 and native icons remain visible
             }
             if !moved.is_empty() {
-                // 诊断:找出是谁挡在宿主与栅栏之间(仅修复时打,正常极罕见)
-                let mut culprit = String::from("none");
-                if let Some(anchor) = anchor_host {
-                let trayw2 = TRAY_HWND.get().copied();
-                let host12 = MENU_HOST_HWND.get().copied();
-                let mut cw = unsafe { GetWindow(anchor, GW_HWNDPREV) };
-                for _ in 0..64 {
-                    if cw.0 == 0 {
-                        break;
-                    }
-                    if !s.windows.values().any(|h| *h == cw)
-                        && host12 != Some(cw)
-                        && trayw2 != Some(cw)
-                        && unsafe { IsWindowVisible(cw).as_bool() }
-                        && !unsafe { IsIconic(cw).as_bool() }
-                    {
-                        let mut cb = [0u16; 32];
-                        let n = unsafe { GetClassNameW(cw, &mut cb) };
-                        culprit = String::from_utf16_lossy(&cb[..n.max(0) as usize]);
-                        break;
-                    }
-                    cw = unsafe { GetWindow(cw, GW_HWNDPREV) };
-                }
-                }
                 log(&format!(
-                    "z-chain repair: fences {:?} re-attached (culprit={})",
+                    "z-chain repair: fences {:?} re-attached (occluder={})",
                     moved, culprit
                 ));
             }
         }
+
         drop(s);
     }
     for id in created {
