@@ -196,6 +196,18 @@
      所有表面画完并向**隐藏窗**提交 ULW（对隐藏窗同样有效，像素暂存）后，
      show_all_fences 末尾一次 ShowWindow 放行（实测 0ms/5 个），DWM 同帧
      合成=同一帧弹出。已可见窗口的运行期刷新不受该位影响。
+   - **菜单后点空白→原生闪现 1-2s（2026-08-27 傍晚修复，勿回退）**：三拍
+     防抖的连带回归。ensure_all_attached 每 tick 先 `attached.clear()`，
+     旧代码失位当拍就修好并重新入集合；防抖期内失位栅栏整 tick 缺席
+     attached，同秒 reconcile_desktop_icons 的 any_fence_presented_on_
+     desktop() 因 `attached.contains`  conjunct 变假→走保底
+     restore_desktop_now 放出原生图标，下一两拍修好又藏回=完整往返。
+     修法：UiState.last_healthy_ms 记录每栅栏最近"全条件就绪"时刻，
+     就绪判定对 8s 内健康者放行（宽限 > 最大自愈延迟）。任何把"短暂
+     z 失位/瞬态外来窗"放大成桌面级回退的判定，都必须挂健康宽限。
+     复现工具 tools/menurepro.ps1（纯 PostMessage，无真实输入、无锁屏
+     风险）；注意 taskkill+start 竞态瞬间两代实例并存会让探针/walk 看
+     到"另一代实例的真实栅栏"充当拦路者——排查时先确保单实例。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**

@@ -380,6 +380,12 @@ struct UiState {
     /// ULW,循环结束一次批量放行。否则"画完一个亮一个",首末栅栏相差
     /// 整个串行绘制时长,启动时有明显扫过感。
     pub defer_show_until_batch: bool,
+    /// 每个非隐藏栅栏最近一次"全部就绪"(z 在带+已呈现+窗口可见)的时刻。
+    /// attached 集合每 tick 全清重建,防抖期内失位栅栏会短暂缺席;z-chain
+    /// 防抖窗口(≤3 tick≈3s)不能让 reconcile 的保底恢复误判"没有任何
+    /// 就绪栅栏"而把原生桌面放出来(2026-08-27 实测 1-2s 原生闪现),
+    /// 因此就绪判定对 8s 内健康的栅栏放行。
+    pub last_healthy_ms: HashMap<u32, u64>,
 }
 
 fn state() -> &'static Mutex<UiState> {
@@ -397,6 +403,7 @@ fn state() -> &'static Mutex<UiState> {
             attached: HashSet::new(),
             walk_strikes: HashMap::new(),
             defer_show_until_batch: false,
+            last_healthy_ms: HashMap::new(),
             hover: HashMap::new(),
             hover_pending: HashMap::new(),
             hover_hit: HashMap::new(),
@@ -2898,10 +2905,15 @@ fn ensure_all_attached() {
                     let mut db = [0u16; 32];
                     let dn = unsafe { GetClassNameW(w, &mut db) };
                     let mut dr = RECT::default();
-                    unsafe { GetWindowRect(w, &mut dr) };
+                    let _ = unsafe { GetWindowRect(w, &mut dr) };
+                    // 身份点名:w 是否在我方窗口表里(排除孤儿同类窗干扰),
+                    // 句柄一并打印供跨 tick 对账。
+                    let own = s.windows.values().any(|v| *v == w);
                     log(&format!(
-                        "walk-break: fence {id} blocked by cls={} rect=({},{})-({},{}) vis={} iconic={}",
+                        "walk-break: fence {id} blocked by cls={} own={} h=0x{:x} rect=({},{})-({},{}) vis={} iconic={}",
                         String::from_utf16_lossy(&db[..dn.max(0) as usize]),
+                        own,
+                        w.0,
                         dr.left, dr.top, dr.right, dr.bottom,
                         unsafe { IsWindowVisible(w).as_bool() },
                         unsafe { IsIconic(w).as_bool() }
@@ -2932,6 +2944,7 @@ fn ensure_all_attached() {
                 }
             } else {
                 s.walk_strikes.remove(&id);
+                s.last_healthy_ms.insert(id, resize_now_ms());
                 s.attached.insert(id);
             }
         }
@@ -3141,15 +3154,23 @@ pub fn restore_desktop_now() -> bool {
 fn any_fence_presented_on_desktop() -> bool {
     let hosts = desktop_hosts();
     let s = state().lock().unwrap();
+    let now = resize_now_ms();
     s.fences.iter().any(|f| {
         !f.hidden
             && s.presented.contains(&f.id)
-            && s.attached.contains(&f.id)
             && s.surfaces.contains_key(&f.id)
             && s.windows
                 .get(&f.id)
                 .is_some_and(|h| unsafe { IsWindowVisible(*h).as_bool() })
             && host_for_rect(&f.rect, &hosts).is_some()
+            // 健康宽限:attached 每 tick 清空重建,z 防抖期(≤3 拍)栅栏会
+            // 短暂缺席该集合,但用户眼里它一直好好地在桌面上。只要 8s 内
+            // 曾完整就绪(z 在带+呈现+可见+宿主在位),就不算"失去呈现",
+            // 绝不因此走保底恢复把原生图标放出来。
+            && (s.attached.contains(&f.id)
+                || now.saturating_sub(
+                    *s.last_healthy_ms.get(&f.id).unwrap_or(&0),
+                ) < 8000)
     })
 }
 
@@ -3184,6 +3205,32 @@ fn reconcile_desktop_icons() {
                 log("zen: re-hid native icons (Explorer re-showed them)");
             }
         } else {
+            // 保底恢复前的诊断快照:谁是"没就绪"的栅栏(可见性/宿主缺哪个),
+            // 防止误判断(如菜单收尾瞬态)误触发整桌回退。2026-08-27 排查
+            // "菜单后点空白→原生闪现 1-2s"专用。
+            {
+                let s = state().lock().unwrap();
+                let hosts = desktop_hosts();
+                let mut why: Vec<String> = Vec::new();
+                for f in s.fences.iter().filter(|f| !f.hidden) {
+                    let vis = s.windows.get(&f.id).is_some_and(|h| unsafe {
+                        IsWindowVisible(*h).as_bool()
+                    });
+                    if !(vis && s.presented.contains(&f.id)) {
+                        why.push(format!(
+                            "{}:vis={}pres={}",
+                            f.id,
+                            vis,
+                            s.presented.contains(&f.id)
+                        ));
+                    }
+                }
+                log(&format!(
+                    "icon-restore guard trip: {} unready [{}]",
+                    why.len(),
+                    why.join(",")
+                ));
+            }
             let _ = restore_desktop_now();
             log("desktop icons restored because fence presentation is unavailable");
         }
