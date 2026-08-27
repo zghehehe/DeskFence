@@ -1081,11 +1081,17 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
         // 区域感知比较:只有栅栏底下的像素变了才算"变"(时钟壁纸的分钟
         // 跳动不再触发全量重绘与缓存落盘)。快照本体总是更新,种子保持
         // 最新;changed=false 时调用方不重绘,切换无感。
+        let t0 = resize_now_ms();
         let changed = wallpaper_changed_under_fences(&s.wallpapers, &caps, &s.fences);
         s.wallpapers = caps;
         if changed {
             save_wallpaper_cache(&s.wallpapers);
         }
+        log(&format!(
+            "wallpaper capture ok ({}ms, changed={})",
+            resize_now_ms() - t0,
+            changed
+        ));
         changed
     }
 }
@@ -2377,32 +2383,47 @@ fn ensure_all_attached() {
         let mut chain_ok = false;
         if let Some(first_fence) = s.fences.iter().next() {
             if let Some(host) = host_for_rect(&first_fence.rect, &hosts) {
-                let top = desktop_insert_after(host.hwnd);
-                let mut seen: Vec<u32> = Vec::new();
-                let mut cur = unsafe { GetWindow(top, GW_HWNDNEXT) };
+                // 从宿主向上(GW_HWNDPREV)走,直到收齐全部栅栏:
+                // - 自有辅助窗口(1px 菜单宿主/托盘窗/瞬态 #32768 菜单弹层)
+                //   跳过不计时——菜单交互的前台化会让它们在栅栏与宿主之间
+                //   游走(2026-08-26 实测:只容忍宿主且方向走反的旧判定会
+                //   每秒失配 → 每秒洗牌 = 持续闪屏);
+                // - 外来窗口夹在宿主与栅栏之间才视为漂移触发修复;
+                //   栅栏上方的任何窗口与本检查无关。
+                let trayw = TRAY_HWND.get().copied();
                 let host1 = MENU_HOST_HWND.get().copied();
-                // 多走一步:1px 菜单宿主可能混入链中,容忍它(它不参与
-                // 桌面层语义,却会因前台化在链里游走)
-                for _ in 0..fences_sorted.len() + 1 {
-                    if cur.0 == 0 {
+                let mut seen: Vec<u32> = Vec::new();
+                let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                for _ in 0..32 {
+                    if w.0 == 0 || seen.len() == fences_sorted.len() {
                         break;
                     }
-                    if host1 == Some(cur) {
-                        cur = unsafe { GetWindow(cur, GW_HWNDNEXT) };
-                        continue;
-                    }
-                    let mut matched = None;
+                    let mut fence_hit: Option<u32> = None;
                     for (id, h) in s.windows.iter() {
-                        if *h == cur {
-                            matched = Some(*id);
+                        if *h == w {
+                            fence_hit = Some(*id);
                             break;
                         }
                     }
-                    match matched {
+                    match fence_hit {
                         Some(id) => seen.push(id),
-                        None => break,
+                        None => {
+                            let mut cls_buf = [0u16; 16];
+                            let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+                            // "#32768" 的 UTF-16 码元,避免每窗走 String 分配
+                            const MENU_CLASS: [u16; 6] =
+                                [0x23, 0x33, 0x32, 0x37, 0x36, 0x38];
+                            let is_menu_popup =
+                                n == 6 && cls_buf[..6] == MENU_CLASS;
+                            let aux = host1 == Some(w)
+                                || trayw == Some(w)
+                                || is_menu_popup;
+                            if !aux {
+                                break;
+                            }
+                        }
                     }
-                    cur = unsafe { GetWindow(cur, GW_HWNDNEXT) };
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
                 }
                 let mut seen_sorted = seen.clone();
                 seen_sorted.sort_unstable();
@@ -2414,6 +2435,10 @@ fn ensure_all_attached() {
                 s.attached.insert(*id);
             }
         } else {
+            log(&format!(
+                "z-chain repair: {} fences re-attached (order drifted or transient window in chain)",
+                s.windows.len()
+            ));
             for (id, h) in s.windows.clone() {
                 let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
                     continue;
@@ -2803,8 +2828,17 @@ fn init_tray() {
 fn show_tray_menu(x: i32, y: i32) {
     let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    shell::append_menu(menu, MENU_SHOW_ALL, "显示全部栅栏");
-    shell::append_menu(menu, MENU_HIDE_ALL, "隐藏全部栅栏");
+    // 显示/隐藏共用一个切换项:按当前状态换文案(用户约定:正常态显示
+    // "隐藏全部栅栏",隐藏后变"显示全部栅栏")
+    let all_hidden = {
+        let s = state().lock().unwrap();
+        s.fences.iter().all(|f| f.hidden)
+    };
+    if all_hidden {
+        shell::append_menu(menu, MENU_SHOW_ALL, "显示全部栅栏");
+    } else {
+        shell::append_menu(menu, MENU_HIDE_ALL, "隐藏全部栅栏");
+    }
     shell::append_separator(menu);
     shell::append_menu(menu, MENU_UNDO, "撤销上次布局调整");
     shell::append_menu(menu, MENU_RESET_LAYOUT, "恢复默认布局");
@@ -3639,6 +3673,7 @@ fn handle_clear_selection_click(x: i32, y: i32) {
         }
     }
     for id in refresh_ids {
+        log(&format!("clear-sel refresh fence {id}"));
         refresh_fence(id);
     }
 }
