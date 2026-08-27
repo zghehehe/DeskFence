@@ -87,6 +87,7 @@ fn set_align_mode_stored(mode: &str) {
         align_mode: mode.to_string(),
         render_mode: render_mode(),
         auto_category: auto_category(),
+        desktop_state: desktop_state(),
     });
 }
 pub fn auto_align_on() -> bool {
@@ -118,6 +119,31 @@ fn set_render_mode_stored(mode: &str) {
         align_mode: align_mode(),
         render_mode: mode.to_string(),
         auto_category: auto_category(),
+        desktop_state: desktop_state(),
+    });
+}
+
+/// 桌面状态(持久化):normal=栅栏显示 / zen=纯净(只剩壁纸) / native=原生图标。
+/// 切换即落盘,启动按此恢复;所有 Settings 落盘点都要带上当前值。
+static DESKTOP_STATE: Mutex<String> = Mutex::new(String::new());
+pub fn desktop_state() -> String {
+    {
+        let g = DESKTOP_STATE.lock().unwrap();
+        if !g.is_empty() {
+            return g.clone();
+        }
+    }
+    let m = model::load_settings().desktop_state;
+    *DESKTOP_STATE.lock().unwrap() = m.clone();
+    m
+}
+fn set_desktop_state_stored(mode: &str) {
+    *DESKTOP_STATE.lock().unwrap() = mode.to_string();
+    model::save_settings(&model::Settings {
+        align_mode: align_mode(),
+        render_mode: render_mode(),
+        auto_category: auto_category(),
+        desktop_state: mode.to_string(),
     });
 }
 
@@ -141,6 +167,7 @@ fn set_auto_category_stored(v: bool) {
         align_mode: align_mode(),
         render_mode: render_mode(),
         auto_category: v,
+        desktop_state: desktop_state(),
     });
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
@@ -1644,10 +1671,15 @@ fn warm_renderer_scratch() {
 /// “显示全部”和 Explorer 重建后的统一恢复入口。
 pub fn show_all_fences() {
     // Remove windows left behind by undo/reset before creating the current layout.
+    // 尊重持久化的桌面状态:zen/native 下栅栏应保持隐藏。菜单"显示全部
+    // 栅栏/恢复栅栏桌面"与第二实例唤起都会先把状态置回 normal 再调用,
+    // 因此这里按状态决定 hidden 位;启动恢复与 Explorer 重启恢复由此
+    // 保持在用户选择的状态。
+    let want_visible = desktop_state() == "normal";
     let orphaned: Vec<HWND> = {
         let mut s = state().lock().unwrap();
         for fence in &mut s.fences {
-            fence.hidden = false;
+            fence.hidden = !want_visible;
         }
         let valid: HashSet<u32> = s.fences.iter().map(|f| f.id).collect();
         let orphan_ids: Vec<u32> = s
@@ -1680,7 +1712,9 @@ pub fn show_all_fences() {
     invalidate_hosts_cache();
     // Keep the already rendered fence pixels on screen during reattachment.
     // Only fall back to Explorer icons when no fence has ever presented.
-    if state().lock().unwrap().presented.is_empty() {
+    // 纯净/原生态下栅栏"从未呈现"是设计使然,绝不能触发这个兜底——否则
+    // zen 启动的图标隐藏会被它立即翻转(实测:隐藏后 0.1s 内被重显+清标记)。
+    if state().lock().unwrap().presented.is_empty() && desktop_state() == "normal" {
         let _ = set_desktop_icons_visible(true);
         DESKTOP_ICONS_HIDDEN.store(false, Ordering::Relaxed);
         model::clear_icons_marker();
@@ -2026,9 +2060,29 @@ pub fn startup() {
         if s.fences.is_empty() {
             let t_cfg0 = resize_now_ms();
             let mut loaded = model::load_config();
-            // 启动必须显示全部栅栏:忽略持久化的 hidden 状态
+            // 按持久化的桌面状态恢复(2026-08-27 起):zen/native=全部
+            // 栅栏保持隐藏;normal=全部显示(忽略历史遗留的 hidden 位)。
+            let persist_hidden = desktop_state() != "normal";
             for f in loaded.iter_mut() {
-                f.hidden = false;
+                f.hidden = persist_hidden;
+            }
+            if persist_hidden {
+                log(&format!(
+                    "boot restores desktop_state={}",
+                    desktop_state()
+                ));
+            }
+            if desktop_state() == "zen" {
+                // 纯净态启动:栅栏全程不呈现,图标协调不会去藏图标,
+                // 这里显式隐藏(保留接管标记,崩溃后下次启动仍能自动恢复)
+                ZEN_MODE.store(true, Ordering::Relaxed);
+                if !NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed)
+                    && set_desktop_icons_visible(false)
+                {
+                    DESKTOP_ICONS_HIDDEN.store(true, Ordering::Relaxed);
+                    model::save_icons_marker(std::process::id());
+                    log("zen boot: native icons hidden, wallpaper only");
+                }
             }
             empty_config = loaded.is_empty();
             if !empty_config {
@@ -2556,6 +2610,10 @@ fn ensure_all_attached() {
 static DESKTOP_ICONS_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// User explicitly requested native desktop icons to remain visible.
 static NATIVE_DESKTOP_OVERRIDE: AtomicBool = AtomicBool::new(false);
+/// 纯净态:用户主动"隐藏全部栅栏"——栅栏与原生图标都隐藏,桌面只剩壁纸。
+/// 图标协调逻辑在此状态下不因"无栅栏呈现"而恢复原生图标(那正是旧的
+/// "隐藏栅栏=回到原生桌面"重复感的来源)。仅在本次运行内生效,重启回正常态。
+static ZEN_MODE: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn find_workerw_lv(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let slot: &mut Option<HWND> = &mut *(lparam.0 as *mut Option<HWND>);
@@ -2685,8 +2743,23 @@ fn reconcile_desktop_icons() {
             log("desktop icons hidden after fence presentation verified");
         }
     } else if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
-        let _ = restore_desktop_now();
-        log("desktop icons restored because fence presentation is unavailable");
+        if ZEN_MODE.load(Ordering::Relaxed) {
+            // 纯净态:主动维持图标隐藏。启动早期的隐藏可能被 Explorer 的
+            // 异步初始化重显(实测 boot 后 0.4s 隐藏、~1s 又被显示回来),
+            // 这里每秒只做"读可见性"的检查,失配才重新隐藏,平时零骚扰。
+            // 崩溃安全不受影响:接管标记仍在,下次启动会自动恢复原生图标。
+            let re_showing = desktop_listview()
+                .is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
+            if re_showing
+                && !NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed)
+                && set_desktop_icons_visible(false)
+            {
+                log("zen: re-hid native icons (Explorer re-showed them)");
+            }
+        } else {
+            let _ = restore_desktop_now();
+            log("desktop icons restored because fence presentation is unavailable");
+        }
     }
 }
 
@@ -2762,6 +2835,9 @@ unsafe extern "system" fn tray_wndproc(
             return LRESULT(0);
         }
         if msg == WM_DL3_SHOW_ALL {
+            // 第二实例唤起 = 回到正常态(持久化)
+            ZEN_MODE.store(false, Ordering::Relaxed);
+            set_desktop_state_stored("normal");
             show_all_fences();
             return LRESULT(0);
         }
@@ -2909,11 +2985,17 @@ fn init_tray() {
 fn show_tray_menu(x: i32, y: i32) {
     let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    // 显示/隐藏共用一个切换项:按当前状态换文案(用户约定:正常态显示
-    // "隐藏全部栅栏",隐藏后变"显示全部栅栏")
-    let all_hidden = {
+    // 两个状态感知切换项(用户约定):
+    // 按钮1 栅栏可见性:正常态"隐藏全部栅栏"(→纯净态:只剩壁纸),
+    //                 栅栏隐藏时"显示全部栅栏"(→回正常态);
+    // 按钮2 桌面归属:正常/纯净态"恢复原始桌面"(→原生图标接管),
+    //                原生态"恢复栅栏桌面"(→栅栏回归,图标重新隐藏)。
+    let (all_hidden, icons_hidden) = {
         let s = state().lock().unwrap();
-        s.fences.iter().all(|f| f.hidden)
+        (
+            s.fences.iter().all(|f| f.hidden),
+            DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed),
+        )
     };
     if all_hidden {
         shell::append_menu(menu, MENU_SHOW_ALL, "显示全部栅栏");
@@ -2933,7 +3015,13 @@ fn show_tray_menu(x: i32, y: i32) {
             "隐藏桌面图标"
         },
     );
-    shell::append_menu(menu, MENU_RESTORE_DESKTOP, "恢复原始桌面");
+    // 原生图标可见且栅栏全部隐藏 = 原生桌面态,翻转为恢复栅栏
+    let native_mode = all_hidden && !icons_hidden;
+    if native_mode {
+        shell::append_menu(menu, MENU_SHOW_ALL, "恢复栅栏桌面");
+    } else {
+        shell::append_menu(menu, MENU_RESTORE_DESKTOP, "恢复原始桌面");
+    }
     let align = unsafe { CreatePopupMenu().unwrap_or_default() };
     let mode = align_mode();
     let modes = [
@@ -2994,8 +3082,20 @@ fn show_tray_menu(x: i32, y: i32) {
 
 fn dispatch_tray_command(id: u32) {
     match id {
-        MENU_SHOW_ALL => show_all_fences(),
-        MENU_HIDE_ALL => set_all_hidden(true),
+        MENU_SHOW_ALL => {
+            // "显示全部栅栏"/"恢复栅栏桌面"共用:回到正常态,栅栏回归,
+            // 图标协调随栅栏呈现自动重新隐藏原生图标
+            ZEN_MODE.store(false, Ordering::Relaxed);
+            set_desktop_state_stored("normal");
+            show_all_fences();
+        }
+        MENU_HIDE_ALL => {
+            // 纯净态:栅栏全部隐藏且原生图标保持隐藏(桌面只剩壁纸)
+            ZEN_MODE.store(true, Ordering::Relaxed);
+            set_desktop_state_stored("zen");
+            set_all_hidden(true);
+            log("zen mode: all fences hidden, native icons stay hidden");
+        }
         MENU_UNDO => undo_layout(),
         MENU_RESET_LAYOUT => reset_fence_layout(),
         MENU_TOGGLE_DESKTOP_ICONS => toggle_desktop_icons(),
@@ -4015,6 +4115,8 @@ fn delete_fence(fence_id: u32) {
 /// 离开 DeskFence 桌面模式：先恢复 Explorer 原生图标，再隐藏本程序窗口。
 /// 不修改原始图标位置、文件或 Explorer 布局；用户可通过“显示全部栅栏”再次接管。
 fn restore_original_desktop() {
+    ZEN_MODE.store(false, Ordering::Relaxed);
+    set_desktop_state_stored("native");
     let _ = restore_desktop_now();
     set_all_hidden(true);
     log("returned to original desktop without changing files or icon layout");
@@ -4818,6 +4920,8 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_DL3_SHOW_ALL => {
+            ZEN_MODE.store(false, Ordering::Relaxed);
+            set_desktop_state_stored("normal");
             set_all_hidden(false);
             return LRESULT(0);
         }

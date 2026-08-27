@@ -1239,6 +1239,16 @@ pub struct Settings {
     /// 的栅栏,未分配的文件集中显示在"未分类"栅栏。
     #[serde(default = "default_auto_category")]
     pub auto_category: bool,
+    /// 桌面状态(2026-08-27 起持久化):"normal"=栅栏显示(默认) /
+    /// "zen"=纯净态(栅栏与原生图标都隐藏,只剩壁纸) /
+    /// "native"=原生桌面(原生图标接管,栅栏隐藏)。托盘菜单切换时落盘,
+    /// 启动按此恢复。
+    #[serde(default = "default_desktop_state")]
+    pub desktop_state: String,
+}
+
+pub fn default_desktop_state() -> String {
+    "normal".into()
 }
 pub fn default_render_mode() -> String {
     "precise".into()
@@ -1303,6 +1313,7 @@ impl Default for Settings {
             align_mode: "auto".into(),
             render_mode: default_render_mode(),
             auto_category: default_auto_category(),
+            desktop_state: default_desktop_state(),
         }
     }
 }
@@ -1330,6 +1341,7 @@ pub fn load_settings() -> Settings {
                 align_mode: mode.into(),
                 render_mode: default_render_mode(),
                 auto_category: default_auto_category(),
+                desktop_state: default_desktop_state(),
             }
         }
     }
