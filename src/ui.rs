@@ -96,8 +96,10 @@ pub fn grid_align_on() -> bool {
     align_mode() == "grid"
 }
 
-/// 渲染模式:"transparent"=透明窗口(默认,兼容动态壁纸);
-/// "precise"=精确模式(不透明壁纸底+GDI ClearType,与原生桌面逐像素一致)。
+/// 渲染模式:"transparent"=透明窗口(默认);"precise"=精确模式。
+/// 2026-08-26 起两模式共用同一渲染管线(透明底+seeded GDI ClearType 文字),
+/// 区别仅剩启动守卫:精确模式等首帧壁纸种子就绪再呈现,透明模式立即呈现
+/// (种子缺失时黑种子兜底)。菜单勾选文案保留两档供用户选择。
 static RENDER_MODE: Mutex<String> = Mutex::new(String::new());
 pub fn render_mode() -> String {
     {
@@ -539,16 +541,21 @@ fn metrics_for_window(hwnd: HWND) -> model::DpiMetrics {
 /// 探测结果缓存:probe 要向桌面 SysListView32 跨进程发 LVM_GETITEMSPACING,
 /// 会唤醒 Explorer 宿主窗口工作——菜单等前台切换后宿主的这次重绘表现为
 /// 栅栏区域整面 ~4% 亮度跳变(用户看到的"点桌面关菜单闪一下")。
-/// 图标格距几秒内不会变,10s 缓存把骚扰从每秒一次降到十分之一,
-/// 探测频率远高于用户在桌面设置里改图标大小的操作节奏。
-static ITEM_SPACING_CACHE: Mutex<Option<(std::time::Instant, (f32, f32))>> =
-    Mutex::new(None);
+/// 2026-08-26 改为**粘性缓存**:键=(注册表 IconSize, 系统 DPI 缩放)——
+/// 格距只在这些输入变化时才会变(Ctrl+滚轮写注册表,换显示器/DPI 改缩放),
+/// 键不变就永不重发探测,把对宿主的骚扰从每 10s 一次降到"配置变化时一次"。
+/// sync_icon_size 的跟随能力不受影响:用户 Ctrl+滚轮 → 注册表变化 → 键失配
+/// → 恰好探测一次并重算格距。
+static ITEM_SPACING_CACHE: Mutex<Option<((f32, u32), (f32, f32))>> = Mutex::new(None);
 
 fn probe_desktop_item_spacing() -> Option<(f32, f32)> {
+    let key = (shell::desktop_icon_size(), unsafe {
+        (GetDpiForSystem() as u32).max(96)
+    });
     {
         let cache = ITEM_SPACING_CACHE.lock().unwrap();
-        if let Some((at, v)) = *cache {
-            if at.elapsed().as_secs() < 10 {
+        if let Some((k, v)) = *cache {
+            if k == key {
                 return Some(v);
             }
         }
@@ -574,7 +581,7 @@ fn probe_desktop_item_spacing() -> Option<(f32, f32)> {
             return None;
         }
         let v = (cx, cy);
-        *ITEM_SPACING_CACHE.lock().unwrap() = Some((std::time::Instant::now(), v));
+        *ITEM_SPACING_CACHE.lock().unwrap() = Some((key, v));
         Some(v)
     }
 }
@@ -958,13 +965,18 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
 /// 壁纸快照例行重捕获的最大间隔(兜底)。壁纸变化的主路径是事件驱动:
 /// 手动换壁纸走 WM_SETTINGCHANGE(毫秒级);幻灯片轮换走 Themes 目录
 /// watcher 或 IDesktopWallpaper 签名轮询(秒级,标准机器有效;本机等定制
-/// 环境两者皆不可用时退化为本兜底轮询)。PrintWindow 抓宿主会强制其重绘,
-/// 间隔太短会在交互时看到桌面闪,60s 是静默观测验证过的安全值。
-const WALLPAPER_REFRESH_MS: u64 = 60_000;
+/// 环境两者皆不可用时退化为本兜底轮询)。
+/// 2026-08-26 从 60s 放宽到 10min:ink 常驻后快照只作文字种子,不新鲜
+/// 没有视觉代价;而每次稳态捕获的 PrintWindow 都会强制桌面宿主重绘,
+/// 落在交互后的未稳态窗口就是用户偶发的"点击后闪一下"——捕获越少,
+/// 命中敏感窗口的概率越小。真实壁纸变化仍由事件驱动毫秒级跟随。
+const WALLPAPER_REFRESH_MS: u64 = 600_000;
 
-/// 捕获/刷新各桌面宿主的壁纸像素(带节流)。失败清空 → 精确模式自动回退透明底。
-/// 原生桌面图标在 DeskFence 接管时是隐藏的,宿主(Progman/WorkerW)捕获到的
-/// 就是纯壁纸;捕获结果疑似全黑(PrintWindow 对个别窗口会失败)同样视为失败。
+/// 捕获/刷新各桌面宿主的壁纸像素(带节流)。快照的作用是**文字种子**与
+/// 启动守卫(ink 常驻后栅栏背景实时透出,不再依赖快照)。失败不清空旧快照
+/// (保留种子继续用,连续失败才触发精确模式回退透明)。原生桌面图标在
+/// DeskFence 接管时是隐藏的,宿主(Progman/WorkerW)捕获到的就是纯壁纸;
+/// 捕获结果疑似全黑(PrintWindow 对个别窗口会失败)同样视为失败。
 fn ensure_wallpaper(s: &mut UiState) -> bool {
     let now = resize_now_ms();
     // wallpaper_ms == 0 是"强制重捕获/从未捕获"哨兵:进程刚启动的一个刷新周期内
@@ -1066,7 +1078,10 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
     } else {
         s.wallpaper_fails = 0;
         s.wallpaper_dirty_since = 0; // 懒捕获任务完成:种子已就绪
-        let changed = wallpaper_content_changed(&s.wallpapers, &caps);
+        // 区域感知比较:只有栅栏底下的像素变了才算"变"(时钟壁纸的分钟
+        // 跳动不再触发全量重绘与缓存落盘)。快照本体总是更新,种子保持
+        // 最新;changed=false 时调用方不重绘,切换无感。
+        let changed = wallpaper_changed_under_fences(&s.wallpapers, &caps, &s.fences);
         s.wallpapers = caps;
         if changed {
             save_wallpaper_cache(&s.wallpapers);
@@ -1093,20 +1108,55 @@ pub fn mark_interaction() {
 /// 存在 ~4% 的时序波动(ICC/伽马路径),逐字节严格比较会把波动当成
 /// "壁纸变了",触发无谓的全量重绘——栅栏区域整面 4% 亮度先跳再回,
 /// 正是用户看到的"闪"。真换壁纸是整图替换,容差不影响判别。
-fn wallpaper_content_changed(
+/// 比较新旧快照在"栅栏覆盖区域"内是否有实质变化(每通道 8 容差,理由:
+/// PrintWindow 捕获亮度存在 ~4% 时序波动,严格比较会把波动当成变化)。
+/// 栅栏区域之外的变化(如本机时钟壁纸的分钟跳动)不影响渲染——ink 常驻
+/// 下快照只作标签种子,栅栏外的壁纸像素从不参与任何绘制——因此不触发
+/// 重绘与缓存落盘,避免时钟壁纸下的每分钟空转(全量重绘+9MB 落盘+闪风险)。
+/// 宿主几何(数量/尺寸/原点)变化仍视为整体变化;无栅栏时退化为全图比较。
+fn wallpaper_changed_under_fences(
     old: &[render::WallpaperPixels],
     new: &[render::WallpaperPixels],
+    fences: &[Fence],
 ) -> bool {
     if old.len() != new.len() {
         return true;
     }
-    old.iter().zip(new.iter()).any(|(a, b)| {
-        a.w != b.w
-            || a.h != b.h
-            || a.origin_x != b.origin_x
-            || a.origin_y != b.origin_y
-            || px_differs(&a.px, &b.px)
-    })
+    for (a, b) in old.iter().zip(new.iter()) {
+        if a.w != b.w || a.h != b.h || a.origin_x != b.origin_x || a.origin_y != b.origin_y {
+            return true;
+        }
+    }
+    if fences.is_empty() {
+        return old
+            .iter()
+            .zip(new.iter())
+            .any(|(a, b)| px_differs(&a.px, &b.px));
+    }
+    for f in fences {
+        let fl = f.rect.x.round() as i32;
+        let ft = f.rect.y.round() as i32;
+        let fr = fl + f.rect.w.round() as i32;
+        let fb = ft + f.rect.h.round() as i32;
+        for (a, b) in old.iter().zip(new.iter()) {
+            let x0 = (fl - a.origin_x).max(0);
+            let y0 = (ft - a.origin_y).max(0);
+            let x1 = (fr - a.origin_x).min(a.w as i32);
+            let y1 = (fb - a.origin_y).min(a.h as i32);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            for y in y0..y1 {
+                let row_a = ((y as u32 * a.w + x0 as u32) as usize) * 4;
+                let row_b = ((y as u32 * b.w + x0 as u32) as usize) * 4;
+                let len = (x1 - x0) as usize * 4;
+                if px_differs(&a.px[row_a..row_a + len], &b.px[row_b..row_b + len]) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn px_differs(a: &[u8], b: &[u8]) -> bool {
@@ -1318,7 +1368,7 @@ fn wallpaper_catchup_tick(hwnd: HWND) {
 }
 
 fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
-    // 精确模式:先确保壁纸快照新鲜(需要在借用 fence 之前拿 &mut)
+    // 启动守卫标记:精确模式在首帧种子就绪前不呈现新帧(借用 fence 前先取出)
     let precise = precise_mode_on();
     // 注意:此处不再 ensure_wallpaper。PrintWindow(RENDERFULLCONTENT) 抓桌面宿主
     // 会强制桌面重绘,点击/菜单收尾触发的栅栏刷新会因此闪整个桌面。
@@ -2681,7 +2731,7 @@ fn add_tray_icon(hwnd: HWND) {
         n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         n.uCallbackMessage = TRAY_MSG;
         n.hIcon = deskfence_icon();
-        let tip = shell::wide("DeskFence 栅栏桌面");
+        let tip = shell::wide("DeskFence");
         for (i, ch) in tip.iter().take(127).enumerate() {
             n.szTip[i] = *ch;
         }

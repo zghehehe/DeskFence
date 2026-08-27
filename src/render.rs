@@ -469,14 +469,14 @@ pub fn gdi_draw_labels_seeded(
                     let inv = 255 - pre[po + 3] as u32;
                     let sb = (pre[po] as u32 + (wb as u32 * inv + 127) / 255).min(255) as u8;
                     let sg = (pre[po + 1] as u32 + (wg as u32 * inv + 127) / 255).min(255) as u8;
-                    let sr2 = (pre[po + 2] as u32 + (wr as u32 * inv + 127) / 255).min(255) as u8;
+                    let sr = (pre[po + 2] as u32 + (wr as u32 * inv + 127) / 255).min(255) as u8;
                     seed[po] = sb;
                     seed[po + 1] = sg;
-                    seed[po + 2] = sr2;
+                    seed[po + 2] = sr;
                     seed[po + 3] = 255;
                     bits[so] = sb;
                     bits[so + 1] = sg;
-                    bits[so + 2] = sr2;
+                    bits[so + 2] = sr;
                     bits[so + 3] = 255;
                 }
             }
@@ -638,9 +638,8 @@ pub fn draw_fence(
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
 
-        // 原生桌面外观:默认(未悬停/未激活)底色/标题完全隐藏,只显示图标本身;
-        // 但保留一条极淡的 1px 边框,让用户能找到栅栏边界和上下左右拖拽调整大小热区。
-        // 悬停时浮现稍清晰的轮廓,便于辨认分区。
+        // 原生桌面外观:默认(未悬停/未激活)完全干净,只显示图标与名字本身,
+        // 边框/标题/手柄全部悬停或拖拽时才浮现(见下方 show_chrome)。
         // 关键:分层窗口按逐像素 alpha 做命中测试,alpha=0 的区域会点击穿透,
         // 因此整个栅栏矩形必须铺一层 alpha=1/255 的"不可见底"(视觉无感知,但鼠标可命中)。
         if let Some(bg) = brush(
