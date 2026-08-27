@@ -375,6 +375,11 @@ struct UiState {
     /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
     /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
     pub walk_strikes: HashMap<u32, u32>,
+    /// 批量呈现抑制位(show_all_fences 置位):true 期间 refresh_fence_impl
+    /// 跳过 ShowWindow/SHOWWINDOW——先把全部栅栏表面画完并向隐藏窗提交
+    /// ULW,循环结束一次批量放行。否则"画完一个亮一个",首末栅栏相差
+    /// 整个串行绘制时长,启动时有明显扫过感。
+    pub defer_show_until_batch: bool,
 }
 
 fn state() -> &'static Mutex<UiState> {
@@ -391,6 +396,7 @@ fn state() -> &'static Mutex<UiState> {
             presented: HashSet::new(),
             attached: HashSet::new(),
             walk_strikes: HashMap::new(),
+            defer_show_until_batch: false,
             hover: HashMap::new(),
             hover_pending: HashMap::new(),
             hover_hit: HashMap::new(),
@@ -1702,20 +1708,24 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         arm_wallpaper_catchup();
         return;
     }
-    // 顶层窗口:直接使用屏幕坐标
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        // 强制置前显示:仅 SW_SHOW 有时不足以让分层窗口重新可见,
-        // 这里显式 SWP_SHOWWINDOW 兜底(问题「显示全部不生效」)。
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            fence.rect.x.round() as i32,
-            fence.rect.y.round() as i32,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE,
-        );
+    // 顶层窗口:直接使用屏幕坐标。defer_show_until_batch 批量呈现期间跳过
+    // 显示动作:先对所有栅栏完成绘制+向隐藏窗提交 ULW(UpdateLayeredWindow
+    // 对隐藏窗口同样有效,像素暂存),由调用方循环结束后一并放行。
+    if !s.defer_show_until_batch {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            // 强制置前显示:仅 SW_SHOW 有时不足以让分层窗口重新可见,
+            // 这里显式 SWP_SHOWWINDOW 兜底(问题「显示全部不生效」)。
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                fence.rect.x.round() as i32,
+                fence.rect.y.round() as i32,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+        }
     }
     let w = fence.rect.w.ceil() as u32;
     let h = fence.rect.h.ceil() as u32;
@@ -1994,8 +2004,40 @@ pub fn show_all_fences() {
     if BOOT_VERBOSE.load(Ordering::Relaxed) {
         log(&format!("boot windows created ({}ms)", resize_now_ms()));
     }
-    for id in ids {
-        refresh_fence(id);
+    // 批量呈现:所有栅栏先在隐藏状态下画完并提交 ULW(像素暂存),然后一
+    // 次性放行。放行循环只有 ShowWindow 系统调用(~µs/个),DWM 同帧合成,
+    // 用户看到的是全部栅栏同一帧弹出——而不是"画完一个亮一个"、首末相差
+    // 整个串行绘制时长的扫过感。已可见窗口(运行期刷新)不受影响。
+    {
+        let mut s = state().lock().unwrap();
+        s.defer_show_until_batch = true;
+    }
+    for id in &ids {
+        refresh_fence(*id);
+    }
+    {
+        let mut s = state().lock().unwrap();
+        s.defer_show_until_batch = false;
+        let t0 = resize_now_ms();
+        let mut n_shown = 0usize;
+        for f in s.fences.iter() {
+            if f.hidden {
+                continue;
+            }
+            if let Some(h) = s.windows.get(&f.id) {
+                unsafe {
+                    let _ = ShowWindow(*h, SW_SHOWNOACTIVATE);
+                }
+                n_shown += 1;
+            }
+        }
+        if BOOT_VERBOSE.load(Ordering::Relaxed) {
+            log(&format!(
+                "boot batch show {} fences took {}ms",
+                n_shown,
+                resize_now_ms() - t0
+            ));
+        }
     }
     reconcile_desktop_icons();
 }
