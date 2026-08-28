@@ -234,6 +234,14 @@
        unset GIT_INDEX_FILE && rm -f .git/pub-idx
      打 tag v* 推送后 Actions 自动 build+单文件校验+发 Release。
      crt-static 经 .cargo/config.toml 全局生效（exe 仅依赖系统库）。
+     **官网**：website/index.html 是单文件官网（内联 SVG 动画、零依赖），
+     含下载(直链 releases/latest/download/deskfence.exe)/隐私/支持三节。
+     发布= tools/deploy-site.sh → 推到独立公开仓库 zghehehe.github.io
+     （GitHub 用户主页域名 https://zghehehe.github.io）。代码仓保持纯净，
+     site 与代码彻底分离。注意：代码仓 Private 期间官网下载/源码链接
+     对外 404——公开推广前先把 DeskFence 仓库转 Public。
+     GitHub 提交身份一律中性：zghehehe + zghehehe@users.noreply.github.com
+     （publish/deploy 脚本内已强制 env，勿用工作身份提交公开内容）。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**

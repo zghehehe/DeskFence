@@ -147,6 +147,8 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       <a href="#guide">使用文档</a>
       <a href="#videos">动画演示</a>
       <a href="#faq">常见问题</a>
+      <a href="#download">下载</a>
+      <a href="https://github.com/zghehehe/DeskFence" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
 </nav>
@@ -158,10 +160,11 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
     <h1>桌面,井然有序。</h1>
     <div class="sub">DeskFence 自动把杂乱的桌面图标分入栅栏,<br>观感与原生桌面逐像素一致,几乎察觉不到它在运行。</div>
     <div class="cta">
-      <a class="btn" href="#guide">五分钟上手</a>
+      <a class="btn" href="https://github.com/zghehehe/DeskFence/releases/latest/download/deskfence.exe">免费下载 exe</a>
+      <a class="btn ghost" href="#guide">五分钟上手</a>
       <a class="btn ghost" href="#videos">看动画演示</a>
     </div>
-    <div class="hero-note">单个 exe · 内存占用 ~80MB · 开机自启可关 · 卸载即还原</div>
+    <div class="hero-note">Windows 10/11 x64 · 单个 exe 免安装 · 无需运行库 · 卸载即还原</div>
 
     <!-- 首屏动画:图标飞入栅栏(卡通 Win11 桌面) -->
     <div class="hero-anim">
@@ -561,6 +564,81 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
   </div>
 </section>
 
+<!-- ============ 下载 ============ -->
+<section id="download">
+  <div class="wrap">
+    <h2 class="sec-title">下载 DeskFence</h2>
+    <p class="sec-sub">单文件、免安装、绿色便携,随时彻底离开。</p>
+    <div class="cta" style="justify-content:center;margin:28px 0 12px">
+      <a class="btn" href="https://github.com/zghehehe/DeskFence/releases/latest/download/deskfence.exe">下载最新版 deskfence.exe</a>
+      <a class="btn ghost" href="https://github.com/zghehehe/DeskFence/releases" target="_blank" rel="noopener">全部版本 / 更新日志</a>
+      <a class="btn ghost" href="https://github.com/zghehehe/DeskFence" target="_blank" rel="noopener">源码 (MIT)</a>
+    </div>
+    <div class="faq" style="max-width:720px;margin:0 auto">
+      <details>
+        <summary>安装方式</summary>
+        <p>下载 <code>deskfence.exe</code> 后双击即可运行——它就是全部,没有安装器、没有驱动服务、不写注册表。想常驻:托盘菜单勾选"开机自启动"。</p>
+      </details>
+      <details>
+        <summary>系统要求</summary>
+        <p>Windows 10 / 11 (x64)。exe 为静态链接单文件,<b>无需安装任何运行库</b>。</p>
+      </details>
+      <details>
+        <summary>SmartScreen 提示"已保护你的电脑"?</summary>
+        <p>程序未做付费代码签名(开源免费,签名费用不菲)。点击"<b>更多信息</b>"→"<b>仍要运行</b>"即可;不放心的可以自行从源码构建。</p>
+      </details>
+      <details>
+        <summary>卸载方法</summary>
+        <p>托盘菜单退出程序 → 删除 exe 与 <code>%APPDATA%\DeskFence</code> 文件夹。桌面图标自动恢复原样。</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 隐私 ============ -->
+<section id="privacy">
+  <div class="wrap">
+    <h2 class="sec-title">隐私</h2>
+    <p class="sec-sub">一句话:DeskFence 不联网。</p>
+    <div class="faq" style="max-width:720px;margin:0 auto">
+      <details open>
+        <summary>收集哪些数据?</summary>
+        <p><b>零。</b>不收集、不上传、无遥测、无统计 SDK、无自动更新请求。程序甚至没有任何联网代码。</p>
+      </details>
+      <details>
+        <summary>数据存在哪?</summary>
+        <p>全部在本机 <code>%APPDATA%\DeskFence</code>(栅栏布局、设置、壁纸与图标缓存)。删除该目录即彻底重置。</p>
+      </details>
+      <details>
+        <summary>怎么验证?</summary>
+        <p>完全开源(MIT),源码可审计;也可自行用防火墙观察——它不会发起任何连接。</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 支持 ============ -->
+<section id="support">
+  <div class="wrap">
+    <h2 class="sec-title">支持与反馈</h2>
+    <p class="sec-sub">遇到问题,按这三步走,基本都能解决。</p>
+    <div class="faq" style="max-width:720px;margin:0 auto">
+      <details open>
+        <summary>1. 先看内置自救</summary>
+        <p>桌面异常时运行 <code>deskfence.exe --restore-desktop</code>:无 UI 恢复原生桌面图标后退出,绝不留白屏。日常排障看日志:<code>%APPDATA%\DeskFence\run.log</code>。</p>
+      </details>
+      <details>
+        <summary>2. 查常见问题</summary>
+        <p><a href="#faq">回到"常见问题"小节</a>——文件安全、性能、动态壁纸、多显示器、卸载等高频问题都在里面。</p>
+      </details>
+      <details>
+        <summary>3. 提 Issue</summary>
+        <p>到 <a href="https://github.com/zghehehe/DeskFence/issues" target="_blank" rel="noopener">GitHub Issues</a> 提交问题,附上 run.log 尾部与系统版本,一般很快有回复。</p>
+      </details>
+    </div>
+  </div>
+</section>
+
 <!-- ============ Footer ============ -->
 <footer>
   <div class="wrap">
@@ -571,11 +649,15 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       </div>
       <div>
         <h4>页面</h4>
-        <p><a href="#features">核心能力</a><br><a href="#guide">使用文档</a><br><a href="#videos">动画演示</a><br><a href="#faq">常见问题</a></p>
+        <p><a href="#features">核心能力</a><br><a href="#guide">使用文档</a><br><a href="#videos">动画演示</a><br><a href="#faq">常见问题</a><br><a href="#download">下载</a></p>
       </div>
       <div>
         <h4>排障</h4>
         <p>运行日志:<code style="color:#a1a1a6">%APPDATA%\DeskFence\run.log</code><br>恢复命令:<code style="color:#a1a1a6">deskfence.exe --restore-desktop</code></p>
+      </div>
+      <div>
+        <h4>链接</h4>
+        <p><a href="https://github.com/zghehehe/DeskFence" target="_blank" rel="noopener">GitHub 源码</a><br><a href="https://github.com/zghehehe/DeskFence/releases" target="_blank" rel="noopener">下载</a><br><a href="https://github.com/zghehehe/DeskFence/issues" target="_blank" rel="noopener">问题反馈</a><br><a href="#privacy">隐私说明</a></p>
       </div>
     </div>
     <div class="fine">© 2026 DeskFence · 适用于 Windows 10/11 · 本页演示动画为卡通示意,实际界面以软件为准</div>
