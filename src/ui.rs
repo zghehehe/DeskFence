@@ -2827,6 +2827,71 @@ fn global_tick() {
 /// 顶层分层窗口 + 每秒重申插入位置 —— Explorer 重启、z 序漂移、启动竞态
 /// 都能在 1 秒内自动修复;找不到宿主时窗口保持原 z 位(新桌面在其下,不浮窗),
 /// 缺失窗口延迟到宿主就绪后创建。
+// ---------------- band 走查共享判据 ----------------
+// 主走查、肇事扫描、z-guard 快速通道三处必须用同一套"可忽略窗口"语义,
+// 2026-08-28 抽取为单一来源(此前走查内部即有两份复制粘贴)。
+
+struct VirtualScreen {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+fn virtual_screen_rect() -> VirtualScreen {
+    unsafe {
+        VirtualScreen {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    }
+}
+
+const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38]; // "#32768"
+const TRAY_CLASS: [u16; 13] = [
+    0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
+]; // "Shell_TrayWnd"
+// EdgeUiInputTopWndClass:系统触摸/输入边缘条,band 内常驻半透明,只覆盖
+// 屏幕边角几像素且自身透明,不可能视觉遮挡桌面内容。它在前后台切换
+//(菜单开合)时会上下漂移穿过我们的 band,按 band 原生系统窗容忍。
+const EDGEUI_CLASS: [u16; 22] = [
+    0x45, 0x64, 0x67, 0x65, 0x55, 0x69, 0x49, 0x6E, 0x70, 0x75, 0x74, 0x54, 0x6F, 0x70, 0x57,
+    0x6E, 0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
+];
+
+/// band 走查的"不可见"判据:隐藏/最小化/离屏/退化尺寸(≤2px,GDI+ 钩子与
+/// 锁屏残留 CoreWindow 常以 1x1@0,0 插队,实际遮不住)/cloaked(visible
+/// 位有效但 DWM 不合成)。
+fn band_invisible(w: HWND, vs: &VirtualScreen) -> bool {
+    let mut wr = RECT::default();
+    let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
+    !rect_ok
+        || unsafe { IsIconic(w).as_bool() }
+        || !unsafe { IsWindowVisible(w).as_bool() }
+        || wr.right - wr.left <= 2
+        || wr.bottom - wr.top <= 2
+        || wr.right <= vs.x
+        || wr.bottom <= vs.y
+        || wr.left >= vs.x + vs.w
+        || wr.top >= vs.y + vs.h
+        || window_is_cloaked(w)
+}
+
+/// band 走查的"自有辅助窗/系统 band 窗"判据:菜单宿主/托盘窗/#32768 弹层/
+/// Shell_TrayWnd(自动隐藏任务栏转换瞬态)/EdgeUi 输入条。
+fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
+    if menu_host == Some(w) || tray == Some(w) {
+        return true;
+    }
+    let mut cls_buf = [0u16; 32];
+    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+    (n == 6 && cls_buf[..6] == MENU_CLASS)
+        || (n == 13 && cls_buf[..13] == TRAY_CLASS)
+        || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
+}
+
 fn ensure_all_attached() {
     let hosts = desktop_hosts();
     let mut created: Vec<u32> = Vec::new();
@@ -2882,22 +2947,7 @@ fn ensure_all_attached() {
         // 全量 SetWindowPos=每次菜单交互都闪。
         let trayw = TRAY_HWND.get().copied();
         let host1 = MENU_HOST_HWND.get().copied();
-        const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38];
-        const TRAY_CLASS: [u16; 13] = [
-            0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
-        ];
-        // EdgeUiInputTopWndClass:系统触摸/输入边缘条,band 内常驻半透明,只覆盖
-        // 屏幕边角几像素且自身透明,不可能视觉遮挡桌面内容。它在前后台切换
-        //(菜单开合)时会上下漂移穿过我们的 band,逐次引发"检出→修复→又漂回"
-        // 的循环,按 band 原生系统窗容忍。
-        const EDGEUI_CLASS: [u16; 22] = [
-            0x45, 0x64, 0x67, 0x65, 0x55, 0x69, 0x49, 0x6E, 0x70, 0x75, 0x74, 0x54, 0x6F, 0x70,
-            0x57, 0x6E, 0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
-        ];
-        let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-        let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-        let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-        let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        let vs = virtual_screen_rect();
         let mut to_move: Vec<u32> = Vec::new();
         for (id, h) in s.windows.clone() {
             // 被拖栅栏拖拽期间提升到最高兄弟栅栏之上(band 内,见 handle_mousemove),
@@ -2947,37 +2997,14 @@ fn ensure_all_attached() {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
-                let mut wr = RECT::default();
-                let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
-                // "不可见"判据含退化尺寸(宽或高<=2):GDI+ 钩子/锁屏残留的
-                // CoreWindow 等以 1x1@0,0 常驻,间歇插进宿主与栅栏之间会
-                // 触发修复+zombie 菜单(2026-08-27 实测),实际不可能遮挡。
-                let invisible = !rect_ok
-                    || unsafe { IsIconic(w).as_bool() }
-                    || !unsafe { IsWindowVisible(w).as_bool() }
-                    || wr.right - wr.left <= 2
-                    || wr.bottom - wr.top <= 2
-                    || wr.right <= vx
-                    || wr.bottom <= vy
-                    || wr.left >= vx + vw
-                    || wr.top >= vy + vh
-                    // cloaked:见 window_is_cloaked——visible 但 DWM 不合成,遮不住
-                    || window_is_cloaked(w);
+                let invisible = band_invisible(w, &vs);
                 if invisible {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
                 let mut cls_buf = [0u16; 32];
                 let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-                let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
-                let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
-                let is_edgeui = n == 22 && cls_buf[..22] == EDGEUI_CLASS;
-                let aux = host1 == Some(w)
-                    || trayw == Some(w)
-                    || is_menu_popup
-                    || is_taskbar
-                    || is_edgeui;
-                if aux {
+                if band_aux(w, host1, trayw) {
                     w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     continue;
                 }
@@ -3163,32 +3190,12 @@ fn ensure_all_attached() {
                             break;
                         }
                         let mut wr = RECT::default();
-                        let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
-                        let invisible = !rect_ok
-                            || unsafe { IsIconic(w).as_bool() }
-                            || !unsafe { IsWindowVisible(w).as_bool() }
-                            || wr.right - wr.left <= 2
-                            || wr.bottom - wr.top <= 2
-                            || wr.right <= vx
-                            || wr.bottom <= vy
-                            || wr.left >= vx + vw
-                            || wr.top >= vy + vh
-                            || window_is_cloaked(w);
-                        if invisible {
+                        let _ = unsafe { GetWindowRect(w, &mut wr) };
+                        if band_invisible(w, &vs) {
                             w = unsafe { GetWindow(w, GW_HWNDPREV) };
                             continue;
                         }
-                        let mut cls_buf = [0u16; 32];
-                        let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-                        let is_menu_popup = n == 6 && cls_buf[..6] == MENU_CLASS;
-                        let is_taskbar = n == 13 && cls_buf[..13] == TRAY_CLASS;
-                        let is_edgeui = n == 22 && cls_buf[..22] == EDGEUI_CLASS;
-                        let aux = host1 == Some(w)
-                            || trayw == Some(w)
-                            || is_menu_popup
-                            || is_taskbar
-                            || is_edgeui;
-                        if aux {
+                        if band_aux(w, host1, trayw) {
                             w = unsafe { GetWindow(w, GW_HWNDPREV) };
                             continue;
                         }
@@ -3199,6 +3206,8 @@ fn ensure_all_attached() {
                         let overlap =
                             wr.left < fx1 && wr.right > fx0 && wr.top < fy1 && wr.bottom > fy0;
                         if overlap {
+                            let mut cls_buf = [0u16; 32];
+                            let n = unsafe { GetClassNameW(w, &mut cls_buf) };
                             culprit = String::from_utf16_lossy(&cls_buf[..n.max(0) as usize]);
                         }
                         break;
@@ -4939,9 +4948,10 @@ unsafe extern "system" fn zorder_event_cb(
 
 /// 安装两组全局事件钩子(out-of-context:回调经本线程消息泵派发):
 /// ① EVENT_SYSTEM_MINIMIZESTART..END(0x0016-0x0017)
-/// ② EVENT_OBJECT_HIDE..REORDER(0x8003-0x8004)
-/// 范围取舍(2026-08-28 事件计数实测):LOCATIONCHANGE(0x800b)也随切换
-/// 大量触发,但正常使用中过于高频(拖动任何窗口即风暴),不采用。
+/// ② EVENT_OBJECT_SHOW..REORDER(0x8002-0x8004)
+/// 覆盖桌面切换双向:隐藏方向发 MINIMIZESTART/HIDE/REORDER,恢复方向的
+/// 窗口重现发 SHOW(2026-08-28 补,缺它恢复过渡完全无触发)。范围取舍:
+/// LOCATIONCHANGE(0x800b)正常使用中过于高频(拖动任何窗口即风暴),不采用。
 fn install_zorder_hooks() {
     let h1 = unsafe {
         SetWinEventHook(
@@ -4956,7 +4966,7 @@ fn install_zorder_hooks() {
     };
     let h2 = unsafe {
         SetWinEventHook(
-            0x8003,
+            0x8002,
             0x8004,
             HMODULE(0),
             Some(zorder_event_cb),
@@ -4972,12 +4982,81 @@ fn install_zorder_hooks() {
     }
 }
 
-/// 高速自检:任何栅栏在宿主之下就立即重挂(带 Repair 意图)。
-/// 收集 HWND 与 SetWindowPos 分两步,不持状态锁做嵌套调用。
+/// 高速自检:① 栅栏在宿主之下→立即重挂;② 栅栏上方有可见外来窗→
+/// 限速下压(桌面切换过渡期,应用窗被插到低位再逐个升起,栅栏会压在
+/// 已渲染窗口上直到走查 3 拍修复=用户看到的"回应用后栅栏浮几秒",
+/// 2026-08-28 实测)。收集 HWND 与 SetWindowPos 分两步,不持状态锁嵌套。
+static LOWER_RATE_MS: u64 = 1500;
+static LAST_LOWER_MS: AtomicU64 = AtomicU64::new(0);
+
 fn zcheck_fences_now() {
-    let hwnds: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
+    let (hwnds, menu_host, tray) = {
+        let s = state().lock().unwrap();
+        (
+            s.windows.values().copied().collect::<Vec<HWND>>(),
+            MENU_HOST_HWND.get().copied(),
+            TRAY_HWND.get().copied(),
+        )
+    };
+    // 下压全局限速:恢复过渡首拍即修;同时把 SPES 钩子层反复插队可能
+    // 引发的"检出→下压→再插队"对抗循环封顶在远低于感知的频率。
+    let may_lower = {
+        let now = resize_now_ms();
+        let last = LAST_LOWER_MS.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < LOWER_RATE_MS {
+            false
+        } else {
+            LAST_LOWER_MS.store(now, Ordering::Relaxed);
+            true
+        }
+    };
     for h in hwnds {
         fence_reanchor_if_below_host(h);
+        if may_lower {
+            fence_lower_if_blocked(h, &menu_host, &tray);
+        }
+    }
+}
+
+/// 快速下压:从宿主向上走,遇到第一个可见外来窗 B 先于本栅栏
+/// (=栅栏压在已渲染窗口上面)时,把栅栏压到 B 正下方;已紧贴 B 之下则不动。
+/// 判据与主走查完全同源(band_invisible/band_aux/自家栅栏),由全局限速节流。
+fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HWND>) {
+    let Some(shell) = desktop_shell_window() else { return };
+    if shell == hwnd {
+        return;
+    }
+    let vs = virtual_screen_rect();
+    let own: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
+    let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) };
+    for _ in 0..400 {
+        if w.0 == 0 || w == hwnd {
+            return; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
+        }
+        if own.contains(&w) || band_invisible(w, &vs) || band_aux(w, *menu_host, *tray) {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        let below = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+        if below != w {
+            let _z = z_scope(ZIntent::Repair);
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    w,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+            log(&format!(
+                "z-guard: fence lowered below visible window 0x{:x} (desktop transition)",
+                w.0
+            ));
+        }
+        return;
     }
 }
 
@@ -5778,9 +5857,9 @@ unsafe extern "system" fn fence_wndproc(
             // 阻止 Win+D / Win+M 对栅栏的摆布:栅栏常驻桌面,不参与窗口管理。
             // 我们自己主动隐藏(隐藏全部栅栏)时 INTENTIONAL_HIDE 为真,放行;
             // 自家定位操作(创建/拖拽/修复/呈现)以 Z_INTENT 标记放行。
-            // 2026-08-28 wdprobe 实测:显示桌面除隐藏外还带 z 沉底,只翻隐藏位
-            // 挡不住——栅栏被压到宿主之下(壁纸后面,vis=1 不可见),要等 3 拍
-            // 自愈才回来。必须同时否决外部 z 改动。
+            // z 否决只作用于真栅栏(GWLP_USERDATA=fence_id):菜单宿主等辅助窗
+            // 的 z 无关紧要,却会被 IME 子系统周期性重排——否决它只会招来
+            // 无限重试的对抗循环(2026-08-28 实测 0xf05d6 每 3-5s 一次)。
             if !INTENTIONAL_HIDE.load(Ordering::SeqCst) && !z_intent_active() {
                 let wp = &mut *(lparam.0 as *mut WINDOWPOS);
                 if (wp.flags.0 & SWP_HIDEWINDOW.0) != 0 && (wp.flags.0 & SWP_SHOWWINDOW.0) == 0 {
@@ -5788,7 +5867,8 @@ unsafe extern "system" fn fence_wndproc(
                     wp.flags.0 |= SWP_SHOWWINDOW.0;
                     wp.flags.0 |= SWP_NOACTIVATE.0;
                 }
-                if z_guard_setting() && (wp.flags.0 & SWP_NOZORDER.0) == 0 {
+                let is_fence = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 0;
+                if is_fence && z_guard_setting() && (wp.flags.0 & SWP_NOZORDER.0) == 0 {
                     wp.flags.0 |= SWP_NOZORDER.0;
                     log(&format!(
                         "z-guard: external z change vetoed h=0x{:x} after=0x{:x} flags=0x{:x}",
@@ -5802,7 +5882,11 @@ unsafe extern "system" fn fence_wndproc(
             // 显示桌面的 z 沉底不经可否决的 WINDOWPOSCHANGING(实测 veto
             // 零命中),只能在变更落地后自检并立即归位。自家操作带 ZIntent
             // 不会进入此分支;主动隐藏期间跳过(隐藏态无需在带)。
-            if !INTENTIONAL_HIDE.load(Ordering::SeqCst) && !z_intent_active() {
+            // 仅真栅栏需要(GWLP_USERDATA),菜单宿主的重排是正常现象。
+            if !INTENTIONAL_HIDE.load(Ordering::SeqCst)
+                && !z_intent_active()
+                && unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 0
+            {
                 let wp = &*(lparam.0 as *const WINDOWPOS);
                 log(&format!(
                     "z-guard: external pos-changed h=0x{:x} after=0x{:x} flags=0x{:x}",

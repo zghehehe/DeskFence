@@ -330,12 +330,26 @@
      派发，天然区分；后台线程只做文件 IO 不碰窗口）；**新增自家定位
      调用时记得带意图，否则会被自己的守卫否决**。② CHANGING 里对外部
      操作注入 SWP_NOZORDER（外部 HWND_TOP 推顶被当场挡下，elevtest
-     验证）。③ WinEvent 双钩子（MINIMIZESTART..END + HIDE..REORDER，
+     验证）——**只对真栅栏生效**（GWLP_USERDATA≠0）：菜单宿主等辅助窗
+     的 z 无关紧要，IME 子系统会周期性重排它们，否决只会招来无限重试
+     的对抗循环（2026-08-28 实测菜单宿主每 3-5s 被重排一次）。
+     ③ WinEvent 双钩子（MINIMIZESTART..END + SHOW..REORDER，
      out-of-context + SKIPOWNPROCESS）→ 合并投递 WM_DL3_ZCHECK →
-     `fence_reanchor_if_below_host` 立即重挂——实测 **<165ms 归位**，
-     走查零参与。**别用 REORDER-only 钩子**：事件按窗口属主进程过滤，
+     高速自检。**别用 REORDER-only 钩子**：事件按窗口属主进程过滤，
      自家栅栏被沉的事件被 SKIPOWNPROCESS 滤掉，只能靠"别的窗口被
-     批量操作"的事件当触发器；LOCATIONCHANGE 太热不采用。
+     批量操作"的事件当触发器；**SHOW(0x8002) 必须包含**——恢复方向
+     的窗口重现只发 SHOW，缺它恢复过渡完全无触发；LOCATIONCHANGE
+     太热不采用。
+   - **恢复过渡浮窗（2026-08-28 用户实测第二症状）**：Win+D 切回应用
+     时，应用窗被成批插到低位再逐个升起，期间**已渲染的窗口位于栅栏
+     之下**，栅栏压在它们上面直到走查 3 拍修复=用户看到"回应用后栅栏
+     浮几秒才消失"。修：`fence_lower_if_blocked`——高速自检里发现
+     "第一个可见外来窗先于栅栏"就把栅栏压到该窗正下方（判据与主走查
+     同源：band_invisible/band_aux/自家栅栏，勿再复制粘贴）；全局限速
+     1.5s/次，把 SPES 钩子层反复插队可能形成的对抗循环封顶。与走查
+     收敛于同一稳态（栅栏贴在最低可见窗之下时，走查从宿主先遇到
+     栅栏=健康，无乒乓）。验收 tools/lowertest.ps1（人为把可见窗插到
+     栅栏下方，4s 内全部压回其下）。
    - **kill-switch**：settings.json `z_guard:false` 一键回退纯自愈。
    - **走查防抖改故障签名**（WalkFault：Blocked{hwnd+类哈希}/
      NotFoundTop/NotFoundBudget）：签名变化即重置拍数——恢复过渡期
