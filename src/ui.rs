@@ -217,6 +217,9 @@ const TIMER_WALLPAPER_CATCHUP: usize = 5;
 /// 壁纸跟随定时器:Themes 目录事件后 250ms 防抖再捕获比对,
 /// 未变化则短重试(Explorer 分多步写缓存、DWM 切换略有延迟)
 const TIMER_WALLPAPER_FOLLOW: usize = 6;
+/// 桌面态快速自检定时器:三指手势的窗口扫动不发任何 WinEvent,
+/// 恢复过渡的检测只能靠轮询(见 zcheck_fences_now 注释)
+const TIMER_DESKTOP_WATCH: usize = 7;
 const EM_SETSEL: u32 = 0x00B1;
 const WM_SETFONT: u32 = 0x0030;
 const RENAME_COMMIT_MSG: u32 = WM_USER + 1;
@@ -404,6 +407,10 @@ struct UiState {
     /// 同秒二次调用 ensure_all_attached,不限速则一秒推两拍,"3 拍≈3 秒"
     /// 的防抖语义失真(2026-08-28 实测 Win+D 沉底 1.4s 即修,与设计意图不符)。
     pub walk_strike_ms: HashMap<u32, u64>,
+    /// 走查最新结论:所有栅栏健康且带内无可见外来窗(=桌面态)。
+    /// 桌面态下 TIMER_DESKTOP_WATCH 以 250ms 节奏跑高速自检——三指手势
+    /// 恢复不发任何 WinEvent,只有轮询能及时兜住(2026-08-28 实测)。
+    pub band_quiet: bool,
     /// 批量呈现抑制位(show_all_fences 置位):true 期间 refresh_fence_impl
     /// 跳过 ShowWindow/SHOWWINDOW——先把全部栅栏表面画完并向隐藏窗提交
     /// ULW,循环结束一次批量放行。否则"画完一个亮一个",首末栅栏相差
@@ -459,6 +466,7 @@ fn state() -> &'static Mutex<UiState> {
             attached: HashSet::new(),
             walk_strikes: HashMap::new(),
             walk_strike_ms: HashMap::new(),
+            band_quiet: false,
             defer_show_until_batch: false,
             last_healthy_ms: HashMap::new(),
             hover: HashMap::new(),
@@ -2949,6 +2957,8 @@ fn ensure_all_attached() {
         let host1 = MENU_HOST_HWND.get().copied();
         let vs = virtual_screen_rect();
         let mut to_move: Vec<u32> = Vec::new();
+        let mut to_glue: Vec<u32> = Vec::new();
+        let mut all_healthy = true;
         for (id, h) in s.windows.clone() {
             // 被拖栅栏拖拽期间提升到最高兄弟栅栏之上(band 内,见 handle_mousemove),
             // 自愈豁免;拖拽结束由 handle_lbuttonup 归位底带
@@ -3047,6 +3057,7 @@ fn ensure_all_attached() {
                 None
             };
             if let Some(fault) = fault {
+                all_healthy = false;
                 // 防抖(勿回退):连续三拍**同签名**失位才动手;签名一变
                 //(拦路者换窗/类型变化=过路者)立即重置。退避保持第 3、13、
                 // 23…拍出手,防"每秒全链 SetWindowPos"复活成周期闪屏源。
@@ -3113,6 +3124,17 @@ fn ensure_all_attached() {
                         let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                     }
                     log(&format!("walk: fence {id} was iconic, restored"));
+                }
+                // 粘底:走查一路只路过可忽略窗就找到本栅栏,但宿主正上方
+                // 不是自家栅栏=栅栏垫在一叠死层(隐形垃圾/最小化窗)上。
+                // 归位到带底的意义:显示桌面/手势扫动会把全部窗口按"隐藏
+                // 前槽位"静默还原——栅栏停在高位,还原时就被放回高位=压在
+                // 回升的应用窗上,与自愈修复来回拉锯(2026-08-28 实测)。
+                // 粘在带底则被记住的槽位就是低位,还原自然落回低位。
+                // 纯 z 移动且途经全为不可见层,视觉零变化;一次收敛。
+                let first_above = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                if first_above != h && !s.windows.values().any(|v| *v == first_above) {
+                    to_glue.push(id);
                 }
             }
         }
@@ -3221,6 +3243,26 @@ fn ensure_all_attached() {
                 ));
             }
         }
+        if !to_glue.is_empty() {
+            let mut glued: Vec<u32> = Vec::new();
+            for id in &to_glue {
+                let Some(h) = s.windows.get(id).copied() else { continue };
+                let Some(frect) = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect) else {
+                    continue;
+                };
+                let Some(host) = host_for_rect(&frect, &hosts) else { continue };
+                if reseat_above_host(h, host.hwnd) {
+                    glued.push(*id);
+                }
+            }
+            if !glued.is_empty() {
+                log(&format!(
+                    "z-glue: fences {:?} re-seated at band bottom (dead layers only)",
+                    glued
+                ));
+            }
+        }
+        s.band_quiet = all_healthy;
 
         drop(s);
     }
@@ -3539,6 +3581,15 @@ unsafe extern "system" fn tray_wndproc(
             global_tick();
             return LRESULT(0);
         }
+        if msg == WM_TIMER && wparam.0 == TIMER_DESKTOP_WATCH as usize {
+            // 桌面态快速自检:三指手势的窗口扫动不发任何 WinEvent(两轮
+            // 实测零触发),恢复过渡只能靠 250ms 轮询兜住;band_quiet 由
+            // 1s 走查维护,正常使用时这里什么都不做。
+            if state().lock().unwrap().band_quiet {
+                zcheck_fences_now();
+            }
+            return LRESULT(0);
+        }
         if msg == WM_TIMER && wparam.0 == TIMER_ANIMATION as usize {
             tick_arrival_animations();
             return LRESULT(0);
@@ -3645,6 +3696,9 @@ fn init_tray() {
         // 全局低频自愈定时器：窗口挂接/图标协调/主题跟随/文件刷新。
         // 目录变化由 watcher 置位，避免在拖动期间以 100ms 频率扫描和重挂窗口。
         let _ = SetTimer(hwnd, TIMER_GLOBAL, 1000, None);
+        // 桌面态快速自检:仅当走查判定 band_quiet(桌面态)时才做实事,
+        // 正常使用(带内有可见外来窗)空转,零成本。
+        let _ = SetTimer(hwnd, TIMER_DESKTOP_WATCH, 250, None);
         // 全局 z 序事件钩子:显示桌面等批量重排的毫秒级触发器(详见
         // zorder_event_cb 注释),高速自检走 WM_DL3_ZCHECK 合并投递。
         install_zorder_hooks();
@@ -4876,6 +4930,39 @@ fn z_intent_active() -> bool {
     Z_INTENT.with(|c| c.get().is_some())
 }
 
+/// 纯 z 归位:把 h 插到 host 正上方的底带。锚点取宿主正上方窗口,失败
+/// (0x80070005,高完整性窗占位)沿链向上换锚,最多 3 个——与走查修复
+/// 路径同一策略,供修复与粘底共用。
+fn reseat_above_host(h: HWND, host: HWND) -> bool {
+    let _z = z_scope(ZIntent::Repair);
+    let mut anchor = desktop_insert_after(host);
+    let mut tried = 0;
+    while let Some(after) = anchor {
+        if tried >= 3 {
+            break;
+        }
+        tried += 1;
+        let ok = unsafe {
+            SetWindowPos(
+                h,
+                after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        }
+        .is_ok();
+        if ok {
+            return true;
+        }
+        let next = unsafe { GetWindow(after, GW_HWNDPREV) };
+        anchor = if next.0 == 0 { None } else { Some(next) };
+    }
+    false
+}
+
 /// 外部定位变更后的自检:若窗口被压到桌面宿主之下(显示桌面批次的实际
 /// 行为,且该操作不经可否决的 WM_WINDOWPOSCHANGING——2026-08-28 wdprobe
 /// 实测 veto 零命中、栅栏在宿主下方 vis=1),立即重挂回宿主正上方,不等
@@ -4986,7 +5073,7 @@ fn install_zorder_hooks() {
 /// 限速下压(桌面切换过渡期,应用窗被插到低位再逐个升起,栅栏会压在
 /// 已渲染窗口上直到走查 3 拍修复=用户看到的"回应用后栅栏浮几秒",
 /// 2026-08-28 实测)。收集 HWND 与 SetWindowPos 分两步,不持状态锁嵌套。
-static LOWER_RATE_MS: u64 = 1500;
+static LOWER_RATE_MS: u64 = 600;
 static LAST_LOWER_MS: AtomicU64 = AtomicU64::new(0);
 
 fn zcheck_fences_now() {
@@ -4998,40 +5085,39 @@ fn zcheck_fences_now() {
             TRAY_HWND.get().copied(),
         )
     };
-    // 下压全局限速:恢复过渡首拍即修;同时把 SPES 钩子层反复插队可能
-    // 引发的"检出→下压→再插队"对抗循环封顶在远低于感知的频率。
-    let may_lower = {
-        let now = resize_now_ms();
-        let last = LAST_LOWER_MS.load(Ordering::Relaxed);
-        if last != 0 && now.saturating_sub(last) < LOWER_RATE_MS {
-            false
-        } else {
-            LAST_LOWER_MS.store(now, Ordering::Relaxed);
-            true
-        }
-    };
+    // 下压限速:额度只在**真正发生下压**时消耗(每次过门都消耗会让杂散
+    // 事件吃光额度,关键时刻反而被挡)。600ms:恢复过渡约 2s 内可跟手
+    // 2-3 次(动作均被扫动动画遮蔽),同时把 SPES 插队类对抗封顶。
+    let now = resize_now_ms();
+    let last = LAST_LOWER_MS.load(Ordering::Relaxed);
+    let may_lower = last == 0 || now.saturating_sub(last) >= LOWER_RATE_MS;
+    let mut acted = false;
     for h in hwnds {
         fence_reanchor_if_below_host(h);
-        if may_lower {
-            fence_lower_if_blocked(h, &menu_host, &tray);
+        if may_lower && fence_lower_if_blocked(h, &menu_host, &tray) {
+            acted = true;
         }
+    }
+    if acted {
+        LAST_LOWER_MS.store(resize_now_ms(), Ordering::Relaxed);
     }
 }
 
 /// 快速下压:从宿主向上走,遇到第一个可见外来窗 B 先于本栅栏
 /// (=栅栏压在已渲染窗口上面)时,把栅栏压到 B 正下方;已紧贴 B 之下则不动。
 /// 判据与主走查完全同源(band_invisible/band_aux/自家栅栏),由全局限速节流。
-fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HWND>) {
-    let Some(shell) = desktop_shell_window() else { return };
+/// 返回是否发生了下压(限速额度据此消耗)。
+fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HWND>) -> bool {
+    let Some(shell) = desktop_shell_window() else { return false };
     if shell == hwnd {
-        return;
+        return false;
     }
     let vs = virtual_screen_rect();
     let own: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
     let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) };
     for _ in 0..400 {
         if w.0 == 0 || w == hwnd {
-            return; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
+            return false; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
         }
         if own.contains(&w) || band_invisible(w, &vs) || band_aux(w, *menu_host, *tray) {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
@@ -5055,9 +5141,11 @@ fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HW
                 "z-guard: fence lowered below visible window 0x{:x} (desktop transition)",
                 w.0
             ));
+            return true;
         }
-        return;
+        return false;
     }
+    false
 }
 
 unsafe extern "system" fn default_edit_proc(

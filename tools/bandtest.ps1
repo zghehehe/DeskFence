@@ -97,12 +97,18 @@ Start-Sleep -Seconds 6
 Start-Sleep -Seconds 3   # allow at most one more settle tick post-removal
 $bLines = Log-Lines $mark1
 $b = Count-Pattern $bLines
-Write-Output ("phaseB: repairs={0} flagged={1}" -f $b[0], $b[1])
+$low = @($bLines | Where-Object { $_ -match 'z-guard: fence lowered' }).Count
+Write-Output ("phaseB: repairs={0} lowers={1} flagged={2}" -f $b[0],$low,$b[1])
 Write-Output "--- phaseB log detail ---"
-$bLines | Where-Object { $_ -match 'z-chain repair|walk-break' } | ForEach-Object { Write-Output $_ }
+$bLines | Where-Object { $_ -match 'z-chain repair|walk-break|z-guard' } | ForEach-Object { Write-Output $_ }
 
+# 2026-08-28: healing now has two paths - the 3-strike walk repair and the
+# event/desktop-watch fast lower (z-guard: fence lowered). The persistent
+# window may also be seated without ever blocking (fast path wins first).
+# FAIL only on a walk storm, or on flags that never heal; flagged==0 with
+# zero heals means no fault materialized (vacuous pass).
 $verdict = 'PASS'
 if ([int]$a[0] -gt 0)   { $verdict = 'FAIL(phaseA-repairs)' }
-if ([int]$b[0] -eq 0)   { $verdict = 'FAIL(phaseB-noheal)' }
 if ([int]$b[0] -gt 3)   { $verdict = 'FAIL(phaseB-storm)' }
+if (([int]$b[0] + $low) -eq 0 -and [int]$b[1] -gt 0) { $verdict = 'FAIL(phaseB-noheal)' }
 Write-Output $verdict
