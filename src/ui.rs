@@ -2957,7 +2957,6 @@ fn ensure_all_attached() {
         let host1 = MENU_HOST_HWND.get().copied();
         let vs = virtual_screen_rect();
         let mut to_move: Vec<u32> = Vec::new();
-        let mut to_glue: Vec<u32> = Vec::new();
         let mut all_healthy = true;
         for (id, h) in s.windows.clone() {
             // 被拖栅栏拖拽期间提升到最高兄弟栅栏之上(band 内,见 handle_mousemove),
@@ -3125,17 +3124,10 @@ fn ensure_all_attached() {
                     }
                     log(&format!("walk: fence {id} was iconic, restored"));
                 }
-                // 粘底:走查一路只路过可忽略窗就找到本栅栏,但宿主正上方
-                // 不是自家栅栏=栅栏垫在一叠死层(隐形垃圾/最小化窗)上。
-                // 归位到带底的意义:显示桌面/手势扫动会把全部窗口按"隐藏
-                // 前槽位"静默还原——栅栏停在高位,还原时就被放回高位=压在
-                // 回升的应用窗上,与自愈修复来回拉锯(2026-08-28 实测)。
-                // 粘在带底则被记住的槽位就是低位,还原自然落回低位。
-                // 纯 z 移动且途经全为不可见层,视觉零变化;一次收敛。
-                let first_above = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-                if first_above != h && !s.windows.values().any(|v| *v == first_above) {
-                    to_glue.push(id);
-                }
+                // 注意:此处不做"粘底"(归位到宿主正上方)。紧贴宿主=站在
+                // 菜单开合的底层扰动区,每次托盘/倒三角菜单关闭的系统静默
+                // 重排都会把栅栏沉到宿主之下再被拉回=可见闪屏(2026-08-28
+                // 实测);深漂移在垃圾层之上反而是历史验证过的安全位置。
             }
         }
         if !to_move.is_empty() {
@@ -3240,25 +3232,6 @@ fn ensure_all_attached() {
                 log(&format!(
                     "z-chain repair: fences {:?} re-attached (occluder={})",
                     moved, culprit
-                ));
-            }
-        }
-        if !to_glue.is_empty() {
-            let mut glued: Vec<u32> = Vec::new();
-            for id in &to_glue {
-                let Some(h) = s.windows.get(id).copied() else { continue };
-                let Some(frect) = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect) else {
-                    continue;
-                };
-                let Some(host) = host_for_rect(&frect, &hosts) else { continue };
-                if reseat_above_host(h, host.hwnd) {
-                    glued.push(*id);
-                }
-            }
-            if !glued.is_empty() {
-                log(&format!(
-                    "z-glue: fences {:?} re-seated at band bottom (dead layers only)",
-                    glued
                 ));
             }
         }
@@ -4928,39 +4901,6 @@ impl Drop for ZScope {
 
 fn z_intent_active() -> bool {
     Z_INTENT.with(|c| c.get().is_some())
-}
-
-/// 纯 z 归位:把 h 插到 host 正上方的底带。锚点取宿主正上方窗口,失败
-/// (0x80070005,高完整性窗占位)沿链向上换锚,最多 3 个——与走查修复
-/// 路径同一策略,供修复与粘底共用。
-fn reseat_above_host(h: HWND, host: HWND) -> bool {
-    let _z = z_scope(ZIntent::Repair);
-    let mut anchor = desktop_insert_after(host);
-    let mut tried = 0;
-    while let Some(after) = anchor {
-        if tried >= 3 {
-            break;
-        }
-        tried += 1;
-        let ok = unsafe {
-            SetWindowPos(
-                h,
-                after,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            )
-        }
-        .is_ok();
-        if ok {
-            return true;
-        }
-        let next = unsafe { GetWindow(after, GW_HWNDPREV) };
-        anchor = if next.0 == 0 { None } else { Some(next) };
-    }
-    false
 }
 
 /// 外部定位变更后的自检:若窗口被压到桌面宿主之下(显示桌面批次的实际
