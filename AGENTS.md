@@ -314,6 +314,52 @@
    枚举类 API 探测在解锁态可用。显示器休眠后 SetCursorPos 挪一下即醒。
    另：桌面壁纸本身带**实时时钟**（动态壁纸，约 (791,192)-(1120,299)），
    截图对比时该区域永远在变，diff 结论要把它排除。
+11. **z 序守卫体系（2026-08-28 终修，勿回退）**：两个用户可见症状
+   （"Win+D 后栅栏几秒不出现"、"栅栏偶尔浮在应用窗上几秒后消失"）
+   的完整机制与修复，全部有 wdprobe 实测背书：
+   - **机制**：显示桌面（Win+D/三指下滑/ToggleDesktop）把栅栏压到
+     宿主 Progman **之下**（壁纸后面，vis=1 不可见）。该操作**既不发
+     WM_WINDOWPOSCHANGING 也不发 WM_WINDOWPOSCHANGED**（两轮探针零
+     命中）——历史上那套 CHANGING 翻 HIDE 位 + WM_SIZE 兜底对这条路径
+     从未生效过，恢复全靠 3 拍自愈（1.4-3s）。"浮在应用上"则是恢复
+     过渡期应用窗从栅栏下方穿过 + 走查把"栅栏上方有可见外来窗"误判
+     为出带、迟到的 repair 又把栅栏压下去的复合表现。
+   - **修复三层**（ui.rs，全部可独立回退）：① `ZIntent` 线程局部意图
+     守卫——自家所有对栅栏窗口的 SetWindowPos/ShowWindow 必须
+     `z_scope(ZIntent::*)` 包裹（同线程同步触发消息 vs 外部经消息泵
+     派发，天然区分；后台线程只做文件 IO 不碰窗口）；**新增自家定位
+     调用时记得带意图，否则会被自己的守卫否决**。② CHANGING 里对外部
+     操作注入 SWP_NOZORDER（外部 HWND_TOP 推顶被当场挡下，elevtest
+     验证）。③ WinEvent 双钩子（MINIMIZESTART..END + HIDE..REORDER，
+     out-of-context + SKIPOWNPROCESS）→ 合并投递 WM_DL3_ZCHECK →
+     `fence_reanchor_if_below_host` 立即重挂——实测 **<165ms 归位**，
+     走查零参与。**别用 REORDER-only 钩子**：事件按窗口属主进程过滤，
+     自家栅栏被沉的事件被 SKIPOWNPROCESS 滤掉，只能靠"别的窗口被
+     批量操作"的事件当触发器；LOCATIONCHANGE 太热不采用。
+   - **kill-switch**：settings.json `z_guard:false` 一键回退纯自愈。
+   - **走查防抖改故障签名**（WalkFault：Blocked{hwnd+类哈希}/
+     NotFoundTop/NotFoundBudget）：签名变化即重置拍数——恢复过渡期
+     每拍不同的应用窗不再累计到第 3 拍（旧误报源）；常驻拦截者语义
+     不变（3 拍 + 3/13/23 退避）。**沉底（top reached）首拍即修**；
+     **预算耗尽只记日志不修**（状态不明）。strike 推进按 500ms 墙钟
+     限速（global_tick 会同秒双调 ensure_all_attached）。
+   - **repair 锚点重试**：宿主正上方若是高完整性窗（SPES 钩子层），
+     以其为锚报 0x80070005（历史 20 次，fence4 曾失踪 3350 拍）——
+     失败沿链向上换锚，最多 3 个。**别改成锚宿主本身**：
+     hWndInsertAfter=X 语义是"落在 X 正下方"，锚宿主会把栅栏放到
+     壁纸后面（2026-08-28 想当然犯过）。
+   - **菜单宿主类名已独立**为 DeskFenceMenuHost（原复用栅栏类名，
+     探针数出 6 个"栅栏"、drag_elevate_anchor 兄弟扫描会被它干扰）。
+   - **run.log 已带本地日期**；walk-break 带宿主句柄。
+   - 验收工具：`tools/wdprobe.ps1`（ToggleDesktop 双向 + 120ms 变化
+     驱动采样，本项修复的主验证器）、`tools/junkcensus.ps1`（band
+     垃圾层普查）、`tools/dfclasses.ps1`（自家窗口类清单）；
+     `tools/wdtest.ps1` 采样过慢（首拍 +0.3s、每秒一拍）抓不到
+     165ms 内的沉底-归位，勿再用它下结论。
+   - 垃圾层现状（junkcensus 实测）：宿主上方 ~400 层，394 隐藏/
+     275 微尺寸/251 离屏/20 cloaked；静态垃圾视觉零干扰，唯一会
+     动的是 SPES 的 ScW（约 10 个，部分 topmost）。走查只对"可见
+     在屏内外来窗"敏感的设计是对的，勿给 ScW 加类名白名单。
 
 ## 代码位置备忘
 
