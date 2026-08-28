@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
+    BOOL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect,
@@ -28,6 +28,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
+// windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::model::{self, Fence, FileItem, Hit, Rect};
@@ -98,6 +102,7 @@ fn set_align_mode_stored(mode: &str) {
         render_mode: render_mode(),
         auto_category: auto_category(),
         desktop_state: desktop_state(),
+        z_guard: z_guard_setting(),
     });
 }
 pub fn auto_align_on() -> bool {
@@ -130,6 +135,7 @@ fn set_render_mode_stored(mode: &str) {
         render_mode: mode.to_string(),
         auto_category: auto_category(),
         desktop_state: desktop_state(),
+        z_guard: z_guard_setting(),
     });
 }
 
@@ -154,6 +160,7 @@ fn set_desktop_state_stored(mode: &str) {
         render_mode: render_mode(),
         auto_category: auto_category(),
         desktop_state: mode.to_string(),
+        z_guard: z_guard_setting(),
     });
 }
 
@@ -178,7 +185,14 @@ fn set_auto_category_stored(v: bool) {
         render_mode: render_mode(),
         auto_category: v,
         desktop_state: desktop_state(),
+        z_guard: z_guard_setting(),
     });
+}
+
+/// z 守卫设置(缓存读取,模式同上):菜单落盘点需要带上当前值。
+fn z_guard_setting() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| model::load_settings().z_guard)
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
 fn rebuild_pins() {
@@ -246,6 +260,8 @@ const WM_DL3_CLEAR_SEL: u32 = WM_APP + 5;
 /// 壁纸缓存目录(Themes\TranscodedWallpaper)有变化:幻灯片轮换/换壁纸的
 /// 毫秒级事件信号,由目录 watcher 线程投递,UI 侧防抖后重捕获
 const WM_DL3_WALLPAPER_DIRTY: u32 = WM_APP + 6;
+/// 全局 z 序事件触发的高速自检请求(WinEvent 回调合并投递)
+const WM_DL3_ZCHECK: u32 = WM_APP + 7;
 /// windows 0.52 crate 未导出,按 Win32 头文件补定义
 const WM_MOUSELEAVE: u32 = 0x02A3;
 static TRAY_HWND: OnceLock<HWND> = OnceLock::new();
@@ -1039,6 +1055,7 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
         log(&format!("no desktop host yet, defer fence {}", fence_id));
         return false;
     }
+    let _zcreate = z_scope(ZIntent::Create);
     let hwnd = unsafe {
         CreateWindowExW(
             // 栅栏始终不参与前台激活；这样点击菜单外的桌面空白只会关闭
@@ -1745,6 +1762,7 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     // 显示动作:先对所有栅栏完成绘制+向隐藏窗提交 ULW(UpdateLayeredWindow
     // 对隐藏窗口同样有效,像素暂存),由调用方循环结束后一并放行。
     if !s.defer_show_until_batch {
+        let _z = z_scope(ZIntent::Show);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // 强制置前显示:仅 SW_SHOW 有时不足以让分层窗口重新可见,
@@ -2058,6 +2076,7 @@ pub fn show_all_fences() {
                 continue;
             }
             if let Some(h) = s.windows.get(&f.id) {
+                let _z = z_scope(ZIntent::Show);
                 unsafe {
                     let _ = ShowWindow(*h, SW_SHOWNOACTIVATE);
                 }
@@ -2974,7 +2993,12 @@ fn ensure_all_attached() {
                     *s.walk_strikes.entry(id).or_insert(0) += 1;
                 }
                 let strikes_n = s.walk_strikes.get(&id).copied().unwrap_or(0);
-                let attempt = strikes_n == 3 || (strikes_n > 3 && (strikes_n - 3) % 10 == 0);
+                // top reached(走查到栈顶)=栅栏确定在宿主之下,不是瞬态:
+                // 无需 3 拍防抖,首拍即修。budget exhausted 状态不明,仍走防抖。
+                let top_reached = !found && !out_of_band && budget == usize::MAX;
+                let attempt = top_reached
+                    || strikes_n == 3
+                    || (strikes_n > 3 && (strikes_n - 3) % 10 == 0);
                 if !found && !out_of_band && to_move.is_empty() {
                     let why = if budget == usize::MAX {
                         "top reached"
@@ -3013,6 +3037,7 @@ fn ensure_all_attached() {
                 // 纯 z 修复(NOMOVE|NOSIZE):位置由交互/布局路径负责,z 自愈只动
                 // 层叠次序。带位移的同值 SetWindowPos 会让 DWM 连无效区一起重算
                 //=可感知的重排闪底。
+                let _z = z_scope(ZIntent::Repair);
                 let attempt = unsafe {
                     SetWindowPos(
                         h,
@@ -3394,6 +3419,12 @@ unsafe extern "system" fn tray_wndproc(
             arm_wallpaper_follow();
             return LRESULT(0);
         }
+        if msg == WM_DL3_ZCHECK {
+            // 合并后的高速自检:栅栏在宿主之下(显示桌面批次)立即重挂
+            ZCHECK_PENDING.store(false, Ordering::Relaxed);
+            zcheck_fences_now();
+            return LRESULT(0);
+        }
         if msg == WM_SETTINGCHANGE {
             rebuild_render_resources();
             invalidate_hosts_cache();
@@ -3512,6 +3543,9 @@ fn init_tray() {
         // 全局低频自愈定时器：窗口挂接/图标协调/主题跟随/文件刷新。
         // 目录变化由 watcher 置位，避免在拖动期间以 100ms 频率扫描和重挂窗口。
         let _ = SetTimer(hwnd, TIMER_GLOBAL, 1000, None);
+        // 全局 z 序事件钩子:显示桌面等批量重排的毫秒级触发器(详见
+        // zorder_event_cb 注释),高速自检走 WM_DL3_ZCHECK 合并投递。
+        install_zorder_hooks();
         add_tray_icon(hwnd);
     }
 }
@@ -4697,6 +4731,163 @@ fn set_all_hidden(hidden: bool) {
 static RENAME_OLD_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static INTENTIONAL_HIDE: AtomicBool = AtomicBool::new(false);
 
+// ---------------- z 序意图守卫 ----------------
+
+/// 窗口定位意图:标记"自家发起的 z 序/显示操作",让 fence_wndproc 的
+/// WM_WINDOWPOSCHANGING 拦截只针对外部改动。区分依据:自家 SetWindowPos/
+/// ShowWindow 在 UI 线程同步触发该消息(嵌套在调用栈内);外部进程(Shell
+/// 显示桌面/最小化批次)的调用经消息泵派发,到达时意图必为 None——线程
+/// 局部即可精确区分,无需跨进程握手(后台线程只做文件 IO,不碰窗口)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZIntent {
+    /// 创建栅栏窗口并插入底带
+    Create,
+    /// 主动显示/刷新呈现
+    Show,
+    /// 拖拽提升/落点归位
+    Drag,
+    /// z 自愈修复
+    Repair,
+    /// 最小化兜底恢复
+    Restore,
+}
+
+thread_local! {
+    static Z_INTENT: std::cell::Cell<Option<ZIntent>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII 守卫:作用域内的窗口定位操作被拦截逻辑放行。嵌套时恢复前值。
+struct ZScope(Option<ZIntent>);
+
+fn z_scope(intent: ZIntent) -> ZScope {
+    let prev = Z_INTENT.with(|c| c.replace(Some(intent)));
+    ZScope(prev)
+}
+
+impl Drop for ZScope {
+    fn drop(&mut self) {
+        Z_INTENT.with(|c| c.set(self.0));
+    }
+}
+
+fn z_intent_active() -> bool {
+    Z_INTENT.with(|c| c.get().is_some())
+}
+
+/// 外部定位变更后的自检:若窗口被压到桌面宿主之下(显示桌面批次的实际
+/// 行为,且该操作不经可否决的 WM_WINDOWPOSCHANGING——2026-08-28 wdprobe
+/// 实测 veto 零命中、栅栏在宿主下方 vis=1),立即重挂回宿主正上方,不等
+/// 3 拍自愈。判据:从本窗口向上(GW_HWNDPREV)走能遇到宿主=自己在宿主
+/// 之下;正常在带内时向上走只会到栈顶。无状态锁,可在窗口过程直接调用。
+fn fence_reanchor_if_below_host(hwnd: HWND) {
+    let Some(shell) = desktop_shell_window() else { return };
+    if shell == hwnd {
+        return;
+    }
+    let mut w = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
+    for _ in 0..400 {
+        if w.0 == 0 {
+            return; // 到顶未遇宿主:窗口在宿主上方,无需处理
+        }
+        if w == shell {
+            let Some(after) = desktop_insert_after(shell) else { return };
+            let _z = z_scope(ZIntent::Repair);
+            let _ = unsafe {
+                SetWindowPos(
+                    hwnd,
+                    after,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+            };
+            log("z-guard: fence re-anchored above host after external move");
+            return;
+        }
+        w = unsafe { GetWindow(w, GW_HWNDPREV) };
+    }
+}
+
+// ---- 全局 z 序事件触发的高速自检 ----
+// 显示桌面把栅栏压到宿主之下的操作既不发 WM_WINDOWPOSCHANGING 也不发
+// WM_WINDOWPOSCHANGED(2026-08-28 两轮 wdprobe 实测:两类拦截零命中),
+// 进程内消息通道完全探测不到。改用全局 WinEvent 钩子做触发器:桌面切换
+// 必然伴随成批的 HIDE/REORDER/MINIMIZE 事件(事件按窗口属主过滤,
+// SKIPOWNPROCESS 会滤掉自家栅栏的 z 事件,所以靠"其他窗口被批量操作"
+// 的事件当信号),回调只做原子标记+合并投递,实查在 UI 线程执行
+// fence_reanchor_if_below_host——2026-08-28 实测切换后 <165ms 即归位,
+// 走查 3 拍自愈全程零参与。
+static ZCHECK_PENDING: AtomicBool = AtomicBool::new(false);
+static ZORDER_HOOKS: std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK)> =
+    std::sync::OnceLock::new();
+
+unsafe extern "system" fn zorder_event_cb(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _idobject: i32,
+    _idchild: i32,
+    _idthread: u32,
+    _time: u32,
+) {
+    // 桌面切换时该事件成批到达,回调必须 O(1):抢到标记者负责投递一条
+    // 合并消息,其余事件全部被吞掉。
+    if !ZCHECK_PENDING.swap(true, Ordering::Relaxed) {
+        let tray = TRAY_HWND.get().copied().unwrap_or(HWND(0));
+        if tray.0 != 0 {
+            let _ = PostMessageW(tray, WM_DL3_ZCHECK, WPARAM(0), LPARAM(0));
+        } else {
+            ZCHECK_PENDING.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 安装两组全局事件钩子(out-of-context:回调经本线程消息泵派发):
+/// ① EVENT_SYSTEM_MINIMIZESTART..END(0x0016-0x0017)
+/// ② EVENT_OBJECT_HIDE..REORDER(0x8003-0x8004)
+/// 范围取舍(2026-08-28 事件计数实测):LOCATIONCHANGE(0x800b)也随切换
+/// 大量触发,但正常使用中过于高频(拖动任何窗口即风暴),不采用。
+fn install_zorder_hooks() {
+    let h1 = unsafe {
+        SetWinEventHook(
+            0x0016,
+            0x0017,
+            HMODULE(0),
+            Some(zorder_event_cb),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    let h2 = unsafe {
+        SetWinEventHook(
+            0x8003,
+            0x8004,
+            HMODULE(0),
+            Some(zorder_event_cb),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if h1.0 == 0 || h2.0 == 0 {
+        log("z-guard: winevent hook install failed");
+    } else {
+        let _ = ZORDER_HOOKS.set((h1, h2));
+    }
+}
+
+/// 高速自检:任何栅栏在宿主之下就立即重挂(带 Repair 意图)。
+/// 收集 HWND 与 SetWindowPos 分两步,不持状态锁做嵌套调用。
+fn zcheck_fences_now() {
+    let hwnds: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
+    for h in hwnds {
+        fence_reanchor_if_below_host(h);
+    }
+}
+
 unsafe extern "system" fn default_edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -5474,6 +5665,7 @@ unsafe extern "system" fn fence_wndproc(
         WM_SIZE => {
             // 回退：即使 WM_WINDOWPOSCHANGING 拦截失败，也兜底恢复
             if wparam.0 as u32 == SIZE_MINIMIZED {
+                let _z = z_scope(ZIntent::Restore);
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                     let _ = SetWindowPos(
@@ -5490,17 +5682,42 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_WINDOWPOSCHANGING => {
-            // 阻止 Win+D / Win+M 最小化：栅栏应常驻桌面，不参与窗口管理。
-            // 我们自己主动隐藏（隐藏全部栅栏）时 INTENTIONAL_HIDE 为真，放行。
-            if !INTENTIONAL_HIDE.load(Ordering::SeqCst) {
+            // 阻止 Win+D / Win+M 对栅栏的摆布:栅栏常驻桌面,不参与窗口管理。
+            // 我们自己主动隐藏(隐藏全部栅栏)时 INTENTIONAL_HIDE 为真,放行;
+            // 自家定位操作(创建/拖拽/修复/呈现)以 Z_INTENT 标记放行。
+            // 2026-08-28 wdprobe 实测:显示桌面除隐藏外还带 z 沉底,只翻隐藏位
+            // 挡不住——栅栏被压到宿主之下(壁纸后面,vis=1 不可见),要等 3 拍
+            // 自愈才回来。必须同时否决外部 z 改动。
+            if !INTENTIONAL_HIDE.load(Ordering::SeqCst) && !z_intent_active() {
                 let wp = &mut *(lparam.0 as *mut WINDOWPOS);
                 if (wp.flags.0 & SWP_HIDEWINDOW.0) != 0 && (wp.flags.0 & SWP_SHOWWINDOW.0) == 0 {
                     wp.flags.0 &= !SWP_HIDEWINDOW.0;
                     wp.flags.0 |= SWP_SHOWWINDOW.0;
                     wp.flags.0 |= SWP_NOACTIVATE.0;
                 }
+                if z_guard_setting() && (wp.flags.0 & SWP_NOZORDER.0) == 0 {
+                    wp.flags.0 |= SWP_NOZORDER.0;
+                    log(&format!(
+                        "z-guard: external z change vetoed h=0x{:x} after=0x{:x} flags=0x{:x}",
+                        hwnd.0, wp.hwndInsertAfter.0, wp.flags.0
+                    ));
+                }
             }
             return LRESULT(0);
+        }
+        WM_WINDOWPOSCHANGED => {
+            // 显示桌面的 z 沉底不经可否决的 WINDOWPOSCHANGING(实测 veto
+            // 零命中),只能在变更落地后自检并立即归位。自家操作带 ZIntent
+            // 不会进入此分支;主动隐藏期间跳过(隐藏态无需在带)。
+            if !INTENTIONAL_HIDE.load(Ordering::SeqCst) && !z_intent_active() {
+                let wp = &*(lparam.0 as *const WINDOWPOS);
+                log(&format!(
+                    "z-guard: external pos-changed h=0x{:x} after=0x{:x} flags=0x{:x}",
+                    hwnd.0, wp.hwndInsertAfter.0, wp.flags.0
+                ));
+                fence_reanchor_if_below_host(hwnd);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         WM_SYSCOMMAND => {
             if (wparam.0 & 0xFFF0) == SC_MINIMIZE as usize {
@@ -6380,6 +6597,7 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             .and_then(|f| host_for_rect(&f.rect, &hosts))
                             .and_then(|host| drag_elevate_anchor(host.hwnd, h));
                         if let Some(anchor) = anchor {
+                            let _z = z_scope(ZIntent::Drag);
                             unsafe {
                                 let _ = SetWindowPos(
                                     h,
@@ -7510,6 +7728,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     if let Some(host) = host_for_rect(&rect, &hosts) {
                         if let Some(after) = desktop_insert_after(host.hwnd) {
                             if let Some(fh) = s.windows.get(&fence_id) {
+                                let _z = z_scope(ZIntent::Drag);
                                 unsafe {
                                     let _ = SetWindowPos(
                                         *fh,

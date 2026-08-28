@@ -1245,6 +1245,11 @@ pub struct Settings {
     /// 启动按此恢复。
     #[serde(default = "default_desktop_state")]
     pub desktop_state: String,
+    /// z 守卫(默认开):否决外部进程对栅栏窗口 z 序的改写。显示桌面/
+    /// 最小化批次会把栅栏压到桌面宿主之下(壁纸后面),只翻隐藏位挡不住
+    /// (2026-08-28 wdprobe 实测)。置 false 回退为纯自愈行为,供降级排查。
+    #[serde(default = "default_z_guard")]
+    pub z_guard: bool,
 }
 
 pub fn default_desktop_state() -> String {
@@ -1254,6 +1259,9 @@ pub fn default_render_mode() -> String {
     "precise".into()
 }
 pub fn default_auto_category() -> bool {
+    true
+}
+pub fn default_z_guard() -> bool {
     true
 }
 
@@ -1314,6 +1322,7 @@ impl Default for Settings {
             render_mode: default_render_mode(),
             auto_category: default_auto_category(),
             desktop_state: default_desktop_state(),
+            z_guard: default_z_guard(),
         }
     }
 }
@@ -1342,6 +1351,7 @@ pub fn load_settings() -> Settings {
                 render_mode: default_render_mode(),
                 auto_category: default_auto_category(),
                 desktop_state: default_desktop_state(),
+                z_guard: default_z_guard(),
             }
         }
     }
