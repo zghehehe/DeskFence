@@ -242,6 +242,11 @@
      对外 404——公开推广前先把 DeskFence 仓库转 Public。
      GitHub 提交身份一律中性：zghehehe + zghehehe@users.noreply.github.com
      （publish/deploy 脚本内已强制 env，勿用工作身份提交公开内容）。
+     **main 历史已于 2026-08-28 强制重写**（旧根含 README 占位符低级错误）：
+     远端 main 与 tag v0.1.0 均为全新单根提交 9ddeea5，旧提交在远端不可达。
+     此后 publish 脚本 -p main 正常追加即可，勿再重建根；README 用相对路径
+     引用 assets/deskfence-icon.svg 与 docs/demo.svg（GitHub README 的 <img>
+     对 SVG 渲染/播放 CSS 动画均正常，已实测）。
      **真实桌面截图严禁入库/公开（2026-08-28 已全删 docs/assets/*.png）**：
      含个人文件名、内网工具名与企业定制壁纸文字。README 配图=docs/demo.svg
      （website 首屏卡通动画的自包含版，内联全部 keyframes；GitHub README
