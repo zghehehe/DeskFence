@@ -1979,7 +1979,7 @@ pub fn wallpaper_signature() -> Option<String> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
     use windows::Win32::UI::Shell::IDesktopWallpaper;
     unsafe {
-        // 注:部分定制环境(本机实测)该 coclass 未注册(REGDB_E_CLASSNOTREG),
+        // 注:部分受管控/定制系统(实测存在)该 coclass 未注册(REGDB_E_CLASSNOTREG),
         // 返回 None 由调用方一次性告警并依赖其它信号源,属预期降级
         let dp: IDesktopWallpaper =
             CoCreateInstance(&CLSID_DESKTOP_WALLPAPER, None, CLSCTX_ALL).ok()?;

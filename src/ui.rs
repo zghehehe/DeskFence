@@ -371,7 +371,7 @@ struct UiState {
     /// 重捕获走"懒化"路径:淡入结束+足够安静才执行,不与用户交互赛跑
     pub wallpaper_dirty_since: u64,
     /// z 链失位防抖计数:连续两拍失位才修。菜单开合瞬间系统瞬态窗(EdgeUi
-    /// 输入条/SPES ScW 全屏钩子/cloaked CoreWindow)会短暂插进宿主与栅栏之间
+    /// 输入条/第三方软件全屏钩子窗/cloaked CoreWindow)会短暂插进宿主与栅栏之间
     /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
     /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
     pub walk_strikes: HashMap<u32, u32>,
@@ -902,7 +902,7 @@ fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
 
 /// DWM cloaked 判定:窗口"可见"位有效但 DWM 不合成其像素——物理上遮不住任何东西。
 /// 典型:SystemSettings/TextInputHost 的全屏 CoreWindow(cloak=2)、Shell 经验宿主、
-/// SPES 等钩子层的全屏瞬态。菜单开合瞬间它们被塞进宿主与栅栏之间,曾触发整链
+/// 某些安全/管控软件钩子层的全屏瞬态。菜单开合瞬间它们被塞进宿主与栅栏之间,曾触发整链
 /// 重排(每次=z 序重排闪屏),必须跳过。
 fn window_is_cloaked(w: HWND) -> bool {
     let mut cloaked: u32 = 0;
@@ -1068,7 +1068,7 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
 
 /// 壁纸快照例行重捕获的最大间隔(兜底)。壁纸变化的主路径是事件驱动:
 /// 手动换壁纸走 WM_SETTINGCHANGE(毫秒级);幻灯片轮换走 Themes 目录
-/// watcher 或 IDesktopWallpaper 签名轮询(秒级,标准机器有效;本机等定制
+/// watcher 或 IDesktopWallpaper 签名轮询(秒级,标准系统有效;部分定制/受管控
 /// 环境两者皆不可用时退化为本兜底轮询)。
 /// 2026-08-26 从 60s 放宽到 10min:ink 常驻后快照只作文字种子,不新鲜
 /// 没有视觉代价;而每次稳态捕获的 PrintWindow 都会强制桌面宿主重绘,
@@ -1220,7 +1220,7 @@ pub fn mark_interaction() {
 /// 正是用户看到的"闪"。真换壁纸是整图替换,容差不影响判别。
 /// 比较新旧快照在"栅栏覆盖区域"内是否有实质变化(每通道 8 容差,理由:
 /// PrintWindow 捕获亮度存在 ~4% 时序波动,严格比较会把波动当成变化)。
-/// 栅栏区域之外的变化(如本机时钟壁纸的分钟跳动)不影响渲染——ink 常驻
+/// 栅栏区域之外的变化(如动态时钟壁纸的分钟跳动)不影响渲染——ink 常驻
 /// 下快照只作标签种子,栅栏外的壁纸像素从不参与任何绘制——因此不触发
 /// 重绘与缓存落盘,避免时钟壁纸下的每分钟空转(全量重绘+9MB 落盘+闪风险)。
 /// 宿主几何(数量/尺寸/原点)变化仍视为整体变化;无栅栏时退化为全图比较。
@@ -2703,7 +2703,7 @@ fn global_tick() {
     }
     // 壁纸事件源之三:IDesktopWallpaper 签名(每显示器当前壁纸路径+背景色+
     // 填充模式)。幻灯片轮换时注册表与 TranscodedWallpaper 缓存都可能不更新
-    // (实测本机换壁纸不写该目录),但 GetWallpaper 反映当前帧。1s 一次纯
+    // (实测部分定制系统换壁纸不写该目录),但 GetWallpaper 反映当前帧。1s 一次纯
     // COM 字符串比较,开销可忽略;变化即触发"捕获-比对-重绘"跟随。
     // (两模式共用:透明模式也要种子)
     {
@@ -2799,7 +2799,7 @@ fn ensure_all_attached() {
         // - 命中 → 该栅栏就位,不动它(SetWindowPos 同位也触发 DWM 重合成=闪);
         // - 自有辅助窗(菜单宿主/托盘窗/#32768 弹层)与一切"不可见"窗
         //   (最小化/隐藏/矩形与虚拟屏幕不相交,含最小化沉底的 Chrome、
-        //   SPES 离屏 CoreWindow)→ 跳过继续;
+        //   第三方软件离屏 CoreWindow)→ 跳过继续;
         // - 自动隐藏任务栏(Shell_TrayWnd)在隐藏/弹出转换时会短暂沉到桌面
         //   层,但弹起时本就在顶层且矩形(y≥任务栏)与栅栏(y≤内容区)不相交,
         //   做空间相交测试后自然跳过;
@@ -2849,9 +2849,9 @@ fn ensure_all_attached() {
             // 它相交而被旧判定放行=持续浮窗)。
             let mut out_of_band = false;
             let mut found = false;
-            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实:企业环境里
-            // 各家软件把辅助窗 HWND_BOTTOM 沉底,一层层垫在宿主与栅栏之间
-            //(2026-08-28 实测单日累积 ~369 层隐形垃圾)。预算耗尽与到顶都
+            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实:不少软件会把
+            // 辅助窗 HWND_BOTTOM 沉底,一层层垫在宿主与栅栏之间(2026-08-28
+            // 实测单日累积 ~369 层隐形垃圾)。预算耗尽与到顶都
             // 是失位,但报文要区分(勿回退到 320——垃圾层只会更多)。
             let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
             let mut budget = 0usize;
@@ -2933,8 +2933,8 @@ fn ensure_all_attached() {
                 // 防抖(勿回退):菜单开合瞬间系统瞬态窗插入 band 又即刻退出,
                 // 驻留 ≤2s 的路过者绝不触发(实测 500ms 周期注入可对齐两个
                 // 1s tick);连续三拍失位才动手。真实浮出带/沉底会持续命中,
-                // 自愈延迟 2-3s(elevtest 验收放宽到 4s 内)。
-                // 退避:修复后若同栅栏再次失位(外来者反复插队,如 SPES 钩子层
+                // 自愈延迟 2-3s(自愈验收窗口相应放宽到 4s 内)。
+                // 退避:修复后若同栅栏再次失位(外来者反复插队,如第三方钩子层
                 // 周期性洗牌),只按 第3、13、23…拍 间隔出手——防"每秒全链
                 // SetWindowPos"复活成周期闪屏源。
                 let strikes = s.walk_strikes.entry(id).or_insert(0);
