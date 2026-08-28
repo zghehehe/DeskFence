@@ -4922,8 +4922,7 @@ fn fence_reanchor_if_below_host(hwnd: HWND) {
 // fence_reanchor_if_below_host——2026-08-28 实测切换后 <165ms 即归位,
 // 走查 3 拍自愈全程零参与。
 static ZCHECK_PENDING: AtomicBool = AtomicBool::new(false);
-static ZCHECK_POST_MS: AtomicU64 = AtomicU64::new(0);
-static ZORDER_HOOKS: std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK, HWINEVENTHOOK, HWINEVENTHOOK)> =
+static ZORDER_HOOKS: std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK)> =
     std::sync::OnceLock::new();
 
 unsafe extern "system" fn zorder_event_cb(
@@ -4935,15 +4934,9 @@ unsafe extern "system" fn zorder_event_cb(
     _idthread: u32,
     _time: u32,
 ) {
-    // 事件风暴(LOCATIONCHANGE 拖动任何窗口即 60Hz)下回调必须 O(1) 且
-    // 限频:距上次投递不足 250ms 直接丢弃,其余靠合并位吞掉。
-    let now = resize_now_ms();
-    let last = ZCHECK_POST_MS.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < 250 {
-        return;
-    }
+    // 桌面切换时该事件成批到达,回调必须 O(1):抢到标记者负责投递一条
+    // 合并消息,其余事件全部被吞掉。
     if !ZCHECK_PENDING.swap(true, Ordering::Relaxed) {
-        ZCHECK_POST_MS.store(now, Ordering::Relaxed);
         let tray = TRAY_HWND.get().copied().unwrap_or(HWND(0));
         if tray.0 != 0 {
             let _ = PostMessageW(tray, WM_DL3_ZCHECK, WPARAM(0), LPARAM(0));
@@ -4953,21 +4946,17 @@ unsafe extern "system" fn zorder_event_cb(
     }
 }
 
-/// 安装四组全局事件钩子(out-of-context:回调经本线程消息泵派发):
+/// 安装两组全局事件钩子(out-of-context:回调经本线程消息泵派发):
 /// ① EVENT_SYSTEM_MINIMIZESTART..END(0x0016-0x0017)
 /// ② EVENT_OBJECT_SHOW..REORDER(0x8002-0x8004)
-/// ③ EVENT_SYSTEM_FOREGROUND(0x0003)
-/// ④ EVENT_OBJECT_LOCATIONCHANGE(0x800b)
-/// 覆盖桌面切换全部路径:Win+D 双向发 MINIMIZE/SHOW/HIDE/REORDER;但
-/// **触控板三指手势的窗口扫动一条都不发**(2026-08-28 实测:手势恢复期间
-/// z-guard 零触发,只有 1s 走查在 3 拍后兜住)——靠 FOREGROUND(手势激活
-/// 起点必发)和 LOCATIONCHANGE(动画位移必发)补齐,250ms 触发节流把
-/// 后者的高频代价压到可忽略。
+/// 覆盖桌面切换双向:隐藏方向发 MINIMIZESTART/HIDE/REORDER,恢复方向的
+/// 窗口重现发 SHOW(2026-08-28 补,缺它恢复过渡完全无触发)。范围取舍:
+/// LOCATIONCHANGE(0x800b)正常使用中过于高频(拖动任何窗口即风暴),不采用。
 fn install_zorder_hooks() {
-    let mk = |lo: u32, hi: u32| unsafe {
+    let h1 = unsafe {
         SetWinEventHook(
-            lo,
-            hi,
+            0x0016,
+            0x0017,
             HMODULE(0),
             Some(zorder_event_cb),
             0,
@@ -4975,11 +4964,21 @@ fn install_zorder_hooks() {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
     };
-    let hooks = (mk(0x0016, 0x0017), mk(0x8002, 0x8004), mk(0x0003, 0x0003), mk(0x800b, 0x800b));
-    if hooks.0 .0 == 0 || hooks.1 .0 == 0 || hooks.2 .0 == 0 || hooks.3 .0 == 0 {
+    let h2 = unsafe {
+        SetWinEventHook(
+            0x8002,
+            0x8004,
+            HMODULE(0),
+            Some(zorder_event_cb),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
+    if h1.0 == 0 || h2.0 == 0 {
         log("z-guard: winevent hook install failed");
     } else {
-        let _ = ZORDER_HOOKS.set(hooks);
+        let _ = ZORDER_HOOKS.set((h1, h2));
     }
 }
 
@@ -4999,43 +4998,40 @@ fn zcheck_fences_now() {
             TRAY_HWND.get().copied(),
         )
     };
-    // 下压限速:额度只在**真正发生下压**时消耗(此前每次过门都消耗,
-    // 关键时刻前的杂散事件会把额度吃光,真正需要时反而被门挡住)。
-    // 同时把 SPES 钩子层反复插队可能引发的对抗循环封顶在远低于感知的频率。
-    let now = resize_now_ms();
-    let last = LAST_LOWER_MS.load(Ordering::Relaxed);
-    let may_lower = last == 0 || now.saturating_sub(last) >= LOWER_RATE_MS;
-    let mut acted = false;
-    for h in &hwnds {
-        fence_reanchor_if_below_host(*h);
-        if may_lower && fence_lower_if_blocked(*h, &hwnds, &menu_host, &tray) {
-            acted = true;
+    // 下压全局限速:恢复过渡首拍即修;同时把 SPES 钩子层反复插队可能
+    // 引发的"检出→下压→再插队"对抗循环封顶在远低于感知的频率。
+    let may_lower = {
+        let now = resize_now_ms();
+        let last = LAST_LOWER_MS.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < LOWER_RATE_MS {
+            false
+        } else {
+            LAST_LOWER_MS.store(now, Ordering::Relaxed);
+            true
         }
-    }
-    if acted {
-        LAST_LOWER_MS.store(resize_now_ms(), Ordering::Relaxed);
+    };
+    for h in hwnds {
+        fence_reanchor_if_below_host(h);
+        if may_lower {
+            fence_lower_if_blocked(h, &menu_host, &tray);
+        }
     }
 }
 
 /// 快速下压:从宿主向上走,遇到第一个可见外来窗 B 先于本栅栏
 /// (=栅栏压在已渲染窗口上面)时,把栅栏压到 B 正下方;已紧贴 B 之下则不动。
 /// 判据与主走查完全同源(band_invisible/band_aux/自家栅栏),由全局限速节流。
-/// 返回是否发生了下压。own 由调用方收集,避免逐栅栏加锁。
-fn fence_lower_if_blocked(
-    hwnd: HWND,
-    own: &[HWND],
-    menu_host: &Option<HWND>,
-    tray: &Option<HWND>,
-) -> bool {
-    let Some(shell) = desktop_shell_window() else { return false };
+fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HWND>) {
+    let Some(shell) = desktop_shell_window() else { return };
     if shell == hwnd {
-        return false;
+        return;
     }
     let vs = virtual_screen_rect();
+    let own: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
     let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) };
     for _ in 0..400 {
         if w.0 == 0 || w == hwnd {
-            return false; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
+            return; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
         }
         if own.contains(&w) || band_invisible(w, &vs) || band_aux(w, *menu_host, *tray) {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
@@ -5059,11 +5055,9 @@ fn fence_lower_if_blocked(
                 "z-guard: fence lowered below visible window 0x{:x} (desktop transition)",
                 w.0
             ));
-            return true;
         }
-        return false;
+        return;
     }
-    false
 }
 
 unsafe extern "system" fn default_edit_proc(
