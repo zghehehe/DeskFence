@@ -6,7 +6,7 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect,
@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Ole::RevokeDragDrop;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -50,6 +51,14 @@ fn tray_class_name() -> PCWSTR {
 fn guide_class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
     let v = W.get_or_init(|| "DeskFenceGuide\0".encode_utf16().collect());
+    PCWSTR::from_raw(v.as_ptr())
+}
+
+/// 菜单前台宿主专用类:历史上复用栅栏类,外部探针与自家 drag_elevate_anchor
+/// 的兄弟栅栏扫描都会把它误当真栅栏(2026-08-28 wdprobe 实测数出 6 个"栅栏")。
+fn menu_host_class_name() -> PCWSTR {
+    static W: OnceLock<Vec<u16>> = OnceLock::new();
+    let v = W.get_or_init(|| "DeskFenceMenuHost\0".encode_utf16().collect());
     PCWSTR::from_raw(v.as_ptr())
 }
 
@@ -375,6 +384,10 @@ struct UiState {
     /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
     /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
     pub walk_strikes: HashMap<u32, u32>,
+    /// strike 最近一次推进的墙钟时刻:global_tick 在 needs_represent 路径会
+    /// 同秒二次调用 ensure_all_attached,不限速则一秒推两拍,"3 拍≈3 秒"
+    /// 的防抖语义失真(2026-08-28 实测 Win+D 沉底 1.4s 即修,与设计意图不符)。
+    pub walk_strike_ms: HashMap<u32, u64>,
     /// 批量呈现抑制位(show_all_fences 置位):true 期间 refresh_fence_impl
     /// 跳过 ShowWindow/SHOWWINDOW——先把全部栅栏表面画完并向隐藏窗提交
     /// ULW,循环结束一次批量放行。否则"画完一个亮一个",首末栅栏相差
@@ -402,6 +415,7 @@ fn state() -> &'static Mutex<UiState> {
             presented: HashSet::new(),
             attached: HashSet::new(),
             walk_strikes: HashMap::new(),
+            walk_strike_ms: HashMap::new(),
             defer_show_until_batch: false,
             last_healthy_ms: HashMap::new(),
             hover: HashMap::new(),
@@ -522,16 +536,13 @@ pub fn log(line: &str) {
         .append(true)
         .open(p)
     {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() % 86400)
-            .unwrap_or(0);
+        // 本地日期+时间:run.log 跨多次启动追加,只有时分秒无法区分天,
+        // 排查偶发问题时对不上用户操作的时刻(2026-08-28 排查实证)。
+        let st = unsafe { GetLocalTime() };
         let _ = writeln!(
             f,
-            "[{:02}:{:02}:{:02}] {}",
-            now / 3600,
-            (now % 3600) / 60,
-            now % 60,
+            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
             line
         );
     }
@@ -789,6 +800,21 @@ fn register_class() {
             lpszClassName: guide_class_name(),
         };
         let _ = RegisterClassW(&wc3);
+        // 菜单前台宿主:沿用 fence_wndproc(与历史行为一致,仅类名独立,
+        // 避免被探针/兄弟扫描误认;窗口过程按 GWLP_USERDATA 查不到即走默认路径)
+        let wc4 = WNDCLASSW {
+            style: WNDCLASS_STYLES(0),
+            lpfnWndProc: Some(fence_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance(),
+            hIcon: deskfence_icon(),
+            hCursor: HCURSOR(0),
+            hbrBackground: HBRUSH(0),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: menu_host_class_name(),
+        };
+        let _ = RegisterClassW(&wc4);
     }
 }
 
@@ -2832,6 +2858,7 @@ fn ensure_all_attached() {
             // 自愈豁免;拖拽结束由 handle_lbuttonup 归位底带
             if matches!(&s.drag, Some(d) if d.fence_id == id) {
                 s.walk_strikes.remove(&id);
+                s.walk_strike_ms.remove(&id);
                 s.attached.insert(id);
                 continue;
             }
@@ -2918,7 +2945,8 @@ fn ensure_all_attached() {
                     // 句柄一并打印供跨 tick 对账。
                     let own = s.windows.values().any(|v| *v == w);
                     log(&format!(
-                        "walk-break: fence {id} blocked by cls={} own={} h=0x{:x} rect=({},{})-({},{}) vis={} iconic={}",
+                        "walk-break: fence {id} host=0x{:x} blocked by cls={} own={} h=0x{:x} rect=({},{})-({},{}) vis={} iconic={}",
+                        host.hwnd.0,
                         String::from_utf16_lossy(&db[..dn.max(0) as usize]),
                         own,
                         w.0,
@@ -2937,9 +2965,16 @@ fn ensure_all_attached() {
                 // 退避:修复后若同栅栏再次失位(外来者反复插队,如第三方钩子层
                 // 周期性洗牌),只按 第3、13、23…拍 间隔出手——防"每秒全链
                 // SetWindowPos"复活成周期闪屏源。
-                let strikes = s.walk_strikes.entry(id).or_insert(0);
-                *strikes += 1;
-                let attempt = *strikes == 3 || (*strikes > 3 && (*strikes - 3) % 10 == 0);
+                // 限速:同秒内的重复走查(global_tick 双调用)只推一拍,
+                // 保证"3 拍"与真实时间的对应关系稳定
+                let now = resize_now_ms();
+                let last = s.walk_strike_ms.get(&id).copied().unwrap_or(0);
+                if last == 0 || now.saturating_sub(last) >= 500 {
+                    s.walk_strike_ms.insert(id, now);
+                    *s.walk_strikes.entry(id).or_insert(0) += 1;
+                }
+                let strikes_n = s.walk_strikes.get(&id).copied().unwrap_or(0);
+                let attempt = strikes_n == 3 || (strikes_n > 3 && (strikes_n - 3) % 10 == 0);
                 if !found && !out_of_band && to_move.is_empty() {
                     let why = if budget == usize::MAX {
                         "top reached"
@@ -2947,17 +2982,19 @@ fn ensure_all_attached() {
                         "budget exhausted"
                     };
                     log(&format!(
-                        "walk-break: fence {id} NOT FOUND in {} steps ({}), strikes={}",
-                        budget, why, *strikes
+                        "walk-break: fence {id} host=0x{:x} NOT FOUND in {} steps ({}), strikes={}",
+                        host.hwnd.0,
+                        budget, why, strikes_n
                     ));
                 }
                 if attempt {
                     to_move.push(id);
-                } else if *strikes == 1 {
+                } else if strikes_n == 1 {
                     log(&format!("walk-break: fence {id} flagged strike 1/3, waiting confirm"));
                 }
             } else {
                 s.walk_strikes.remove(&id);
+                s.walk_strike_ms.remove(&id);
                 s.last_healthy_ms.insert(id, resize_now_ms());
                 s.attached.insert(id);
             }
@@ -3456,7 +3493,7 @@ fn init_tray() {
         // 正下方的分层窗口(实测在 (0,0) 时引发栅栏整面 ~4% 亮度跳变)。
         let menu_host = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
-            class_name(),
+            menu_host_class_name(),
             PCWSTR::null(),
             WINDOW_STYLE(0),
             GetSystemMetrics(SM_CXSCREEN) - 2,
