@@ -35,7 +35,8 @@ export GIT_COMMITTER_EMAIL=zghehehe@users.noreply.github.com
 export GIT_INDEX_FILE="$PWD/.git/pub-idx"
 trap 'unset GIT_INDEX_FILE; rm -f .git/pub-idx' EXIT
 git read-tree --empty
-git add .cargo .github src resources assets/deskfence.ico \
+git add .cargo .github src resources assets/deskfence.ico assets/deskfence-icon.svg \
+        docs/demo.svg \
         Cargo.toml Cargo.lock build.rs DeskFence.rc app.manifest \
         README.md LICENSE .gitignore
 T=$(git write-tree)

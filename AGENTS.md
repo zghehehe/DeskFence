@@ -242,6 +242,11 @@
      对外 404——公开推广前先把 DeskFence 仓库转 Public。
      GitHub 提交身份一律中性：zghehehe + zghehehe@users.noreply.github.com
      （publish/deploy 脚本内已强制 env，勿用工作身份提交公开内容）。
+     **真实桌面截图严禁入库/公开（2026-08-28 已全删 docs/assets/*.png）**：
+     含个人文件名、内网工具名与企业定制壁纸文字。README 配图=docs/demo.svg
+     （website 首屏卡通动画的自包含版，内联全部 keyframes；GitHub README
+     经 <img> 引用可正常播放 CSS 动画；校验 XML 合法性要用 XmlDocument.Load，
+     PS5.1 Get-Content 会按 GBK 误读 UTF-8 报假错）。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**
