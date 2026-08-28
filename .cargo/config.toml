@@ -1,0 +1,4 @@
+# 静态链接 C 运行库：release 产物成为真·单文件（仅依赖 Windows 系统库，
+# 无需 VC++ Redistributable）。所有 target 通用，MSVC 工具链专用。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

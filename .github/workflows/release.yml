@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Check single-file binary (static CRT, no VC runtime import)
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("target/release/deskfence.exe")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -match "VCRUNTIME140") {
+            Write-Error "exe still imports VCRUNTIME140.dll - crt-static is not in effect"
+            exit 1
+          }
+          Write-Output "single-file check ok"
+
+      - name: Hash
+        shell: pwsh
+        run: (Get-FileHash target/release/deskfence.exe -Algorithm SHA256).Hash |
+          Out-File -Encoding ascii deskfence.exe.sha256
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/deskfence.exe
+            deskfence.exe.sha256
+          generate_release_notes: true

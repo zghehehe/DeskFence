@@ -208,6 +208,32 @@
      复现工具 tools/menurepro.ps1（纯 PostMessage，无真实输入、无锁屏
      风险）；注意 taskkill+start 竞态瞬间两代实例并存会让探针/walk 看
      到"另一代实例的真实栅栏"充当拦路者——排查时先确保单实例。
+   - **⑥ 走查预算与垃圾层现实（2026-08-28，勿回退）**：企业环境里各软件
+     把辅助窗 HWND_BOTTOM 沉底，隐形垃圾一层层垫在宿主与栅栏之间（单日
+     实测 ~369 层，只会更多）。后果：walk 预算 320 在 ~330 处耗尽永远摸
+     不到栅栏 → `NOT FOUND` 风暴 + strikes 飙升（栅栏其实全程可见无遮挡，
+     纯日志/自愈语义问题）。已改：预算 320→1000，报文区分 budget
+     exhausted/top reached。**自愈语义不变的关键**：失位判定靠"遇到可见
+     外来窗先于栅栏"（out_of_band），隐形垃圾只消耗步数不构成失位；所以
+     预算调大不会把真浮窗放行（真浮窗必然先撞见可见 app 窗）。另：栅栏
+     沉到垃圾层之下属正常漂移（视觉无差异），不需要每层纠正。
+     bandwalk2.ps1 可打印自家窗口在链上的精确步位（bandwalk.ps1 是前 30
+     步简版）。repair FAILED 日志（错误码+锚点）保留，防再次出现"修复
+     静默无效"无处下手。
+   - **⑦ 公开发布流程（GitHub）**：公开仓库只含必要代码——src/、Cargo.*、
+     build.rs、DeskFence.rc、app.manifest、assets/deskfence.ico、
+     resources/deskfence.res、README、LICENSE、.gitignore、
+     .cargo/config.toml（crt-static 单文件）、.github/workflows/release.yml。
+     **不发布**：tools/、docs/、website/、AGENTS.md。构建资源已预编译
+     （build.rs 直接链接 res，不再调 windres——改图标后本地手动重生成）。
+     发布分支=孤儿分支 main（git plumbing 组装，不动工作树）：
+       export GIT_INDEX_FILE=$PWD/.git/pub-idx
+       git read-tree --empty
+       git add .cargo .github src resources assets/deskfence.ico Cargo.toml Cargo.lock build.rs DeskFence.rc app.manifest README.md LICENSE .gitignore
+       T=$(git write-tree); git commit-tree $T -p main -m sync | xargs git branch -f main
+       unset GIT_INDEX_FILE && rm -f .git/pub-idx
+     打 tag v* 推送后 Actions 自动 build+单文件校验+发 Release。
+     crt-static 经 .cargo/config.toml 全局生效（exe 仅依赖系统库）。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**

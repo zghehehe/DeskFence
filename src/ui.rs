@@ -2849,10 +2849,18 @@ fn ensure_all_attached() {
             // 它相交而被旧判定放行=持续浮窗)。
             let mut out_of_band = false;
             let mut found = false;
-            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实(实测被顶到
-            // 宿主之上 236 层);预算耗尽/到栈顶仍未命中=出带,绝不静默放行
+            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实:企业环境里
+            // 各家软件把辅助窗 HWND_BOTTOM 沉底,一层层垫在宿主与栅栏之间
+            //(2026-08-28 实测单日累积 ~369 层隐形垃圾)。预算耗尽与到顶都
+            // 是失位,但报文要区分(勿回退到 320——垃圾层只会更多)。
             let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-            for _ in 0..320 {
+            let mut budget = 0usize;
+            for _ in 0..1000 {
+                if w.0 == 0 {
+                    budget = usize::MAX; // 真到顶
+                    break;
+                }
+                budget += 1;
                 if w.0 == 0 {
                     break;
                 }
@@ -2933,9 +2941,15 @@ fn ensure_all_attached() {
                 *strikes += 1;
                 let attempt = *strikes == 3 || (*strikes > 3 && (*strikes - 3) % 10 == 0);
                 if !found && !out_of_band && to_move.is_empty() {
+                    let why = if budget == usize::MAX {
+                        "top reached"
+                    } else {
+                        "budget exhausted"
+                    };
                     log(&format!(
-                        "walk-break: fence {id} NOT FOUND in 320 steps (top reached), strikes={}"
-                    , *strikes));
+                        "walk-break: fence {id} NOT FOUND in {} steps ({}), strikes={}",
+                        budget, why, *strikes
+                    ));
                 }
                 if attempt {
                     to_move.push(id);
@@ -2962,7 +2976,7 @@ fn ensure_all_attached() {
                 // 纯 z 修复(NOMOVE|NOSIZE):位置由交互/布局路径负责,z 自愈只动
                 // 层叠次序。带位移的同值 SetWindowPos 会让 DWM 连无效区一起重算
                 //=可感知的重排闪底。
-                let attached = unsafe {
+                let attempt = unsafe {
                     SetWindowPos(
                         h,
                         after,
@@ -2972,8 +2986,18 @@ fn ensure_all_attached() {
                         0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                     )
-                    .is_ok()
                 };
+                let attached = attempt.is_ok();
+                if !attached && moved.is_empty() && to_move.len() <= 6 {
+                    // 首个失败的实证:错误码+锚点,排查"修复静默无效"专用
+                    log(&format!(
+                        "repair FAILED fence {} h=0x{:x} after=0x{:x} err={:?}",
+                        id,
+                        h.0,
+                        after.0,
+                        attempt.err()
+                    ));
+                }
                 if attached {
                     s.attached.insert(*id);
                     moved.push(*id);
@@ -3210,7 +3234,6 @@ fn reconcile_desktop_icons() {
             // "菜单后点空白→原生闪现 1-2s"专用。
             {
                 let s = state().lock().unwrap();
-                let hosts = desktop_hosts();
                 let mut why: Vec<String> = Vec::new();
                 for f in s.fences.iter().filter(|f| !f.hidden) {
                     let vis = s.windows.get(&f.id).is_some_and(|h| unsafe {
