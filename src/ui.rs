@@ -399,7 +399,7 @@ struct UiState {
     /// 输入条/第三方软件全屏钩子窗/cloaked CoreWindow)会短暂插进宿主与栅栏之间
     /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
     /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
-    pub walk_strikes: HashMap<u32, u32>,
+    pub walk_strikes: HashMap<u32, WalkStrike>,
     /// strike 最近一次推进的墙钟时刻:global_tick 在 needs_represent 路径会
     /// 同秒二次调用 ensure_all_attached,不限速则一秒推两拍,"3 拍≈3 秒"
     /// 的防抖语义失真(2026-08-28 实测 Win+D 沉底 1.4s 即修,与设计意图不符)。
@@ -417,10 +417,37 @@ struct UiState {
     pub last_healthy_ms: HashMap<u32, u64>,
 }
 
+/// 一次走查失位的故障签名。防抖只在"同一签名连续出现"时累计拍数:
+/// 恢复过渡期穿过 band 的应用窗每拍都是不同窗口,签名一变就重置计数,
+/// 不再误触修复(2026-08-28 Chrome/CabinetWClass 拦截误报即此类);而常驻
+/// 拦路者(同 HWND 同类)或沉底故障签名稳定,防抖/退避语义保持不变。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkFault {
+    /// 可见外来窗先于栅栏出现在宿主之上
+    Blocked { hwnd: isize, class: u64 },
+    /// 走查到栈顶未找到:栅栏确定在宿主之下(显示桌面批次),首拍即修
+    NotFoundTop,
+    /// 走查预算耗尽:状态不明,只记日志不动手
+    NotFoundBudget,
+}
+
+struct WalkStrike {
+    fault: WalkFault,
+    count: u32,
+}
+
+fn class_hash(cls: &[u16]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &c in cls {
+        h ^= c as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn state() -> &'static Mutex<UiState> {
     static S: OnceLock<Mutex<UiState>> = OnceLock::new();
-    S.get_or_init(|| {
-        Mutex::new(UiState {
+    S.get_or_init(|| {        Mutex::new(UiState {
             renderer: None,
             fences: Vec::new(),
             files: Vec::new(),
@@ -2895,6 +2922,7 @@ fn ensure_all_attached() {
             // 它相交而被旧判定放行=持续浮窗)。
             let mut out_of_band = false;
             let mut found = false;
+            let mut blocker = (0isize, 0u64);
             // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实:不少软件会把
             // 辅助窗 HWND_BOTTOM 沉底,一层层垫在宿主与栅栏之间(2026-08-28
             // 实测单日累积 ~369 层隐形垃圾)。预算耗尽与到顶都
@@ -2955,6 +2983,7 @@ fn ensure_all_attached() {
                 }
                 // 可见在屏内外来窗口先于栅栏出现:栅栏出带
                 out_of_band = true;
+                blocker = (w.0, class_hash(&cls_buf[..n.max(0) as usize]));
                 if to_move.is_empty() {
                     let mut db = [0u16; 32];
                     let dn = unsafe { GetClassNameW(w, &mut db) };
@@ -2976,30 +3005,57 @@ fn ensure_all_attached() {
                 }
                 break;
             }
-            if out_of_band || !found {
-                // 防抖(勿回退):菜单开合瞬间系统瞬态窗插入 band 又即刻退出,
-                // 驻留 ≤2s 的路过者绝不触发(实测 500ms 周期注入可对齐两个
-                // 1s tick);连续三拍失位才动手。真实浮出带/沉底会持续命中,
-                // 自愈延迟 2-3s(自愈验收窗口相应放宽到 4s 内)。
-                // 退避:修复后若同栅栏再次失位(外来者反复插队,如第三方钩子层
-                // 周期性洗牌),只按 第3、13、23…拍 间隔出手——防"每秒全链
-                // SetWindowPos"复活成周期闪屏源。
-                // 限速:同秒内的重复走查(global_tick 双调用)只推一拍,
-                // 保证"3 拍"与真实时间的对应关系稳定
+            let fault = if out_of_band {
+                Some(WalkFault::Blocked {
+                    hwnd: blocker.0,
+                    class: blocker.1,
+                })
+            } else if !found {
+                if budget == usize::MAX {
+                    Some(WalkFault::NotFoundTop)
+                } else {
+                    Some(WalkFault::NotFoundBudget)
+                }
+            } else {
+                None
+            };
+            if let Some(fault) = fault {
+                // 防抖(勿回退):连续三拍**同签名**失位才动手;签名一变
+                //(拦路者换窗/类型变化=过路者)立即重置。退避保持第 3、13、
+                // 23…拍出手,防"每秒全链 SetWindowPos"复活成周期闪屏源。
+                // 限速:同秒内的重复走查(global_tick 双调用)只推一拍。
                 let now = resize_now_ms();
                 let last = s.walk_strike_ms.get(&id).copied().unwrap_or(0);
-                if last == 0 || now.saturating_sub(last) >= 500 {
+                let advanced = last == 0 || now.saturating_sub(last) >= 500;
+                if advanced {
                     s.walk_strike_ms.insert(id, now);
-                    *s.walk_strikes.entry(id).or_insert(0) += 1;
                 }
-                let strikes_n = s.walk_strikes.get(&id).copied().unwrap_or(0);
-                // top reached(走查到栈顶)=栅栏确定在宿主之下,不是瞬态:
-                // 无需 3 拍防抖,首拍即修。budget exhausted 状态不明,仍走防抖。
-                let top_reached = !found && !out_of_band && budget == usize::MAX;
-                let attempt = top_reached
-                    || strikes_n == 3
-                    || (strikes_n > 3 && (strikes_n - 3) % 10 == 0);
-                if !found && !out_of_band && to_move.is_empty() {
+                let strikes_n = {
+                    let e = s
+                        .walk_strikes
+                        .entry(id)
+                        .or_insert(WalkStrike { fault, count: 0 });
+                    if e.fault != fault {
+                        e.fault = fault;
+                        e.count = 0;
+                    }
+                    if advanced {
+                        e.count += 1;
+                    }
+                    e.count
+                };
+                // 沉底(栈顶未找到)确定非瞬态,首拍即修;预算耗尽状态不明,
+                // 只记日志;被拦截走三拍防抖。
+                let attempt = match fault {
+                    WalkFault::NotFoundTop => true,
+                    WalkFault::NotFoundBudget => false,
+                    WalkFault::Blocked { .. } => {
+                        strikes_n == 3 || (strikes_n > 3 && (strikes_n - 3) % 10 == 0)
+                    }
+                };
+                if matches!(fault, WalkFault::NotFoundTop | WalkFault::NotFoundBudget)
+                    && to_move.is_empty()
+                {
                     let why = if budget == usize::MAX {
                         "top reached"
                     } else {
@@ -3021,6 +3077,16 @@ fn ensure_all_attached() {
                 s.walk_strike_ms.remove(&id);
                 s.last_healthy_ms.insert(id, resize_now_ms());
                 s.attached.insert(id);
+                // iconic 兜底:漏网的路径可能把栅栏最小化,走查找到了也
+                // 不等于可渲染(repair 的纯 z SetWindowPos 取消不了最小化,
+                // 必须走 ShowWindow)。
+                if unsafe { IsIconic(h) }.as_bool() {
+                    let _z = z_scope(ZIntent::Restore);
+                    unsafe {
+                        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                    }
+                    log(&format!("walk: fence {id} was iconic, restored"));
+                }
             }
         }
         if !to_move.is_empty() {
@@ -3031,34 +3097,61 @@ fn ensure_all_attached() {
                 let frect = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect);
                 let Some(frect) = frect else { continue };
                 let Some(host) = host_for_rect(&frect, &hosts) else { continue };
-                let Some(after) = desktop_insert_after(host.hwnd) else {
-                    continue;
-                };
                 // 纯 z 修复(NOMOVE|NOSIZE):位置由交互/布局路径负责,z 自愈只动
                 // 层叠次序。带位移的同值 SetWindowPos 会让 DWM 连无效区一起重算
                 //=可感知的重排闪底。
+                // 锚点重试:宿主正上方若是高完整性进程的窗口(企业安全软件
+                // 钩子层),以其为锚会被拒(0x80070005;2026-08-28 实测 20 次,
+                // fence4 因此失踪 3350 拍)。失败沿链向上换锚重试,最多 3 个。
                 let _z = z_scope(ZIntent::Repair);
-                let attempt = unsafe {
-                    SetWindowPos(
-                        h,
-                        after,
-                        frect.x.round() as i32,
-                        frect.y.round() as i32,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    )
-                };
-                let attached = attempt.is_ok();
+                let mut attached = false;
+                let mut first_err = None;
+                let mut anchor = desktop_insert_after(host.hwnd);
+                let mut tried = 0;
+                while let Some(after) = anchor {
+                    if tried >= 3 {
+                        break;
+                    }
+                    tried += 1;
+                    let attempt = unsafe {
+                        SetWindowPos(
+                            h,
+                            after,
+                            frect.x.round() as i32,
+                            frect.y.round() as i32,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        )
+                    };
+                    match attempt {
+                        Ok(()) => {
+                            attached = true;
+                            if tried > 1 {
+                                log(&format!(
+                                    "repair fence {id} succeeded on retry #{tried} (anchor 0x{:x})",
+                                    after.0
+                                ));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some((after, e));
+                            }
+                            let next = unsafe { GetWindow(after, GW_HWNDPREV) };
+                            anchor = if next.0 == 0 { None } else { Some(next) };
+                        }
+                    }
+                }
                 if !attached && moved.is_empty() && to_move.len() <= 6 {
                     // 首个失败的实证:错误码+锚点,排查"修复静默无效"专用
-                    log(&format!(
-                        "repair FAILED fence {} h=0x{:x} after=0x{:x} err={:?}",
-                        id,
-                        h.0,
-                        after.0,
-                        attempt.err()
-                    ));
+                    if let Some((after, e)) = first_err {
+                        log(&format!(
+                            "repair FAILED fence {} h=0x{:x} after=0x{:x} err={:?}",
+                            id, h.0, after.0, e
+                        ));
+                    }
                 }
                 if attached {
                     s.attached.insert(*id);
