@@ -35,11 +35,10 @@ fn main() {
         shell::icon_dump(&path, &prefix);
         return;
     }
-    // 单实例:二次双击只唤醒已有实例(显示全部栅栏),不启动第二个进程
-    if !acquire_single_instance() {
-        ui::notify_second_instance();
-        return;
-    }
+    // 清洁启动序列(用户约定的默认行为,2026-08-29):任何时候起新实例,
+    // 都先停掉旧实例、确认环境就绪,没问题了才启动新服务——杜绝双实例
+    // 互殴/僵尸窗口/脏桌面层把运行环境弄乱。
+    ensure_clean_startup();
     if !ui::init() {
         println!("failed to init renderer/COM");
         std::process::exit(1);
@@ -48,30 +47,36 @@ fn main() {
     let _ = ui::run_message_loop();
 }
 
-/// 命名互斥体保证单实例;返回 true = 本进程是唯一实例
-fn acquire_single_instance() -> bool {
-    use std::sync::OnceLock;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
-    use windows::Win32::System::Threading::CreateMutexW;
-
-    static HANDLE_SLOT: OnceLock<HANDLE> = OnceLock::new();
-    unsafe {
-        let name: Vec<u16> = "Local\\DeskFence.SingleInstance"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        match CreateMutexW(None, false, PCWSTR::from_raw(name.as_ptr())) {
-            Ok(h) => match GetLastError() {
-                // 新式错误模型:GetLastError() 返回 Result<()>
-                Ok(()) => {
-                    let _ = HANDLE_SLOT.set(h);
-                    true
-                }
-                Err(e) if e.code().0 as u32 == ERROR_ALREADY_EXISTS.0 => false,
-                Err(_) => true,
-            },
-            Err(_) => true, // 拿不到互斥体也不阻塞启动
+/// 清洁启动:①替换旧实例(停止所有 deskfence.exe 并等待退出);
+/// ②桌面宿主就绪门槛(Explorer 桌面层未就绪时最多等 15s——登录早期/
+/// Explorer 重启中,超时放行交由既有自愈在就绪后补挂,绝不永久阻塞)。
+fn ensure_clean_startup() {
+    // ① 新实例替换旧实例:双击旧版 exe 不会"唤醒旧进程拒绝新版",
+    // 更新/重测直接启动即可;旧实例非正常退出由 boot 的崩溃恢复兜底。
+    let stale = shell::pids_by_name("deskfence.exe");
+    if !stale.is_empty() {
+        let remain = shell::terminate_by_name("deskfence.exe", 5000);
+        ui::log(&format!(
+            "clean-start: replaced {} previous instance(s){}",
+            stale.len(),
+            if remain.is_empty() {
+                String::new()
+            } else {
+                format!(", {} resisted: {:?}", remain.len(), remain)
+            }
+        ));
+    }
+    // ② 宿主就绪门槛
+    if ui::desktop_host_ready() {
+        return;
+    }
+    ui::log("clean-start: desktop host not ready, waiting (max 15s)");
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if ui::desktop_host_ready() {
+            ui::log("clean-start: desktop host became ready");
+            return;
         }
     }
+    ui::log("clean-start: host still absent after 15s, booting with deferred attach");
 }

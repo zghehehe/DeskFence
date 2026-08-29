@@ -2017,6 +2017,72 @@ unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> Option<String> {
     String::from_utf16(std::slice::from_raw_parts(p.0, len)).ok()
 }
 
+// ---------------- 进程辅助(环境体检/自愈) ----------------
+
+/// 按进程名枚举 pid(不含自身)。用于环境体检(发现多余 DeskFence 实例)
+/// 与"修复桌面环境"(重启 Explorer 重建桌面层)。
+pub fn pids_by_name(name: &str) -> Vec<u32> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    let mut out = Vec::new();
+    let me = std::process::id();
+    unsafe {
+        if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            let mut e = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            if Process32FirstW(snap, &mut e).is_ok() {
+                loop {
+                    let end = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+                    let pname = String::from_utf16_lossy(&e.szExeFile[..end]);
+                    if pname.eq_ignore_ascii_case(name) && e.th32ProcessID != me {
+                        out.push(e.th32ProcessID);
+                    }
+                    if Process32NextW(snap, &mut e).is_err() {
+                        break;
+                    }
+                }
+            }
+            let _ = CloseHandle(HANDLE(snap.0));
+        }
+    }
+    out
+}
+
+/// 按名终止进程并等待退出(最多 wait_ms)。返回未退出的残余 pid。
+pub fn terminate_by_name(name: &str, wait_ms: u64) -> Vec<u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    let start = std::time::Instant::now();
+    loop {
+        let alive = pids_by_name(name);
+        if alive.is_empty() {
+            return Vec::new();
+        }
+        if start.elapsed().as_millis() as u64 > wait_ms {
+            return alive;
+        }
+        for pid in &alive {
+            unsafe {
+                if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, *pid) {
+                    let _ = TerminateProcess(h, 1);
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// 启动 explorer.exe(修复桌面环境用;GUI 子进程,无控制台闪窗)。
+pub fn start_explorer() {
+    let _ = std::process::Command::new("explorer.exe").spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::select_image_size;

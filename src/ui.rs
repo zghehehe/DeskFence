@@ -250,6 +250,8 @@ const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
 const MENU_RENDER_PRECISE: u32 = 0x5117;
 const MENU_AUTO_CATEGORY: u32 = 0x5118;
 const MENU_HELP: u32 = 0x5119;
+const MENU_ENV_CHECK: u32 = 0x511A;
+const MENU_ENV_REPAIR: u32 = 0x511B;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -581,6 +583,14 @@ pub fn log(line: &str) {
     let dir = model::config_dir();
     let _ = std::fs::create_dir_all(&dir);
     let p = dir.join("run.log");
+    // 轮转:超 4MB 归档为 run.log.old(覆盖旧档),防长期运行无限增长。
+    if let Ok(meta) = std::fs::metadata(&p) {
+        if meta.len() > 4 * 1024 * 1024 {
+            let old = dir.join("run.log.old");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&p, &old);
+        }
+    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -2637,6 +2647,16 @@ pub fn startup() {
     reconcile_desktop_icons();
     BOOT_VERBOSE.store(false, Ordering::Relaxed);
     log(&format!("boot done ({}ms)", resize_now_ms()));
+    // 启动环境体检(默认配置的一部分):把桌面层健康状态留在日志里,
+    // 用户报障时日志可直接区分"代码问题/环境问题"(2026-08-29 教训)。
+    {
+        let (ok, report) = env_health_report();
+        if ok {
+            log("env-check at boot: ok");
+        } else {
+            log(&format!("env-check at boot: ISSUES\n{report}"));
+        }
+    }
 }
 
 /// 全局自愈:定时器与显示变化时调用。
@@ -2685,6 +2705,11 @@ fn global_tick() {
     finish_rename_if_clicked_outside();
 
     let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // 环境自稳:30s 节拍体检,持续异常超宽限期自动重建桌面层(见
+    // env_watchdog_tick)。这是"运行期间保证环境正常"的默认机制。
+    if t % 30 == 7 {
+        env_watchdog_tick();
+    }
     // 图标缓存落盘调度:运行期懒提取(DPI 切换/新文件/残影预览等任何
     // icon_cache 增量)都体现在提取计数上;计数变化→记脏,安静 4s 后写盘。
     // 启动冷提取的首次落盘也由此自动完成,无需在启动关键路径上做 IO。
@@ -3377,6 +3402,240 @@ fn any_fence_presented_on_desktop() -> bool {
     })
 }
 
+// ---------------- 环境体检与自愈(2026-08-29 教训产品化) ----------------
+// 长时间运行/重度使用后,Explorer 桌面层可能被弄脏(双实例互殴、僵尸窗口、
+// 宿主链异常),同一份代码表现随之漂移。把排查工具的能力内建为默认配置:
+// 启动时自动体检记日志;托盘提供"体检"(诊断报告)与"修复桌面环境"
+// (重启 Explorer 重建桌面层,栅栏经 TaskbarCreated 路径自动重挂)。
+
+/// 环境体检(只读)。返回 (是否健康, 中文报告)。
+pub fn env_health_report() -> (bool, String) {
+    let mut ok = true;
+    let mut lines: Vec<String> = Vec::new();
+    // 1) 多余 DeskFence 进程(自身已持锁,其余皆僵尸)
+    let stale = shell::pids_by_name("deskfence.exe");
+    if stale.is_empty() {
+        lines.push("实例: 单实例 ✓".into());
+    } else {
+        ok = false;
+        lines.push(format!(
+            "实例: 检测到 {} 个多余 DeskFence 进程 {:?}(重启本程序可自动清理)",
+            stale.len(),
+            stale
+        ));
+    }
+    // 2) 桌面宿主
+    match desktop_shell_window() {
+        Some(h) => lines.push(format!("桌面宿主: 就绪 0x{:x} ✓", h.0)),
+        None => {
+            ok = false;
+            lines.push("桌面宿主: 未找到(Explorer 桌面层未就绪)".into());
+        }
+    }
+    // 3) 孤儿 DeskFence 窗口(死去实例的遗留)
+    let me = std::process::id();
+    let mut orphans = 0usize;
+    unsafe {
+        unsafe extern "system" fn enum_orphan(h: HWND, l: LPARAM) -> BOOL {
+            let (me, count) = unsafe {
+                let p = l.0 as *mut (u32, usize);
+                (&(*p).0, &mut (*p).1)
+            };
+            let mut buf = [0u16; 32];
+            let n = unsafe { GetClassNameW(h, &mut buf) };
+            let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            if cls.starts_with("DeskFence") {
+                let mut pid = 0u32;
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
+                        h,
+                        Some(&mut pid),
+                    )
+                };
+                if pid != *me {
+                    *count += 1;
+                }
+            }
+            BOOL(1)
+        }
+        let mut ctx = (me, 0usize);
+        let _ = EnumWindows(Some(enum_orphan), LPARAM(&mut ctx as *mut _ as isize));
+        orphans = ctx.1;
+    }
+    if orphans == 0 {
+        lines.push("窗口: 无孤儿窗口 ✓".into());
+    } else {
+        ok = false;
+        lines.push(format!("窗口: 检测到 {orphans} 个孤儿 DeskFence 窗口(建议\"修复桌面环境\")"));
+    }
+    // 4) 栅栏在带内
+    let host = desktop_shell_window();
+    let in_band;
+    let total;
+    {
+        let s = state().lock().unwrap();
+        total = s.fences.iter().filter(|f| !f.hidden).count();
+        let mut good = 0usize;
+        if let Some(host) = host {
+            for h in s.windows.values() {
+                let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+                for _ in 0..600 {
+                    if w.0 == 0 {
+                        break;
+                    }
+                    if w == *h {
+                        good += 1;
+                        break;
+                    }
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                }
+            }
+        }
+        in_band = good;
+    }
+    if total > 0 && in_band == total {
+        lines.push(format!("栅栏: {in_band}/{total} 在桌面层内 ✓"));
+    } else {
+        ok = false;
+        lines.push(format!("栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"));
+    }
+    // 5) 原生图标与接管状态一致性(仅提示,协调器每秒会修)
+    if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
+        if let Some(lv) = desktop_listview() {
+            if unsafe { IsWindowVisible(lv).as_bool() } {
+                lines.push("图标: 原生图标意外可见(将在 1 秒内自动隐藏)".into());
+            } else {
+                lines.push("图标: 接管正常 ✓".into());
+            }
+        }
+    }
+    (ok, lines.join("\n"))
+}
+
+/// 托盘动作:弹出环境体检报告。
+fn env_health_dialog() {
+    let (ok, report) = env_health_report();
+    let title = if ok {
+        "DeskFence 环境体检:健康"
+    } else {
+        "DeskFence 环境体检:发现问题"
+    };
+    log(&format!("env-check by user: ok={ok}\n{report}"));
+    let t = shell::wide(title);
+    let m = shell::wide(&format!("{report}\n\n(本报告已写入日志)"));
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR::from_raw(m.as_ptr()),
+            PCWSTR::from_raw(t.as_ptr()),
+            MB_OK | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// 托盘动作:修复桌面环境——重启 Explorer 重建桌面层(垃圾层/钩子层/
+/// 僵尸托盘全部清零),本程序靠 TaskbarCreated 路径自动重挂栅栏与托盘。
+/// 在后台线程执行,避免阻塞 UI。
+fn env_repair() {
+    let t = shell::wide("DeskFence 修复桌面环境");
+    let m = shell::wide(
+        "将重启资源管理器以重建桌面层(已打开的文件夹窗口会关闭,\n\
+         屏幕会闪黑约 1-2 秒),栅栏与图标接管将自动恢复。\n\n继续?",
+    );
+    let choice = unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR::from_raw(m.as_ptr()),
+            PCWSTR::from_raw(t.as_ptr()),
+            MB_OKCANCEL | MB_ICONWARNING | MB_SETFOREGROUND,
+        )
+    };
+    if choice != IDOK {
+        return;
+    }
+    env_repair_internal("user");
+}
+
+/// 重建桌面层:重启 Explorer,栅栏经 TaskbarCreated 路径自动重挂,
+/// 托盘图标自动重建。由托盘"修复桌面环境"与环境自稳 watchdog 共用。
+fn env_repair_internal(reason: &str) {
+    log(&format!(
+        "env-repair({reason}): restarting explorer to rebuild desktop band"
+    ));
+    std::thread::spawn(|| unsafe {
+        // 让 UI 先消化掉调用上下文(消息框/自检),再动 Explorer
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let remain = shell::terminate_by_name("explorer.exe", 5000);
+        if !remain.is_empty() {
+            log(&format!("env-repair: explorer pids {:?} resisted", remain));
+        }
+        shell::start_explorer();
+        // 等新宿主就绪(TaskbarCreated 会走重挂路径,这里只做日志收尾)
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if desktop_shell_window().is_some() {
+                log("env-repair: desktop host rebuilt");
+                return;
+            }
+        }
+        log("env-repair: host not seen in 15s (Explorer may still be starting)");
+    });
+}
+
+// ---------------- 环境自稳 watchdog(默认保证,非用户自救) ----------------
+// 运行期间持续体检(30s 节奏):宿主消失/栅栏持续无法归位/接管被破坏等
+// 异常**持续超过宽限期**(自愈已有充足时间修复瞬态)即自动重建桌面层。
+// 限额防风暴:两次重建至少间隔 10 分钟,每次运行最多 3 次,超限只记日志。
+static WATCHDOG_FAULT_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_LAST_RECOVERY_MS: AtomicU64 = AtomicU64::new(0);
+static WATCHDOG_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+const WATCHDOG_GRACE_MS: u64 = 90_000;
+const WATCHDOG_MIN_INTERVAL_MS: u64 = 600_000;
+const WATCHDOG_MAX_RECOVERIES: u32 = 3;
+
+fn env_watchdog_tick() {
+    let (ok, report) = env_health_report();
+    let now = resize_now_ms();
+    if ok {
+        WATCHDOG_FAULT_SINCE_MS.store(0, Ordering::Relaxed);
+        return;
+    }
+    // 首次发现异常记起点;持续不足宽限期则等自愈工作
+    let since = {
+        let prev = WATCHDOG_FAULT_SINCE_MS.load(Ordering::Relaxed);
+        if prev == 0 {
+            WATCHDOG_FAULT_SINCE_MS.store(now, Ordering::Relaxed);
+            log(&format!("env-watchdog: fault started, waiting self-heal ({report})"));
+            now
+        } else {
+            prev
+        }
+    };
+    if now.saturating_sub(since) < WATCHDOG_GRACE_MS {
+        return;
+    }
+    let last = WATCHDOG_LAST_RECOVERY_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < WATCHDOG_MIN_INTERVAL_MS {
+        return;
+    }
+    let count = WATCHDOG_RECOVERIES.load(Ordering::Relaxed);
+    if count >= WATCHDOG_MAX_RECOVERIES {
+        if count == WATCHDOG_MAX_RECOVERIES {
+            log("env-watchdog: recovery cap reached, logging only");
+            WATCHDOG_RECOVERIES.store(count + 1, Ordering::Relaxed);
+        }
+        return;
+    }
+    WATCHDOG_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    WATCHDOG_LAST_RECOVERY_MS.store(now, Ordering::Relaxed);
+    WATCHDOG_FAULT_SINCE_MS.store(0, Ordering::Relaxed);
+    log(&format!(
+        "env-watchdog: sustained fault beyond grace, auto-rebuilding desktop band (recovery #{})",
+        count + 1
+    ));
+    env_repair_internal("watchdog");
+}
+
 /// 协调原生桌面图标可见性。任何栅栏宿主/呈现状态异常都优先恢复原生图标，
 /// 以保证用户绝不会得到空白桌面。
 fn reconcile_desktop_icons() {
@@ -3388,7 +3647,15 @@ fn reconcile_desktop_icons() {
     }
     let fences_ready = any_fence_presented_on_desktop();
     if fences_ready {
-        if !DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) && set_desktop_icons_visible(false) {
+        // 接管不变式(2026-08-29):判定依据是图标**实际可见性**而非标志位
+        // ——Explorer 在 ToggleDesktop/自身重建后可能重新显示图标列表,
+        // 只看 DESKTOP_ICONS_HIDDEN 会死锁(标志 true 但图标可见,永不
+        // 重新隐藏)。栅栏在桌面=图标必须藏,这就是"不被环境干扰"。
+        let lv_vis =
+            desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
+        if (!DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) || lv_vis)
+            && set_desktop_icons_visible(false)
+        {
             DESKTOP_ICONS_HIDDEN.store(true, Ordering::Relaxed);
             model::save_icons_marker(std::process::id());
             log("desktop icons hidden after fence presentation verified");
@@ -3760,6 +4027,8 @@ fn show_tray_menu(x: i32, y: i32) {
         shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     }
     shell::append_menu(menu, MENU_HELP, "使用说明");
+    shell::append_menu(menu, MENU_ENV_CHECK, "桌面环境体检");
+    shell::append_menu(menu, MENU_ENV_REPAIR, "修复桌面环境...");
     if shell::get_autostart() {
         shell::append_menu_checked(menu, MENU_AUTOSTART, "开机自启");
     } else {
@@ -3804,6 +4073,8 @@ fn dispatch_tray_command(id: u32) {
         MENU_RENDER_PRECISE => set_render_mode("precise"),
         MENU_AUTO_CATEGORY => toggle_auto_category(),
         MENU_HELP => show_help(),
+        MENU_ENV_CHECK => env_health_dialog(),
+        MENU_ENV_REPAIR => env_repair(),
         MENU_AUTOSTART => toggle_autostart(),
         MENU_QUIT => quit_app(),
         _ => log(&format!("unknown tray command: {}", id)),
@@ -4556,19 +4827,9 @@ fn handle_clear_selection_click(x: i32, y: i32) {
     }
 }
 
-/// 第二实例请求:找到已有实例并让其显示全部栅栏
-pub fn notify_second_instance() {
-    unsafe {
-        let tray_cls = tray_class_name();
-        let mut hwnd = FindWindowW(tray_cls, PCWSTR::null());
-        if hwnd.0 == 0 {
-            let fence_cls = class_name();
-            hwnd = FindWindowW(fence_cls, PCWSTR::null());
-        }
-        if hwnd.0 != 0 {
-            let _ = PostMessageW(hwnd, WM_DL3_SHOW_ALL, WPARAM(0), LPARAM(0));
-        }
-    }
+/// 桌面宿主是否就绪(清洁启动门槛用):Progman/WorkerW + 图标视图链存在。
+pub fn desktop_host_ready() -> bool {
+    desktop_shell_window().is_some()
 }
 
 // ---------------- 菜单与操作 ----------------
