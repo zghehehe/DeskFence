@@ -406,6 +406,97 @@
     - 机器判定（探针/探测器）通过≠用户体感通过，涉及闪屏/浮窗的
       改动必须等用户实测确认再提交。
 
+13. **菜单后点空白闪屏——带底 churn 区与就位锚点（2026-08-29 终修，勿回退）**：
+    症状=托盘/倒三角菜单关闭后点桌面空白，桌面快速小闪。机制：Win+D 后
+    `fence_reanchor_if_below_host`/走查修复把栅栏拉回 `desktop_insert_after`
+    （=宿主正上方=z 栈 1-5 步）——正是 2b51566 点名的 menu-churn 区；菜单
+    关闭的系统**静默重排**（不发 CHANGING/CHANGED——CHANGING 否决本就无
+    条件拦外部 z 变更，静默路径绕过它）把带底栅栏压到宿主下，高速 zcheck
+    再 5 连发拉回=整面 DWM 重合成=闪。日志指纹：`track dismissed` 后紧跟
+    5 条 `re-anchored above host after external move`。修复（全在 ui.rs）：
+    - `band_attach_anchor`：就位锚点（创建/走查修复/re-anchor/拖拽落位
+      四处统一）="最低**可见且非 topmost** 外来窗"正下方。应用态=最低
+      应用窗（实测 ~380 层深位，数百层垃圾与带底扰动区绝缘）；显示桌面
+      态无此类窗→兄弟归队/带底回退（该状态非 topmost 区仅 ~8 层，本无
+      避风港，属已知边界，回应用后由晋升送回深位）。
+    - **topmost 一律不作锚、不做下探**：带内堆着大量 topmost 风格的隐形
+      翻转垃圾（Outlook ATL/tooltip、SPES ScW 钩子层），活跃瞬间冒充
+      "最低可见外来窗"；实测"以 topmost 为界向下探到非 topmost 窗"的
+      终点是不受过滤保护的 MSCTFIME UI（IME 翻转窗），锚它=栅栏留在带底
+      扰动区、晋升永不触发（第一版实踩，下探已删）。
+    - `band_aux` 新增 MSCTFIME UI / Default IME（可见性与矩形随输入焦点
+      振荡，空闲时 0x0 矩形，explorer 属主；零像素/瞬态不可能遮挡桌面
+      内容，与 EdgeUi 输入条同法理容忍）。
+    - 走查健康分支新增 **churn 区晋升**：健康但 depth≤12 且解析出的锚点
+      比当前位深 20+ 层（滞后防抖）→一次性晋升到锚点下（SetWindowPos 带
+      沿链换锚重试×3，防高完整性锚 0x80070005 静默失败）；深位健康栅栏
+      绝不重排（重排本身=重合成闪）。`promote-diag` 限频 30s 留诊断。
+    - 验证基准：干净环境 boot 后 bandwalk 应见栅栏 ~378-384 步（最低
+      应用窗正下方）；envreset 后相同。**环境被反复桌面切换污染后
+      ToggleDesktop 会卡死（FG 停在 Progman/ScW，切了没反应）**——验证
+      桌面切换行为前先 envcheck，连续切换控制在 2-3 次内，脏了就 envreset。
+    - 排障工具链教训：PowerShell 委托回调（EnumWindows 的 delegate）里
+      直接 Write-Output 会被吞，收集进 ArrayList 回来再打印；探针结论
+      （"窗口消失了"）先怀疑探针再用 FindWindow 复核。
+    - **60ms zwatch 终局机制（2026-08-29 下午，勿回退）**：菜单关闭的
+      静默沉底=系统把菜单宿主连同其 z 邻居（=紧贴带底的整个连续块，
+      12:33:31.469 实测恰好是栅栏 1-5+菜单宿主 6，块外 ATL@7 不动）
+      整帧压到宿主之下，高速自检 ~60ms 后拉回=栅栏消失 0.1-0.8s=
+      "菜单后点空白轻微闪"的真身（flashdet：菜单本体仅 ~20k 采样px，
+      闪=56k-129k 连续 1s 的栅栏列blink）。**应用态栅栏在 ~380 深位离
+      菜单宿主十万八千里=天然免疫**；显示态才中招。修复链=主规则锚
+      （最低可见非 topmost 外来窗=parked 应用窗）+晋升滞后 6 层——
+      Win+D 后 1s 内把栅栏送进 parked 应用窗之下（~12-18 步，已离开
+      1-6 沉底块）。
+    - **晋升三重门（勿简化）**：①目标比当前深 +6 层（滞后防抖；曾用
+      +20 会把"从带底送进 parked 窗之下十几层"的机会挡掉=12:22:58
+      沉底实锤）；②目标自身 depth>12（防"锚点在底部簇内穿插"的
+      1Hz 晋升振荡风暴，12:48 实测）；③锚必须非 topmost 窗。
+    - **topmost band 死路（勿再试）**：插到 topmost 窗正下方会把栅栏
+      并入 topmost band（实测 5 栅栏 topmost=True，切回应用=全屏浮窗）；
+      SetWindowLongW 清不掉 WS_EX_TOPMOST（win32k 强制 band 管理，
+      日志骗人、实测位还在）；HWND_NOTOPMOST 会把窗口移到非 topmost
+      带顶部=位置不可控。整个"用 topmost 垃圾做锚+事后清位"路线已
+      撤销，源码注释有墓碑。
+    - **ToggleDesktop 反复切换会失灵**（FG 卡 Progman/ScW，COM 调用
+      no-op）：一次调试会话 COM 切换控制在 2-3 次内；失灵后真实
+      Win+D 可解，或 envreset。
+    - **残留边界（待用户实测分流）**：显示态下若全部应用窗都"最小化
+      停泊"（非 live-parked）且 topmost 垃圾丛林下方无非 topmost 隐形
+      窗可垫——栅栏只能留带底，菜单关闭仍可能轻微闪。候选下一步：
+      菜单宿主独立线程（怀疑沉底块按线程分组，宿主与栅栏分线程即可
+      解耦——待验证块边界是线程还是 z 连续性）。
+    - **⑧ 显示桌面态 topmost 免疫（2026-08-29 终修，勿回退）**：用户
+      Case A/B 对比实锤——Win+D/三指（ToggleDesktop 批停泊）后菜单关
+      闭必闪；逐个最小化回桌面（不进停泊批）后不闪。且停泊批只认
+      "曾经被切换沉底过的窗口"：12:33:31 沉底块恰好=栅栏簇+菜单宿主，
+      parked 窗(17-21)不被波及。**topmost 窗不参与停泊**（ScW/隐形
+      丛林每次切换纹丝不动）→终修:`shown_topmost_tick`(走查末尾,
+      ensure_all_attached 尾部调用)在"无任何可见非 topmost 外来窗"
+      (band_has_live_foreign,与 resolver 主规则同源)稳定 2 拍后给
+      全部栅栏 HWND_TOPMOST=免疫;出现可见应用窗立即 HWND_NOTOPMOST
+      +zcheck 下压重归深位(被恢复扫动遮蔽)。**只有 SetWindowPos 的
+      HWND_TOPMOST/NOTOPMOST 能改 topmost 位**(SetWindowLongW 改不动,
+      勿再试);NOTOPMOST 会把窗口抬到非 topmost 带顶=位置不可控,
+      摘除路径只动真正 topmost 的栅栏(先查位)。免疫期间:走查对
+      topmost 栅栏按健康豁免(防与免疫互殴)、zcheck 不下压(防模式
+      抖动)。进入瞬间(切换沉底→拉回带底→1s 后跳 topmost)有一次
+      z 跳变,发生在切换动画后——若用户可感知再前移到 reanchor 路径。
+      日志指纹:`shown-topmost: mode ON/OFF`。COM ToggleDesktop 在
+      一台机器上反复调用后会静默失灵(切换无效果、无日志),真实
+      Win+D 或 envreset 可解——机器验证切换行为时 COM 调用控制在
+      2-3 次内。
+    - **快速通道(同日补,勿回退)**:①进入——`fence_reanchor_if_
+      below_host` 沉底瞬间若 `band_has_live_foreign()==false` 直接
+      HWND_TOPMOST(不等走查 2 拍;否则用户"刚到桌面就点菜单"仍在
+      闪窗期内,2s→~0.2s 且被切换动画遮蔽;误判由走查退出路径自纠);
+      ②退出——zcheck_fences_now 开头检测"免疫中+出现可见应用窗"立即
+      摘除+重归位(恢复扫动第一批 WinEvent 毫秒级到达,不等 1s 走查
+      ="回应用偶现浮窗"的主潜伏期);③摘除=SetWindowPos 直接插到
+      `band_attach_anchor` 解析的最低可见外来窗之下——**绝不用
+      HWND_NOTOPMOST 做第一选择**(它会先把栅栏抬到非 topmost 带顶
+      =浮在应用上再等人压,只留作锚解析失败兜底)。
+
 ## 代码位置备忘
 
 - 渲染：src/render.rs（ink 常驻：透明底+1/255 隐形命中层+seeded GDI 文字；

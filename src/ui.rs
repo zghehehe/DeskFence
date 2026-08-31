@@ -250,8 +250,6 @@ const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
 const MENU_RENDER_PRECISE: u32 = 0x5117;
 const MENU_AUTO_CATEGORY: u32 = 0x5118;
 const MENU_HELP: u32 = 0x5119;
-const MENU_ENV_CHECK: u32 = 0x511A;
-const MENU_ENV_REPAIR: u32 = 0x511B;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -1054,6 +1052,111 @@ fn desktop_insert_after(host: HWND) -> Option<HWND> {
     }
 }
 
+/// 栅栏窗口类名("DeskFenceFence",14 字符)——供无锁判定自家栅栏。
+const FENCE_CLASS: [u16; 14] = [
+    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65, 0x6E, 0x63, 0x65,
+];
+
+/// 无锁判定自家栅栏窗口:band_attach_anchor 在窗口过程/持锁的走查修复里
+/// 直接调用,不能取状态锁;辅助窗(菜单宿主/托盘)类名不同,不会误判。
+fn is_own_fence_window(w: HWND) -> bool {
+    let mut cls_buf = [0u16; 16];
+    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+    n as usize == FENCE_CLASS.len() && cls_buf[..FENCE_CLASS.len()] == FENCE_CLASS
+}
+
+fn is_topmost_window(w: HWND) -> bool {
+    // WS_EX_TOPMOST = 0x8
+    (unsafe { GetWindowLongW(w, GWL_EXSTYLE) } & 0x8) != 0
+}
+
+/// 带内就位锚点(2026-08-29 修"菜单后点桌面闪屏"根因,勿回退):返回栅栏
+/// 应插到"其正下方"的窗口。旧实现=宿主正上方(带底,z 序 1-5 步)——那是
+/// 菜单开合/IME/辅助窗的底层扰动区:zwatch 60ms 实测(12:33:31.469),
+/// 菜单关闭时系统把菜单宿主连同其 z 邻居(=紧贴带底的栅栏簇)整帧静默
+/// 沉到宿主之下(不发 CHANGING/CHANGED,否决无从下手),高速自检再整链
+/// 拉回=栅栏消失 0.1-0.8s=菜单后点空白的轻微闪。日志指纹:track
+/// dismissed 后紧跟 5 条 re-anchored。规则(分两档):
+/// 主规则(所有调用方):从宿主向上按走查同源容忍集(隐形/辅助/自家栅栏/
+/// topmost 全跳过)找到第一个"可见且非 topmost 的外来窗"L,锚定 L 正下方。
+/// 应用态 L=最低可见应用窗(~380 层深位,数百层垃圾与带底扰动区绝缘)。
+/// topmost 跳过的原因:带内大量 topmost 风格隐形翻转垃圾(Outlook ATL/
+/// tooltip、SPES ScW),活跃瞬间冒充最低可见窗;曾试"以 topmost 为界下探
+/// 到非 topmost 窗",终点是不受过滤保护的 MSCTFIME UI(IME 翻转窗),
+/// 锚它=留在扰动区(第一版实踩,下探已删)。
+/// 深位回退(仅晋升路径 deep=true,显示桌面态):主规则找不到 L 时,锚定
+/// "最低的可见或 topmost 外来窗"正下方(本机显示态=ScW 钩子层群底部,
+/// ~30 步)——低于一切可见窗=不浮窗,且隔 20+ 层隐形垃圾离开菜单宿主的
+/// 停泊扰动区。只在晋升(1s 走查节拍、状态已稳定)启用,不在快速
+/// re-anchor/创建/修复路径用:过渡期窗口可见性闪烁瞬间误判会把栅栏锚到
+/// topmost 群之下=浮到应用窗上(应用态 ScW 在 ~440 层,高于 Chrome)。
+/// 最后回退:健康兄弟栅栏正下方(归队)→宿主正上方(旧行为)。锚点绝不
+/// 能是宿主本身(会把栅栏放到壁纸后面)或 HWND_TOP(会浮顶)。
+fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<HWND> {
+    let vs = virtual_screen_rect();
+    let menu_host = MENU_HOST_HWND.get().copied();
+    let tray = TRAY_HWND.get().copied();
+    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    for _ in 0..1000 {
+        if w.0 == 0 {
+            break;
+        }
+        if w == skip
+            || is_own_fence_window(w)
+            || is_topmost_window(w)
+            || band_invisible(w, &vs)
+            || band_aux(w, menu_host, tray)
+        {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        return Some(w);
+    }
+    // 深位回退(deep=true):主规则无"可见且非 topmost"外来窗时,锚到"最低
+    // 可见或 topmost 外来窗"之下、紧贴它的最高**非 topmost 隐形**外来窗。
+    // 锚必须自身非 topmost:插到 topmost 窗正下方会把栅栏并入 topmost band
+    // (2026-08-29 实测 5 栅栏全变 topmost=True;且 SetWindowLongW 清不掉
+    // 该位,HWND_NOTOPMOST 又会把窗口移到非 topmost 带顶部=位置不可控,
+    // 此路不通,勿再试)。无可垫垃圾则继续兄弟归队/带底。
+    if deep {
+        let mut best: Option<HWND> = None;
+        let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+        for _ in 0..1000 {
+            if w.0 == 0 {
+                break;
+            }
+            if w == skip || is_own_fence_window(w) || band_aux(w, menu_host, tray) {
+                w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                continue;
+            }
+            if band_invisible(w, &vs) {
+                if !is_topmost_window(w) {
+                    best = Some(w);
+                }
+                w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                continue;
+            }
+            break; // 首个可见外来窗(含 topmost)到顶
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    // 走完预算仍无可用外来窗:优先归队到带内最低的兄弟栅栏之下,保持
+    // 集群;没有兄弟才回退带底。
+    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    for _ in 0..1000 {
+        if w.0 == 0 {
+            break;
+        }
+        if w != skip && is_own_fence_window(w) {
+            return Some(w);
+        }
+        w = unsafe { GetWindow(w, GW_HWNDPREV) };
+    }
+    desktop_insert_after(host)
+}
+
 // ---------------- 窗口生命周期 ----------------
 
 /// 当前鼠标屏幕坐标（拖动位移必须用屏幕坐标，
@@ -1126,11 +1229,13 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, fence_id as isize);
         ole::register_drop_target(hwnd, fence_id);
-        // 就位目标:宿主正上方(底带)。取不到锚点时不动 z——初始位置由
-        // 全局 tick 的自愈在宿主就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
-        let insert_after = match host.map(|h| desktop_insert_after(h.hwnd)).flatten() {
+        // 就位目标:最低可见外来窗正下方(带内绝缘位,见 band_attach_anchor;
+        // 勿回退到"宿主正上方"——带底是菜单开合的扰动区,2026-08-29 闪屏
+        // 根因)。取不到锚点时不动 z——初始位置由全局 tick 的自愈在宿主
+        // 就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
+        let insert_after = match host.map(|h| band_attach_anchor(h.hwnd, HWND(0), false)).flatten() {
             Some(a) => Some(a),
-            None => desktop_shell_window().and_then(|s| desktop_insert_after(s)),
+            None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), false)),
         };
         let mut attached = false;
         if let Some(after) = insert_after {
@@ -2894,6 +2999,19 @@ const EDGEUI_CLASS: [u16; 22] = [
     0x6E, 0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
 ];
 
+/// IME 候选/状态窗("MSCTFIME UI")与其线程宿主("Default IME")。2026-08-29
+/// 实测:MSCTFIME UI 的可见性/矩形随输入焦点振荡(空闲时 0x0 矩形隐藏,
+/// 活跃瞬间在带内"live"),稳稳钉在宿主正上方几层——若当可见外来窗处理,
+/// band_attach_anchor 的锚点会被它钉死在带底 churn 区(Win+D 后栅栏永远
+/// 晋升不出去=菜单关闭闪屏不愈);它零像素/瞬态,不可能视觉遮挡桌面内容,
+/// 与 EdgeUi 输入条同类,按 band 原生系统窗容忍。
+const MSCTFIME_CLASS: [u16; 11] = [
+    0x4D, 0x53, 0x43, 0x54, 0x46, 0x49, 0x4D, 0x45, 0x20, 0x55, 0x49,
+]; // "MSCTFIME UI"
+const DEFAULT_IME_CLASS: [u16; 11] = [
+    0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
+]; // "Default IME"
+
 /// band 走查的"不可见"判据:隐藏/最小化/离屏/退化尺寸(≤2px,GDI+ 钩子与
 /// 锁屏残留 CoreWindow 常以 1x1@0,0 插队,实际遮不住)/cloaked(visible
 /// 位有效但 DWM 不合成)。
@@ -2923,6 +3041,8 @@ fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
     (n == 6 && cls_buf[..6] == MENU_CLASS)
         || (n == 13 && cls_buf[..13] == TRAY_CLASS)
         || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
+        || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
+        || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
 }
 
 fn ensure_all_attached() {
@@ -2992,9 +3112,20 @@ fn ensure_all_attached() {
                 s.attached.insert(id);
                 continue;
             }
+            // 显示桌面态 topmost 免疫:免疫栅栏(topmost 化)天然健康,
+            // 走查不得把它"修复"回带内(否则与免疫模式互殴)。
+            if SHOWN_TOPMOST.load(Ordering::Relaxed) && is_topmost_window(h) {
+                s.walk_strikes.remove(&id);
+                s.walk_strike_ms.remove(&id);
+                s.last_healthy_ms.insert(id, resize_now_ms());
+                s.attached.insert(id);
+                continue;
+            }
             let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
                 continue;
             };
+            // 提前拷出:健康分支后半段有对 s 的可变借用(MutexGuard 不能字段分裂)
+            let fence_hidden = fence.hidden;
             let Some(host) = host_for_rect(&fence.rect, &hosts) else {
                 continue; // 无宿主:不动窗口,保持原 z 位
             };
@@ -3149,10 +3280,165 @@ fn ensure_all_attached() {
                     }
                     log(&format!("walk: fence {id} was iconic, restored"));
                 }
-                // 注意:此处不做"粘底"(归位到宿主正上方)。紧贴宿主=站在
-                // 菜单开合的底层扰动区,每次托盘/倒三角菜单关闭的系统静默
-                // 重排都会把栅栏沉到宿主之下再被拉回=可见闪屏(2026-08-28
-                // 实测);深漂移在垃圾层之上反而是历史验证过的安全位置。
+                // 注意:此处健康栅栏不做任何"粘底"重申(深漂移是安全位)。
+                // 出带修复的落点在上方 repair 分支:band_attach_anchor=
+                // 最低可见外来窗正下方(2026-08-29),同样不做带底粘底。
+                //
+                // churn 区晋升(2026-08-29,勿回退):显示桌面(Win+D)后,
+                // 高速拉回只能锚到过渡瞬间的中途态窗口(沉底扫动未完成时
+                // 某个仍 live 的窗,两秒后它自己隐掉),栅栏常被留在宿主
+                // 正上方 1-10 层=菜单开合/IME/辅助窗静默沉底的扰动区
+                // ("菜单关闭后点桌面空白闪屏"的根因)。应用态无需晋升
+                // (恢复扫动会把栅栏一路托到最低应用窗之下);显示态无人
+                // 托底,由走查在健康后一次性晋升到 band_attach_anchor 的
+                // 绝缘位。仅当仍在 churn 区(≤12 层)且目标位显著更高
+                // (滞后 6 层防边界抖动;曾用 20——会把"从带底送入 parked 应用
+                // 窗之下十几层"的机会挡掉,2026-08-29 12:22:58 实测)才动——
+                // 深位健康栅栏绝不重排
+                // (重排本身=重合成闪)。
+                if !fence_hidden {
+                    let mut in_churn = false;
+                    let mut depth = 0usize;
+                    {
+                        let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                        for _ in 0..12 {
+                            if w.0 == 0 {
+                                break;
+                            }
+                            if w == h {
+                                in_churn = true;
+                                break;
+                            }
+                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                            depth += 1;
+                        }
+                    }
+                    if in_churn {
+                        // 诊断(限频 30s,显示态常驻带底会持续命中):晋升未
+                        // 发生时把判定中间量留在日志里
+                        static LAST_PROMOTE_DIAG: AtomicU64 = AtomicU64::new(0);
+                        let now_ms = resize_now_ms();
+                        let diag =
+                            now_ms.saturating_sub(LAST_PROMOTE_DIAG.load(Ordering::Relaxed)) > 30000;
+                        if diag {
+                            LAST_PROMOTE_DIAG.store(now_ms, Ordering::Relaxed);
+                        }
+                        if let Some(a) = band_attach_anchor(host.hwnd, h, true) {
+                            if a != h {
+                                let mut d2 = 0usize;
+                                let mut target_far = false;
+                                let mut w2 = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                                for _ in 0..1000 {
+                                    if w2.0 == 0 {
+                                        break;
+                                    }
+                                    if w2 == a {
+                                        // 双重门:目标比当前深(滞后防抖)且目标
+                                        // 自身已脱离 churn 区(>12 层)。后者防
+                                        // "锚点在底部簇内穿插"的自循环——每次
+                                        // 晋升都还在 churn 区里,下个 tick 又升
+                                        // =每秒一次 z 移动的振荡(2026-08-29
+                                        // 12:48 实测 promote 风暴)。
+                                        target_far = d2 + 1 > depth + 6 && d2 + 1 > 12;
+                                        break;
+                                    }
+                                    w2 = unsafe { GetWindow(w2, GW_HWNDPREV) };
+                                    d2 += 1;
+                                }
+                                if diag {
+                                    let mut cb = [0u16; 32];
+                                    let cn = unsafe { GetClassNameW(a, &mut cb) };
+                                    log(&format!(
+                                        "promote-diag: fence {id} depth={} anchor=0x{:x} cls={}(n={}) inv={} aux={} target_depth={} far={}",
+                                        depth + 1,
+                                        a.0,
+                                        String::from_utf16_lossy(&cb[..cn.max(0) as usize]),
+                                        cn,
+                                        band_invisible(a, &vs),
+                                        band_aux(a, host1, trayw),
+                                        d2 + 1,
+                                        target_far
+                                    ));
+                                }
+                                if target_far {
+                                    // 锚点邻域重试:SPES ScW 等高完整性窗作锚报
+                                    // 0x80070005,且 ScW 群 8 层连坐,沿链换 3 个
+                                    // 穿不过去(2026-08-29 实测 promote-diag:
+                                    // SetWindowPos failed on all anchors)。改为
+                                    // 从期望锚点向下(更深入绝缘区)/向上各探
+                                    // ±8 层找第一个可作锚的窗口——该区间由
+                                    // resolver 构造保证全是隐形/辅助/自家窗,
+                                    // 位置偏差不影响绝缘语义。
+                                    let mut moved = false;
+                                    let mut shift_used = 0i32;
+                                    for delta in [
+                                        0i32, -1, -2, -3, -4, 1, 2, 3, 4, -5, -6, -7, -8, 5, 6,
+                                        7, 8,
+                                    ] {
+                                        let mut cur = a;
+                                        let mut ok = true;
+                                        for _ in 0..delta.unsigned_abs() {
+                                            let next = unsafe {
+                                                GetWindow(
+                                                    cur,
+                                                    if delta < 0 {
+                                                        GW_HWNDNEXT
+                                                    } else {
+                                                        GW_HWNDPREV
+                                                    },
+                                                )
+                                            };
+                                            if next.0 == 0 || next == host.hwnd || next == h {
+                                                ok = false;
+                                                break;
+                                            }
+                                            cur = next;
+                                        }
+                                        if !ok || cur == h || is_topmost_window(cur) {
+                                            continue;
+                                        }
+                                        let _z = z_scope(ZIntent::Repair);
+                                        let ok2 = unsafe {
+                                            SetWindowPos(
+                                                h,
+                                                cur,
+                                                0,
+                                                0,
+                                                0,
+                                                0,
+                                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                            )
+                                            .is_ok()
+                                        };
+                                        if ok2 {
+                                            moved = true;
+                                            shift_used = delta;
+                                            break;
+                                        }
+                                    }
+                                    if moved {
+                                        if shift_used != 0 {
+                                            log(&format!(
+                                                "promote fence {id} anchor shifted {shift_used}"
+                                            ));
+                                        }
+                                        log(&format!(
+                                            "z-guard: fence {id} promoted out of churn zone (depth {} -> below 0x{:x})",
+                                            depth + 1,
+                                            a.0
+                                        ));
+                                    } else if diag {
+                                        log("promote-diag: SetWindowPos failed on all anchors");
+                                    }
+                                }
+                            } else if diag {
+                                log(&format!("promote-diag: fence {id} anchor==self",));
+                            }
+                        } else if diag {
+                            log("promote-diag: no anchor resolved");
+                        }
+                    }
+                }
             }
         }
         if !to_move.is_empty() {
@@ -3172,7 +3458,7 @@ fn ensure_all_attached() {
                 let _z = z_scope(ZIntent::Repair);
                 let mut attached = false;
                 let mut first_err = None;
-                let mut anchor = desktop_insert_after(host.hwnd);
+                let mut anchor = band_attach_anchor(host.hwnd, h, false);
                 let mut tried = 0;
                 while let Some(after) = anchor {
                     if tried >= 3 {
@@ -3267,6 +3553,8 @@ fn ensure_all_attached() {
     for id in created {
         refresh_fence(id);
     }
+    // 显示桌面态 topmost 免疫管理(锁已释放,见 shown_topmost_tick)
+    shown_topmost_tick();
 }
 
 // ---------------- 托盘图标 ----------------
@@ -3513,6 +3801,7 @@ pub fn env_health_report() -> (bool, String) {
 }
 
 /// 托盘动作:弹出环境体检报告。
+#[allow(dead_code)] // 手动入口已按用户要求移出托盘菜单,保留函数作文档
 fn env_health_dialog() {
     let (ok, report) = env_health_report();
     let title = if ok {
@@ -3536,6 +3825,7 @@ fn env_health_dialog() {
 /// 托盘动作:修复桌面环境——重启 Explorer 重建桌面层(垃圾层/钩子层/
 /// 僵尸托盘全部清零),本程序靠 TaskbarCreated 路径自动重挂栅栏与托盘。
 /// 在后台线程执行,避免阻塞 UI。
+#[allow(dead_code)]
 fn env_repair() {
     let t = shell::wide("DeskFence 修复桌面环境");
     let m = shell::wide(
@@ -4027,8 +4317,8 @@ fn show_tray_menu(x: i32, y: i32) {
         shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     }
     shell::append_menu(menu, MENU_HELP, "使用说明");
-    shell::append_menu(menu, MENU_ENV_CHECK, "桌面环境体检");
-    shell::append_menu(menu, MENU_ENV_REPAIR, "修复桌面环境...");
+    // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
+    // 手动入口(用户要求,2026-08-29)。
     if shell::get_autostart() {
         shell::append_menu_checked(menu, MENU_AUTOSTART, "开机自启");
     } else {
@@ -4073,8 +4363,6 @@ fn dispatch_tray_command(id: u32) {
         MENU_RENDER_PRECISE => set_render_mode("precise"),
         MENU_AUTO_CATEGORY => toggle_auto_category(),
         MENU_HELP => show_help(),
-        MENU_ENV_CHECK => env_health_dialog(),
-        MENU_ENV_REPAIR => env_repair(),
         MENU_AUTOSTART => toggle_autostart(),
         MENU_QUIT => quit_app(),
         _ => log(&format!("unknown tray command: {}", id)),
@@ -5116,6 +5404,141 @@ fn set_all_hidden(hidden: bool) {
     }
 }
 
+// ---------------- 显示桌面态 topmost 免疫(2026-08-29 终修,勿回退) ----------------
+// 机制:ToggleDesktop/三指把栅栏纳入"停泊批"(静默沉底,无法否决),此后
+// 每次菜单关闭系统都把批内成员重新停泊=栅栏被拖下再拉回=菜单后点空白
+// 闪屏(60ms zwatch 实测:沉底块=栅栏簇+菜单宿主,parked 窗不被波及)。
+// 逐个最小化回桌面的路径不碰停泊批→栅栏不动→不闪(用户 Case B 实测)。
+// topmost 窗口不参与停泊(SPW ScW 钩子层与隐形垃圾丛林在每次切换中
+// 纹丝不动)→显示桌面态(无任何可见非 topmost 外来窗=应用全部停泊/
+// 最小化)给栅栏上 HWND_TOPMOST 获得同款豁免;出现可见应用窗(回应用)
+// 立即 HWND_NOTOPMOST,由既有走查/下压机制送回最低应用窗之下的深位。
+/// 免疫模式当前是否生效
+static SHOWN_TOPMOST: AtomicBool = AtomicBool::new(false);
+/// 显示桌面态连续稳定拍数(防过渡期抖动)
+static SHOWN_STABLE: AtomicU32 = AtomicU32::new(0);
+/// 沉底检测时记录的"待激活免疫"时间戳(0=无)。快速通道不在沉底瞬间
+/// 立即上 topmost——那时应用缩小动画还在播,topmost 栅栏会渲染在动画
+/// 之上=用户看到"栅栏比桌面先冒出来"(2026-08-29 用户实测);改为等
+/// 450ms(动画播完,而人手点开+关闭菜单至少要 1s)后由 zcheck 批量
+/// 一次性激活,五个栅栏同帧同现(逐栅栏激活会出现"一个比其他慢很多")。
+static SHOWN_PENDING_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 全带是否存在"可见且非 topmost 的外来窗"(=有可见应用窗)。
+/// 与 band_attach_anchor 主规则同源判定。
+fn band_has_live_foreign() -> bool {
+    let Some(host) = desktop_shell_window() else {
+        return true; // 宿主未知时保守视为有(不开免疫)
+    };
+    let vs = virtual_screen_rect();
+    let mh = MENU_HOST_HWND.get().copied();
+    let tr = TRAY_HWND.get().copied();
+    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    for _ in 0..1000 {
+        if w.0 == 0 {
+            break;
+        }
+        if is_own_fence_window(w)
+            || is_topmost_window(w)
+            || band_aux(w, mh, tr)
+            || band_invisible(w, &vs)
+        {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// 免疫模式切换:SetWindowPos(HWND_TOPMOST/NOTOPMOST) 是唯一可靠的
+/// topmost 位操作方式(SetWindowLongW 改不动,实测)。
+fn fence_apply_shown_topmost(on: bool) -> usize {
+    let hwnds: Vec<HWND> = state()
+        .lock()
+        .unwrap()
+        .windows
+        .values()
+        .copied()
+        .collect();
+    let mut n = 0usize;
+    for h in hwnds {
+        if !on && !is_topmost_window(h) {
+            continue; // 摘除模式:只动真正 topmost 的(避免把已归位栅栏再抬高)
+        }
+        let after = if on {
+            HWND_TOPMOST
+        } else {
+            // 摘除=直接重归位到最低可见外来窗之下。HWND_NOTOPMOST 会先把
+            // 栅栏抬到非 topmost 带顶部=浮在应用窗上再等人压(用户实测
+            // "回应用偶现栅栏浮在应用上"的根源),只留作锚解析失败的兜底。
+            match desktop_shell_window().and_then(|host| band_attach_anchor(host, h, false)) {
+                Some(a) if a != h => a,
+                _ => HWND_NOTOPMOST,
+            }
+        };
+        let _z = z_scope(ZIntent::Repair);
+        let ok = unsafe {
+            SetWindowPos(
+                h,
+                after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        }
+        .is_ok();
+        if ok {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 每秒走查末尾驱动的免疫模式管理:进入需"无可见应用窗"稳定 2 拍,
+/// 退出(出现可见应用窗)立即。切换本身在上一拍的过渡动画之后——
+/// 首次进入的 TOPMOST 跳变若可感知,再前移到 reanchor 路径(待用户实测)。
+fn shown_topmost_tick() {
+    if !z_guard_setting() || desktop_state() != "normal" {
+        if SHOWN_TOPMOST.swap(false, Ordering::Relaxed) {
+            let _ = fence_apply_shown_topmost(false);
+            log("shown-topmost: mode off (guard/state)");
+        }
+        return;
+    }
+    let shown = !band_has_live_foreign();
+    let prev = SHOWN_TOPMOST.load(Ordering::Relaxed);
+    if shown {
+        let s = SHOWN_STABLE.fetch_add(1, Ordering::Relaxed) + 1;
+        if !prev && s >= 2 {
+            // 栅栏全部隐藏(zen 瞬态)时不切
+            let any_visible = {
+                let st = state().lock().unwrap();
+                st.fences.iter().any(|f| !f.hidden)
+            };
+            if any_visible {
+                let n = fence_apply_shown_topmost(true);
+                SHOWN_TOPMOST.store(true, Ordering::Relaxed);
+                SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
+                log(&format!("shown-topmost: mode ON ({n} fences immune)"));
+            }
+        }
+    } else {
+        SHOWN_STABLE.store(0, Ordering::Relaxed);
+        if prev {
+            let n = fence_apply_shown_topmost(false);
+            SHOWN_TOPMOST.store(false, Ordering::Relaxed);
+            log(&format!("shown-topmost: mode OFF ({n} fences back to band)"));
+            // 立即触发高速自检:把摘除后高位悬浮的栅栏下压到最低可见
+            // 应用窗之下(发生在恢复扫动动画内=被遮蔽;勿改为递归调用
+            // ensure_all_attached——走查不可重入)。
+            zcheck_fences_now();
+        }
+    }
+}
+
 // ---------------- 重命名 ----------------
 
 static RENAME_OLD_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
@@ -5180,7 +5603,16 @@ fn fence_reanchor_if_below_host(hwnd: HWND) {
             return; // 到顶未遇宿主:窗口在宿主上方,无需处理
         }
         if w == shell {
-            let Some(after) = desktop_insert_after(shell) else { return };
+            // 显示桌面态快速免疫(2026-08-29):沉底时若已无可见应用窗,
+            // 记录待激活时间戳,由 zcheck 在 450ms 后批量上 topmost
+            // (勿在此立即上——应用缩小动画还在播,栅栏会渲染在动画之上
+            // ="栅栏比桌面先出来";误判由 zcheck 的可见窗检查自纠)。
+            if z_guard_setting() && desktop_state() == "normal" && !band_has_live_foreign() {
+                SHOWN_PENDING_MS.store(resize_now_ms(), Ordering::Relaxed);
+            }
+            // 锚点=最低可见外来窗正下方(带内绝缘位,2026-08-29;带底=菜单
+            // 关闭静默沉底的扰动区,勿回退,详见 band_attach_anchor)。
+            let Some(after) = band_attach_anchor(shell, hwnd, false) else { return };
             let _z = z_scope(ZIntent::Repair);
             let _ = unsafe {
                 SetWindowPos(
@@ -5193,7 +5625,10 @@ fn fence_reanchor_if_below_host(hwnd: HWND) {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 )
             };
-            log("z-guard: fence re-anchored above host after external move");
+            log(&format!(
+                "z-guard: fence re-anchored above host after external move (after=0x{:x})",
+                after.0
+            ));
             return;
         }
         w = unsafe { GetWindow(w, GW_HWNDPREV) };
@@ -5278,6 +5713,30 @@ static LOWER_RATE_MS: u64 = 600;
 static LAST_LOWER_MS: AtomicU64 = AtomicU64::new(0);
 
 fn zcheck_fences_now() {
+    // 待激活免疫结算(2026-08-29):沉底后 450ms(应用缩小动画播完,而
+    // 人手开+关菜单至少 1s)仍无可见应用窗 → 批量一次性上 topmost,
+    // 五个栅栏同帧同现;期间出现可见应用窗则取消(误判自纠)。
+    let pend = SHOWN_PENDING_MS.load(Ordering::Relaxed);
+    if pend != 0 {
+        if band_has_live_foreign() || SHOWN_TOPMOST.load(Ordering::Relaxed) {
+            SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
+        } else if resize_now_ms().saturating_sub(pend) > 450 {
+            SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
+            let n = fence_apply_shown_topmost(true);
+            SHOWN_TOPMOST.store(true, Ordering::Relaxed);
+            SHOWN_STABLE.store(2, Ordering::Relaxed);
+            log(&format!("shown-topmost: mode ON ({n} fences immune)"));
+        }
+    }
+    // 免疫模式快速退出(2026-08-29):恢复扫动的第一批 WinEvent 到达时
+    // (毫秒级,被扫动动画遮蔽),topmost 栅栏还浮在上升的应用窗上——
+    // 立即摘除+重归位,不等 1s 走查(用户实测"回应用偶现浮窗"的主潜伏期)。
+    if SHOWN_TOPMOST.load(Ordering::Relaxed) && band_has_live_foreign() {
+        let n = fence_apply_shown_topmost(false);
+        SHOWN_TOPMOST.store(false, Ordering::Relaxed);
+        SHOWN_STABLE.store(0, Ordering::Relaxed);
+        log(&format!("shown-topmost: fast OFF ({n} reseated)"));
+    }
     let (hwnds, menu_host, tray) = {
         let s = state().lock().unwrap();
         (
@@ -5293,9 +5752,12 @@ fn zcheck_fences_now() {
     let last = LAST_LOWER_MS.load(Ordering::Relaxed);
     let may_lower = last == 0 || now.saturating_sub(last) >= LOWER_RATE_MS;
     let mut acted = false;
+    // 免疫模式下不下压:停泊 live 窗迟到出现时把 topmost 栅栏拖下去会
+    // 掉出免疫→模式抖动;1s 内走查会让位给模式退出+重归位。
+    let shown_mode = SHOWN_TOPMOST.load(Ordering::Relaxed);
     for h in hwnds {
         fence_reanchor_if_below_host(h);
-        if may_lower && fence_lower_if_blocked(h, &menu_host, &tray) {
+        if !shown_mode && may_lower && fence_lower_if_blocked(h, &menu_host, &tray) {
             acted = true;
         }
     }
@@ -8180,9 +8642,10 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         unsafe {
             let _ = ReleaseCapture();
         }
-        // 拖拽期间被拖栅栏被提升到兄弟栅栏之上(仅 band 内);拖拽结束立即归位
-        // 底带(宿主正上方)。若等自愈兜底,栅栏会在其他窗口上方漂移=用户看到的
-        // "栅栏浮在别的窗口上方"。
+        // 拖拽期间被拖栅栏被提升到兄弟栅栏之上(仅 band 内);拖拽结束立即
+        // 归位带内绝缘位(最低可见外来窗正下方,与整链同位;勿回退到宿主
+        // 正上方——带底扰动区)。若等自愈兜底,栅栏会在其他窗口上方漂移=
+        // 用户看到的"栅栏浮在别的窗口上方"。
         {
             let s = state().lock().unwrap();
             let hosts = desktop_hosts();
@@ -8192,7 +8655,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             if let Some((hidden, rect)) = target {
                 if !hidden {
                     if let Some(host) = host_for_rect(&rect, &hosts) {
-                        if let Some(after) = desktop_insert_after(host.hwnd) {
+                        if let Some(after) = band_attach_anchor(host.hwnd, HWND(0), false) {
                             if let Some(fh) = s.windows.get(&fence_id) {
                                 let _z = z_scope(ZIntent::Drag);
                                 unsafe {
