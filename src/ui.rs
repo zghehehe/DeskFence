@@ -1044,12 +1044,19 @@ fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
 /// 栅栏顶到整个 z 栈顶端(2026-08-27 实测三个栅栏被顶到宿主之上 215 层,
 /// 即用户看到的"栅栏浮在别的窗口上方")。
 fn desktop_insert_after(host: HWND) -> Option<HWND> {
-    let above = unsafe { GetWindow(host, GW_HWNDPREV) };
-    if above.0 == 0 {
-        None
-    } else {
-        Some(above)
+    // 宿主正上方第一个**非坏锚**窗口(UIPI 拒锚窗口做了锚,插入必败;
+    // 2026-08-31 WeLink elevated 实测)。坏锚在带底紧贴宿主时沿链向上跳过。
+    let mut above = unsafe { GetWindow(host, GW_HWNDPREV) };
+    for _ in 0..32 {
+        if above.0 == 0 {
+            return None;
+        }
+        if !bad_anchor_recent(above) {
+            return Some(above);
+        }
+        above = unsafe { GetWindow(above, GW_HWNDPREV) };
     }
+    None
 }
 
 /// 栅栏窗口类名("DeskFenceFence",14 字符)——供无锁判定自家栅栏。
@@ -1068,6 +1075,37 @@ fn is_own_fence_window(w: HWND) -> bool {
 fn is_topmost_window(w: HWND) -> bool {
     // WS_EX_TOPMOST = 0x8
     (unsafe { GetWindowLongW(w, GWL_EXSTYLE) } & 0x8) != 0
+}
+
+// ---------------- UIPI 坏锚缓存(2026-08-31) ----------------
+// 以高完整性(elevated)进程的窗口为 hWndInsertAfter 会被 UIPI 拒绝
+// (0x80070005)。实测案例:WeLinkMeeting 以管理员运行,其会议窗参与
+// 桌面切换停泊批落到带内低位后,band_attach_anchor 主规则解析出的
+// "最低可见外来窗"正是它 → 5 个栅栏的 repair/下压/re-anchor 全部
+// 被拒 → 栅栏持续浮在会议窗上方(浮窗),8s 健康宽限过期后 reconcile
+// 放出原生图标(图标重合)。被拒过的 hwnd 缓存一段时间,锚解析绕开;
+// 成功插入即清除。TTL 兜底句柄复用风险。
+const BAD_ANCHOR_TTL_MS: u64 = 60_000;
+static BAD_ANCHORS: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
+
+fn bad_anchor_mark(h: HWND) {
+    let now = resize_now_ms();
+    let mut g = BAD_ANCHORS.lock().unwrap();
+    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
+    g.push((h.0, now));
+}
+
+fn bad_anchor_clear(h: HWND) {
+    let now = resize_now_ms();
+    let mut g = BAD_ANCHORS.lock().unwrap();
+    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
+}
+
+fn bad_anchor_recent(h: HWND) -> bool {
+    let now = resize_now_ms();
+    let g = BAD_ANCHORS.lock().unwrap();
+    g.iter()
+        .any(|(k, t)| *k == h.0 && now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS)
 }
 
 /// 带内就位锚点(2026-08-29 修"菜单后点桌面闪屏"根因,勿回退):返回栅栏
@@ -1092,6 +1130,9 @@ fn is_topmost_window(w: HWND) -> bool {
 /// topmost 群之下=浮到应用窗上(应用态 ScW 在 ~440 层,高于 Chrome)。
 /// 最后回退:健康兄弟栅栏正下方(归队)→宿主正上方(旧行为)。锚点绝不
 /// 能是宿主本身(会把栅栏放到壁纸后面)或 HWND_TOP(会浮顶)。
+/// UIPI 坏锚降级(2026-08-31):主规则候选若在坏锚缓存(被 0x80070005
+/// 拒过,elevated 进程窗口)→改插它 GW_HWNDNEXT 下方窗口之下=栅栏落到
+/// 坏锚之下,绝不遮挡;下方无可垫窗才走兄弟归队/带底。
 fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<HWND> {
     let vs = virtual_screen_rect();
     let menu_host = MENU_HOST_HWND.get().copied();
@@ -1109,6 +1150,29 @@ fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<HWND> {
         {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
             continue;
+        }
+        // UIPI 坏锚(如 elevated 会议窗)不能插其下方:改插它 GW_HWNDNEXT
+        // 方向(更低)的窗口之下,让栅栏落到坏锚之下=绝不遮挡它;沿下方找
+        // 可垫窗,全不可用才走兄弟归队/带底回退。绝不能"跳过继续向上"——
+        // 那样锚更浅,栅栏还是浮在坏锚上方(浮窗复现)。下方窗口必然非
+        // topmost(同一非 topmost 带内,坏锚下方不会再有 topmost)。
+        if bad_anchor_recent(w) {
+            let mut lower = unsafe { GetWindow(w, GW_HWNDNEXT) };
+            let mut tried = 0;
+            while lower.0 != 0 && tried < 8 {
+                // 排除宿主:锚宿主=栅栏沉到壁纸后面(勿回退)。
+                if lower != host
+                    && lower != skip
+                    && !is_topmost_window(lower)
+                    && !is_own_fence_window(lower)
+                    && !bad_anchor_recent(lower)
+                {
+                    return Some(lower);
+                }
+                lower = unsafe { GetWindow(lower, GW_HWNDNEXT) };
+                tried += 1;
+            }
+            break; // 坏锚下方无可垫窗:走兄弟归队/带底(栅栏在宿主正上方=坏锚之下)
         }
         return Some(w);
     }
@@ -3479,6 +3543,7 @@ fn ensure_all_attached() {
                     match attempt {
                         Ok(()) => {
                             attached = true;
+                            bad_anchor_clear(after);
                             if tried > 1 {
                                 log(&format!(
                                     "repair fence {id} succeeded on retry #{tried} (anchor 0x{:x})",
@@ -3488,6 +3553,9 @@ fn ensure_all_attached() {
                             break;
                         }
                         Err(e) => {
+                            // 记坏锚:锚解析(含降级路径)下一拍起绕开它,
+                            // 不再撞同一堵 UIPI 墙(WeLink elevated 实测)。
+                            bad_anchor_mark(after);
                             if first_err.is_none() {
                                 first_err = Some((after, e));
                             }
@@ -3756,36 +3824,45 @@ pub fn env_health_report() -> (bool, String) {
         ok = false;
         lines.push(format!("窗口: 检测到 {orphans} 个孤儿 DeskFence 窗口(建议\"修复桌面环境\")"));
     }
-    // 4) 栅栏在带内
-    let host = desktop_shell_window();
-    let in_band;
-    let total;
-    {
-        let s = state().lock().unwrap();
-        total = s.fences.iter().filter(|f| !f.hidden).count();
-        let mut good = 0usize;
-        if let Some(host) = host {
-            for h in s.windows.values() {
-                let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-                for _ in 0..600 {
-                    if w.0 == 0 {
-                        break;
+    // 4) 栅栏在带内(仅 normal 态判定)。zen/native 态栅栏有意全部隐藏,
+    // total=0 不能构成 fault——2026-08-31 教训:zen 态被此判定恒判 fault,
+    // env-watchdog 以 10 分钟限速反复重启 Explorer(一天 3 次),勿回退。
+    if desktop_state() == "normal" {
+        let host = desktop_shell_window();
+        let in_band;
+        let total;
+        {
+            let s = state().lock().unwrap();
+            total = s.fences.iter().filter(|f| !f.hidden).count();
+            let mut good = 0usize;
+            if let Some(host) = host {
+                for h in s.windows.values() {
+                    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+                    for _ in 0..600 {
+                        if w.0 == 0 {
+                            break;
+                        }
+                        if w == *h {
+                            good += 1;
+                            break;
+                        }
+                        w = unsafe { GetWindow(w, GW_HWNDPREV) };
                     }
-                    if w == *h {
-                        good += 1;
-                        break;
-                    }
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
                 }
             }
+            in_band = good;
         }
-        in_band = good;
-    }
-    if total > 0 && in_band == total {
-        lines.push(format!("栅栏: {in_band}/{total} 在桌面层内 ✓"));
+        if total > 0 && in_band == total {
+            lines.push(format!("栅栏: {in_band}/{total} 在桌面层内 ✓"));
+        } else {
+            ok = false;
+            lines.push(format!("栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"));
+        }
     } else {
-        ok = false;
-        lines.push(format!("栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"));
+        lines.push(format!(
+            "栅栏: 桌面态 {} 栅栏按状态隐藏 ✓",
+            desktop_state()
+        ));
     }
     // 5) 原生图标与接管状态一致性(仅提示,协调器每秒会修)
     if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
@@ -3950,49 +4027,50 @@ fn reconcile_desktop_icons() {
             model::save_icons_marker(std::process::id());
             log("desktop icons hidden after fence presentation verified");
         }
-    } else if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
-        if ZEN_MODE.load(Ordering::Relaxed) {
-            // 纯净态:主动维持图标隐藏。启动早期的隐藏可能被 Explorer 的
-            // 异步初始化重显(实测 boot 后 0.4s 隐藏、~1s 又被显示回来),
-            // 这里每秒只做"读可见性"的检查,失配才重新隐藏,平时零骚扰。
-            // 崩溃安全不受影响:接管标记仍在,下次启动会自动恢复原生图标。
-            let re_showing = desktop_listview()
-                .is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
-            if re_showing
-                && !NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed)
-                && set_desktop_icons_visible(false)
-            {
-                log("zen: re-hid native icons (Explorer re-showed them)");
-            }
-        } else {
-            // 保底恢复前的诊断快照:谁是"没就绪"的栅栏(可见性/宿主缺哪个),
-            // 防止误判断(如菜单收尾瞬态)误触发整桌回退。2026-08-27 排查
-            // "菜单后点空白→原生闪现 1-2s"专用。
-            {
-                let s = state().lock().unwrap();
-                let mut why: Vec<String> = Vec::new();
-                for f in s.fences.iter().filter(|f| !f.hidden) {
-                    let vis = s.windows.get(&f.id).is_some_and(|h| unsafe {
-                        IsWindowVisible(*h).as_bool()
-                    });
-                    if !(vis && s.presented.contains(&f.id)) {
-                        why.push(format!(
-                            "{}:vis={}pres={}",
-                            f.id,
-                            vis,
-                            s.presented.contains(&f.id)
-                        ));
-                    }
-                }
-                log(&format!(
-                    "icon-restore guard trip: {} unready [{}]",
-                    why.len(),
-                    why.join(",")
-                ));
-            }
-            let _ = restore_desktop_now();
-            log("desktop icons restored because fence presentation is unavailable");
+    } else if ZEN_MODE.load(Ordering::Relaxed) {
+        // 纯净态:主动维持图标隐藏。不依赖 DESKTOP_ICONS_HIDDEN 前提——
+        // TaskbarCreated 路径的 restore_desktop_now 会把标志清成 false,
+        // 若以标志为前提,清掉后 zen 的图标维持整条失效=纯净态破功
+        // (2026-08-31)。每秒只做"读可见性"的检查,失配才重新隐藏,
+        // 平时零骚扰。崩溃安全不受影响:接管标记仍在。
+        let re_showing = desktop_listview()
+            .is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
+        if re_showing
+            && !NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed)
+            && set_desktop_icons_visible(false)
+        {
+            DESKTOP_ICONS_HIDDEN.store(true, Ordering::Relaxed);
+            model::save_icons_marker(std::process::id());
+            log("zen: re-hid native icons (Explorer re-showed them)");
         }
+    } else if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
+        // 保底恢复前的诊断快照:谁是"没就绪"的栅栏(可见性/宿主缺哪个),
+        // 防止误判断(如菜单收尾瞬态)误触发整桌回退。2026-08-27 排查
+        // "菜单后点空白→原生闪现 1-2s"专用。
+        {
+            let s = state().lock().unwrap();
+            let mut why: Vec<String> = Vec::new();
+            for f in s.fences.iter().filter(|f| !f.hidden) {
+                let vis = s.windows.get(&f.id).is_some_and(|h| unsafe {
+                    IsWindowVisible(*h).as_bool()
+                });
+                if !(vis && s.presented.contains(&f.id)) {
+                    why.push(format!(
+                        "{}:vis={}pres={}",
+                        f.id,
+                        vis,
+                        s.presented.contains(&f.id)
+                    ));
+                }
+            }
+            log(&format!(
+                "icon-restore guard trip: {} unready [{}]",
+                why.len(),
+                why.join(",")
+            ));
+        }
+        let _ = restore_desktop_now();
+        log("desktop icons restored because fence presentation is unavailable");
     }
 }
 
@@ -4051,7 +4129,12 @@ unsafe extern "system" fn tray_wndproc(
         if msg == taskbar_created_msg() {
             // Explorer rebuilt its taskbar and desktop host. Keep the native desktop
             // visible while the fences are reattached, then re-add our tray icon.
-            let _ = restore_desktop_now();
+            // zen 态例外:纯净态不该放图标——放了会和 reconcile 的 zen 维持
+            // 对抗(2026-08-31 实测:watchdog 重启 Explorer 后图标闪现又被
+            // 藏回,反复拉锯)。zen 的图标隐藏由 reconcile 每秒维持兜底。
+            if desktop_state() != "zen" {
+                let _ = restore_desktop_now();
+            }
             add_tray_icon(hwnd);
             show_all_fences();
             return LRESULT(0);
@@ -5614,7 +5697,7 @@ fn fence_reanchor_if_below_host(hwnd: HWND) {
             // 关闭静默沉底的扰动区,勿回退,详见 band_attach_anchor)。
             let Some(after) = band_attach_anchor(shell, hwnd, false) else { return };
             let _z = z_scope(ZIntent::Repair);
-            let _ = unsafe {
+            let attempt = unsafe {
                 SetWindowPos(
                     hwnd,
                     after,
@@ -5625,6 +5708,15 @@ fn fence_reanchor_if_below_host(hwnd: HWND) {
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 )
             };
+            if let Err(e) = attempt {
+                bad_anchor_mark(after);
+                log(&format!(
+                    "z-guard: re-anchor FAILED after=0x{:x} err={e:?} (anchor blacklisted)",
+                    after.0
+                ));
+                return;
+            }
+            bad_anchor_clear(after);
             log(&format!(
                 "z-guard: fence re-anchored above host after external move (after=0x{:x})",
                 after.0
@@ -5786,10 +5878,17 @@ fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HW
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
             continue;
         }
+        // 坏锚(UIPI 拒锚,elevated 进程窗口):下压必败,跳过不试也不刷
+        // 日志;归位由走查 repair 经 band_attach_anchor 的降级锚完成。
+        if bad_anchor_recent(w) {
+            return false;
+        }
         let below = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
         if below != w {
             let _z = z_scope(ZIntent::Repair);
-            let _ = unsafe {
+            // 必须检查返回值:曾用 let _ = 丢弃,被 UIPI 拒时也打"lowered"
+            // 假成功日志+消耗限速额度,排查时无下手处(2026-08-31 教训)。
+            let attempt = unsafe {
                 SetWindowPos(
                     hwnd,
                     w,
@@ -5800,6 +5899,15 @@ fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HW
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
                 )
             };
+            if let Err(e) = attempt {
+                bad_anchor_mark(w);
+                log(&format!(
+                    "z-guard: fence lower FAILED below 0x{:x} err={e:?} (anchor blacklisted)",
+                    w.0
+                ));
+                return false;
+            }
+            bad_anchor_clear(w);
             log(&format!(
                 "z-guard: fence lowered below visible window 0x{:x} (desktop transition)",
                 w.0
