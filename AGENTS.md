@@ -237,11 +237,17 @@
      **不发布**：tools/、docs/、website/、AGENTS.md。构建资源已预编译
      （build.rs 直接链接 res，不再调 windres——改图标后本地手动重生成）。
      发布分支=孤儿分支 main（git plumbing 组装，不动工作树）：
-       export GIT_INDEX_FILE=$PWD/.git/pub-idx
-       git read-tree --empty
-       git add .cargo .github src resources assets/deskfence.ico Cargo.toml Cargo.lock build.rs DeskFence.rc app.manifest README.md LICENSE .gitignore
-       T=$(git write-tree); git commit-tree $T -p main -m sync | xargs git branch -f main
-       unset GIT_INDEX_FILE && rm -f .git/pub-idx
+     export GIT_INDEX_FILE=$PWD/.git/pub-idx
+     git read-tree --empty
+     git add .cargo .github src resources assets/deskfence.ico \
+       assets/deskfence-icon.svg docs/demo.svg \
+       Cargo.toml Cargo.lock build.rs DeskFence.rc app.manifest \
+       README.md LICENSE .gitignore
+     T=$(git write-tree); git commit-tree $T -p main -m sync | xargs git branch -f main
+     unset GIT_INDEX_FILE && rm -f .git/pub-idx
+     **组装后必须 `diff <(git ls-tree -r --name-only v0.1.0) <(git ls-tree -r --name-only main)`
+     核对文件清单**——2026-08-31 v0.1.1 按旧列表漏了 deskfence-icon.svg,README
+     图标 404,被迫重写 main 历史。新加 README 引用的文件时同步更新此列表。
      打 tag v* 推送后 Actions 自动 build+单文件校验+发 Release。
      crt-static 经 .cargo/config.toml 全局生效（exe 仅依赖系统库）。
      **官网**：website/index.html 是单文件官网（内联 SVG 动画、零依赖），
