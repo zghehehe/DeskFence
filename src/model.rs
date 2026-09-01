@@ -292,6 +292,139 @@ pub fn push_chain(rects: &mut [Rect], anchor: usize) {
     }
 }
 
+// ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
+
+/// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
+/// 带内按 x 升序。返回各带成员在输入中的下标,带序自上而下。
+/// 任意层数通用(三层/四层…只是多几个带)。
+pub fn rows_from_rects(rects: &[Rect]) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    order.sort_by(|&a, &b| {
+        (rects[a].y + rects[a].h * 0.5)
+            .partial_cmp(&(rects[b].y + rects[b].h * 0.5))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for idx in order {
+        let r = &rects[idx];
+        let start_new = match rows.last() {
+            Some(row) => {
+                let prev = &rects[row[0]];
+                let tol = 0.6 * prev.h.min(r.h).max(24.0);
+                (r.y + r.h * 0.5) - (prev.y + prev.h * 0.5) > tol
+            }
+            None => true,
+        };
+        if start_new {
+            rows.push(vec![idx]);
+        } else {
+            rows.last_mut().unwrap().push(idx);
+        }
+    }
+    for row in rows.iter_mut() {
+        row.sort_by(|&a, &b| {
+            rects[a]
+                .x
+                .partial_cmp(&rects[b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    rows
+}
+
+/// 中心所在行(行 y 中心最近)与行内槽位(中心左侧成员数,0..=行长度)。
+pub fn row_slot_of(rects: &[Rect], rows: &[Vec<usize>], center: (f32, f32)) -> (usize, usize) {
+    let mut best_row = 0usize;
+    let mut bd = f32::MAX;
+    for (ri, row) in rows.iter().enumerate() {
+        let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+            / row.len() as f32;
+        let d = (center.1 - mid).abs();
+        if d < bd {
+            bd = d;
+            best_row = ri;
+        }
+    }
+    let k = rows
+        .get(best_row)
+        .map(|row| {
+            row.iter()
+                .filter(|&&i| rects[i].x + rects[i].w * 0.5 < center.0)
+                .count()
+        })
+        .unwrap_or(0);
+    (best_row, k)
+}
+
+/// 中心 y 到最近行中心的距离(拖远=自由放置区的判定输入)。
+pub fn nearest_row_distance(rects: &[Rect], rows: &[Vec<usize>], y: f32) -> f32 {
+    rows.iter()
+        .map(|row| {
+            let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+                / row.len() as f32;
+            (y - mid).abs()
+        })
+        .fold(f32::MAX, f32::min)
+}
+
+/// 行内插入落位(纯几何)。rects 含被拖者(a_idx)。A 从所在行拔出插入
+/// target=(行,位):受影响的两行按"行锚点x + 各自宽度 + GAP"行内重排
+/// (锚点=该行原首成员的 x/y),行 y 取原顶;未涉及的行一个像素不动,
+/// 尺寸全部保持各自——结构性保证不重叠、不塌行、不乱桌。
+/// 返回(逐输入下标的新位置, A 的落点)。
+pub fn row_insert_layout(
+    rects: &[Rect],
+    a_idx: usize,
+    target: (usize, usize),
+) -> (Vec<(f32, f32)>, (f32, f32)) {
+    let rows = rows_from_rects(rects);
+    let mut out: Vec<(f32, f32)> = rects.iter().map(|r| (r.x, r.y)).collect();
+    let slot = |i: usize| (rects[i].x, rects[i].y);
+    let (hr, hj) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(ri, row)| row.iter().position(|&i| i == a_idx).map(|j| (ri, j)))
+        .unwrap_or((0, 0));
+    let (tr, tk) = target;
+    if (hr, hj) == (tr, tk) {
+        return (out, slot(a_idx));
+    }
+    let flow = |out: &mut Vec<(f32, f32)>, members: &[usize], x0: f32, y0: f32| {
+        let mut x = x0;
+        for &i in members {
+            out[i] = (x, y0);
+            x += rects[i].w + GAP;
+        }
+    };
+    if tr == hr {
+        let row = &rows[hr];
+        let mut order: Vec<usize> = row.clone();
+        order.remove(hj);
+        let k2 = (if tk > hj { tk - 1 } else { tk }).min(order.len());
+        let (ax, ay) = row
+            .iter()
+            .find(|&&i| i != a_idx)
+            .map(|&i| slot(i))
+            .unwrap_or(slot(a_idx));
+        order.insert(k2, a_idx);
+        flow(&mut out, &order, ax, ay);
+    } else {
+        let rest: Vec<usize> = rows[hr].iter().copied().filter(|&i| i != a_idx).collect();
+        if !rest.is_empty() {
+            let (ax, ay) = slot(rest[0]);
+            flow(&mut out, &rest, ax, ay);
+        }
+        let row_t = &rows[tr.min(rows.len() - 1)];
+        let mut order: Vec<usize> = row_t.clone();
+        let k2 = tk.min(order.len());
+        order.insert(k2, a_idx);
+        let (ax, ay) = slot(row_t[0]);
+        flow(&mut out, &order, ax, ay);
+    }
+    let land = out[a_idx];
+    (out, land)
+}
+
 /// 把栅栏组约束进工作区 [vx,vy,vw,vh]：
 /// 先整体平移回区内（保持相对位置），再逐个夹回；
 /// 不放大也不缩小尺寸，避免拖动时栅栏被越拖越小。
@@ -2893,5 +3026,159 @@ mod tests {
         assert!(la2.total_rows <= la2.rows);
         let h2 = hit_test(&f, &la2, 194.0, 60.0, 4);
         assert_ne!(h2, Hit::Scrollbar);
+    }
+
+    // ---------- 拖拽落位(2026-09-02 行内槽位模型) ----------
+
+    fn rr(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    /// 两行基准布局(7 成员,被拖者 A 固定 a_idx=6):
+    /// 上行 [M0(0,0,244) M1(256,0,244) M2(512,0,132)],
+    /// 下行 [M3(0,112,244) M4(256,112,132) M5(400,112,132)]
+    fn two_row_layout(a: Rect) -> Vec<Rect> {
+        vec![
+            rr(0.0, 0.0, 244.0, 100.0), // 0 M0
+            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
+            rr(512.0, 0.0, 132.0, 100.0), // 2 M2
+            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(256.0, 112.0, 132.0, 100.0), // 4 M4
+            rr(400.0, 112.0, 132.0, 100.0), // 5 M5
+            a,                          // 6 A(被拖者)
+        ]
+    }
+
+    fn assert_no_overlap(rects: &[Rect], pos: &[(f32, f32)]) {
+        // 用移动后的位置重新聚类,再逐行检查相邻成员无重叠
+        let moved: Vec<Rect> = rects
+            .iter()
+            .zip(pos)
+            .map(|(r, (x, y))| rr(*x, *y, r.w, r.h))
+            .collect();
+        let rows = rows_from_rects(&moved);
+        for row in &rows {
+            for w in row.windows(2) {
+                let (a, b) = (&moved[w[0]], &moved[w[1]]);
+                assert!(
+                    b.x >= a.x + a.w,
+                    "overlap: ({},{}) vs ({},{})",
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_same_row_before_member_rotates() {
+        // A(700,0) 在上行末尾,插到 M2(512) 之前(槽位2):
+        // A 接管 M2 的槽(512),M2 右移到行尾新槽(656);下行不动
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 2));
+        assert_eq!(land, (512.0, 0.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[6], (512.0, 0.0));
+        // 下行不动
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_top_to_bottom_before_member() {
+        // 上→下:A(700,0) 插到下行 M4(256) 之前(行1槽位1):
+        // 上行 A 在行尾拔出不挪任何人;下行 [M3,A,M4,M5] @ 0/256/400/544
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (1, 1));
+        assert_eq!(land, (256.0, 112.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (512.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (400.0, 112.0));
+        assert_eq!(pos[5], (544.0, 112.0));
+        assert_eq!(pos[6], (256.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_bottom_to_top_after_member() {
+        // 下→上:A(700,112) 插到上行 M1(256) 之后(行0槽位2):
+        // A 接管 M2 的槽(512),M2 右移;下行 A 在行尾拔出,其余原位
+        let rects = two_row_layout(rr(700.0, 112.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 2));
+        assert_eq!(land, (512.0, 0.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_bottom_to_top_before_first() {
+        // 下→上:A(700,112) 插到上行 M0 之前(行0槽位0):
+        // 上行全体右移 [A,M0,M1,M2] @ 0/144/400/656;下行不动
+        let rects = two_row_layout(rr(700.0, 112.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 0));
+        assert_eq!(land, (0.0, 0.0));
+        assert_eq!(pos[0], (144.0, 0.0));
+        assert_eq!(pos[1], (400.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_at_row_end_extends_row() {
+        // A(0,300) 独占一行,插到下行行尾(行1槽位3):
+        // A 落在 M5 之后 (544,112);原行只有 A,拔出无影响
+        let rects = two_row_layout(rr(0.0, 300.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (1, 3));
+        assert_eq!(land, (544.0, 112.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_eq!(pos[6], (544.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn three_rows_move_middle_to_third() {
+        // 三层:中行 A(256,212) 插到第三行 G(512) 之前:
+        // 第三行 [A,G] @ 512/656;中行另一成员 M1 不动
+        let rects = vec![
+            rr(0.0, 212.0, 244.0, 100.0), // 0 M1(中行)
+            rr(512.0, 424.0, 132.0, 100.0), // 1 G(第三行)
+            rr(256.0, 212.0, 132.0, 100.0), // 2 A(中行)
+        ];
+        let (pos, land) = row_insert_layout(&rects, 2, (2, 0));
+        assert_eq!(land, (512.0, 424.0));
+        assert_eq!(pos[1], (656.0, 424.0)); // G 右移一格
+        assert_eq!(pos[0], (0.0, 212.0)); // 中行成员不动
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn row_slot_counts_left_members() {
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let rows = rows_from_rects(&rects);
+        assert_eq!(rows.len(), 2);
+        // 行内任意点:中心在 M4 与 M5 之间(394) → 行1槽位2
+        assert_eq!(row_slot_of(&rects, &rows, (394.0, 162.0)), (1, 2));
+        // 中心在 M0 左侧 → 行0槽位0
+        assert_eq!(row_slot_of(&rects, &rows, (10.0, 50.0)), (0, 0));
+        // 距行中心很远 = 自由区
+        assert!(nearest_row_distance(&rects, &rows, 2000.0) > 300.0);
     }
 }

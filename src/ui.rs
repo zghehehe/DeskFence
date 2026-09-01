@@ -318,6 +318,18 @@ enum DragMode {
     ScrollThumb { grab: f32 },
 }
 
+/// 拖拽插入方案(2026-09-02:行内槽位模型)。几何在 model.rs
+/// (rows_from_rects/row_slot_of/row_insert_layout,有单测),此处只做适配。
+#[derive(Clone)]
+struct InsertPlan {
+    /// 全体可见栅栏的新位置(逐 start_layout 可见成员,含被拖者)
+    assign: Vec<(u32, (f32, f32))>,
+    /// 被拖者落点
+    land: (f32, f32),
+    /// 指示线 (x, y, w, h)
+    line: (f32, f32, f32, f32),
+}
+
 #[derive(Clone)]
 struct Drag {
     fence_id: u32,
@@ -333,6 +345,9 @@ struct Drag {
     /// 图标按下时该项是否已被选中(第二次点击已选中项 = Explorer 的慢双击重命名)
     icon_was_selected: bool,
     icon_path: String,
+    /// Move 拖拽最后一次有插入线的方案:松手瞬间滑出容差也必须能插进去
+    /// (以最后一次方案为准,2026-09-02)
+    last_insert: Option<InsertPlan>,
 }
 
 /// 拖拽实时预览状态:拖动中即时重排显示,松手才生效;取消/拖出释放则回滚
@@ -7044,152 +7059,70 @@ fn compact_neighbors_after_resize(fences: &mut [Fence], anchor_id: u32) {
 /// 从按下快照推演「锚点跟随鼠标」后的全体栅栏布局(纯函数:快照+光标 → 布局)。
 /// 每帧都从快照重算,拖回即还原,可逆性不依赖算法性质;
 /// 拖动预览与松手提交共用同一管线,保证所见即所得(松手不再二次跳变)。
-/// 栅栏插入计划:基于按下快照(其余栅栏拖动中不动),按视觉顺序(行带+列)给出
-/// 插入下标、其余栅栏顺序与指示线矩形(屏幕坐标)。光标远离群体包围盒时 None
-/// (松手=原地自由放置,不拼接)。
-fn fence_insertion_plan(
-    drag: &Drag,
-    cx: f32,
-    cy: f32,
-) -> Option<(usize, Vec<u32>, (f32, f32, f32, f32))> {
-    let mut others: Vec<(u32, Rect)> = drag
+/// 栅栏插入计划(2026-09-02 第2-6/11项:行内槽位模型)。行聚类把被拖者也
+/// 计入,插入点=(目标行,行内位置)二维定位——横向中心越过邻居中心换槽,
+/// 纵向跨过行间中线换层,任意方向/任意层数/任意宽度组合都成立;指示线恒
+/// 为目标行整行高竖线。落位分配走 model::row_insert_layout(有单测):
+/// 尺寸保持各自,只动受影响两行,其余成员取到自己原位(不乱桌)。
+fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
+    let all: Vec<(u32, Rect)> = drag
         .start_layout
         .iter()
-        .filter(|f| f.id != drag.fence_id && !f.hidden && !f.collapsed)
+        .filter(|f| !f.hidden && !f.collapsed)
         .map(|f| (f.id, f.rect))
         .collect();
-    if others.is_empty() {
+    if all.len() < 2 {
         return None;
     }
-    // 群体包围盒(外扩被拖栅栏的宽高);光标不在其中则不显示插入线
-    let mut bx0 = f32::MAX;
-    let mut by0 = f32::MAX;
-    let mut bx1 = f32::MIN;
-    let mut by1 = f32::MIN;
-    for (_, r) in &others {
-        bx0 = bx0.min(r.x);
-        by0 = by0.min(r.y);
-        bx1 = bx1.max(r.x + r.w);
-        by1 = by1.max(r.y + r.h);
-    }
-    let mx = drag.start_rect.w.max(0.0);
-    let my = drag.start_rect.h.max(0.0);
-    if cx < bx0 - mx || cx > bx1 + mx || cy < by0 - my || cy > by1 + my {
-        return None;
-    }
-    // 行带聚类:按 y 中心排序,间距 > 0.6*min(高) 开新带;带内按 x 排
-    others.sort_by(|a, b| {
-        (a.1.y + a.1.h * 0.5)
-            .partial_cmp(&(b.1.y + b.1.h * 0.5))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut bands: Vec<Vec<(u32, Rect)>> = Vec::new();
-    for item in others {
-        let start_new = match bands.last() {
-            Some(band) => {
-                let prev = &band[0].1;
-                let tol = 0.6 * prev.h.min(item.1.h).max(24.0);
-                (item.1.y + item.1.h * 0.5) - (prev.y + prev.h * 0.5) > tol
-            }
-            None => true,
-        };
-        if start_new {
-            bands.push(vec![item]);
-        } else {
-            bands.last_mut().unwrap().push(item);
-        }
-    }
-    let mut visual: Vec<(u32, Rect, usize)> = Vec::new();
-    let mut band_mids: Vec<f32> = Vec::new();
-    for (bi, band) in bands.iter_mut().enumerate() {
-        band.sort_by(|a, b| {
-            a.1.x
-                .partial_cmp(&b.1.x)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mid = band.iter().map(|(_, r)| r.y + r.h * 0.5).sum::<f32>() / band.len() as f32;
-        band_mids.push(mid);
-        visual.extend(band.iter().map(|(id, r)| (*id, *r, bi)));
-    }
-    // 光标所在带:最近带中心的 |cy - band_mid| <= 半高容差,否则超出的全部算"之前/之后"
-    let (cursor_band, in_band) = {
-        let mut best = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, mid) in band_mids.iter().enumerate() {
-            let d = (cy - mid).abs();
-            if d < best_d {
-                best_d = d;
-                best = i;
-            }
-        }
-        let half = visual
-            .iter()
-            .map(|(_, r, _)| r.h * 0.5)
-            .fold(0f32, f32::max)
-            .max(48.0);
-        (best, best_d <= half)
-    };
-    // 光标不在任何行带内(明显在群体上方/下方)= 自由放置区,不做插入
-    if !in_band {
-        return None;
-    }
-    // 该栅栏所在带 < 光标带,或同带且中心在光标左侧 → 位于插入点之前
-    let idx = {
-        let mut count = 0;
-        for (i, (_, r, fence_band)) in visual.iter().enumerate() {
-            let before =
-                *fence_band < cursor_band || (*fence_band == cursor_band && r.x + r.w * 0.5 < cx);
-            if before {
-                count = i + 1;
-            }
-        }
-        count
-    };
-    let ids: Vec<u32> = visual.iter().map(|(id, _, _)| *id).collect();
-    // 恒等插入(拼接后顺序不变)或光标仍在被拖栅栏原矩形内(刚拿起/原地)不画线,
-    // 否则原位会出现一条多余的竖线
-    let ocx = drag.start_rect.x + drag.start_rect.w * 0.5;
-    let orig_idx = visual
+    let a_idx = all.iter().position(|(id, _)| *id == drag.fence_id)?;
+    let rects: Vec<Rect> = all.iter().map(|(_, r)| *r).collect();
+    let rows = model::rows_from_rects(&rects);
+    // 被拖者原位(行,槽)
+    let (hr, hj) = rows
         .iter()
-        .filter(|(_, r, fb)| *fb < cursor_band || (*fb == cursor_band && r.x + r.w * 0.5 < ocx))
-        .count();
-    if in_band && idx == orig_idx {
+        .enumerate()
+        .find_map(|(ri, row)| row.iter().position(|&i| i == a_idx).map(|j| (ri, j)))?;
+    // 被拖栅栏实时中心(随光标移动):插入判定用它而非光标本身
+    let lx = drag.start_rect.x + drag.start_rect.w * 0.5 + (cx - drag.start_sx);
+    let ly = drag.start_rect.y + drag.start_rect.h * 0.5 + (cy - drag.start_sy);
+    // 自由放置区:实时中心距最近行中心超过半高容差(至少 48)→ 无槽位
+    let half = rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|&i| rects[i].h * 0.5)
+        .fold(0f32, f32::max)
+        .max(48.0);
+    if model::nearest_row_distance(&rects, &rows, ly) > half {
         return None;
     }
-    if in_band
-        && drag.start_rect.x <= cx
-        && cx <= drag.start_rect.x + drag.start_rect.w
-        && drag.start_rect.y <= cy
-        && cy <= drag.start_rect.y + drag.start_rect.h
-    {
+    let (tr, tk) = model::row_slot_of(&rects, &rows, (lx, ly));
+    // 原位抑制:(行,槽)全都没变 = 刚拿起/原地
+    if (tr, tk) == (hr, hj) {
         return None;
     }
-    // 指示线几何:竖线=水平相邻之间,横线=行带之间
-    let gap = model::GAP;
-    let line = if idx == 0 {
-        let r = &visual[0].1;
-        (r.x - gap * 0.5 - 1.25, r.y, 2.5, r.h)
-    } else if idx >= visual.len() {
-        let r = &visual[visual.len() - 1].1;
-        (r.x + r.w + gap * 0.5 - 1.25, r.y, 2.5, r.h)
+    let (assign_pos, land) = model::row_insert_layout(&rects, a_idx, (tr, tk));
+    let assign = all
+        .iter()
+        .enumerate()
+        .map(|(t, (id, _))| (*id, assign_pos[t]))
+        .collect();
+    // 指示线=目标行整行高竖线:tk<行长度画在第 tk 成员左缘,否则行尾右缘
+    let row_t = &rows[tr];
+    let (top, bottom) = row_t.iter().fold((f32::MAX, f32::MIN), |(t, b), &i| {
+        (t.min(rects[i].y), b.max(rects[i].y + rects[i].h))
+    });
+    let line = if tk < row_t.len() {
+        let m = rects[row_t[tk]];
+        (m.x - model::GAP * 0.5 - 1.25, top, 2.5, bottom - top)
     } else {
-        let a = &visual[idx - 1].1;
-        let b = &visual[idx].1;
-        let same_row =
-            ((a.y + a.h * 0.5) - (b.y + b.h * 0.5)).abs() <= 0.6 * a.h.min(b.h).max(24.0);
-        if same_row {
-            let x = ((a.x + a.w + b.x) * 0.5 - 1.25).max(bx0 - gap);
-            let y0 = a.y.min(b.y);
-            let y1 = (a.y + a.h).max(b.y + b.h);
-            (x, y0, 2.5, y1 - y0)
-        } else {
-            let y = ((a.y + a.h + b.y) * 0.5 - 1.25).max(by0 - gap);
-            let x0 = a.x.min(b.x);
-            let x1 = (a.x + a.w).max(b.x + b.w);
-            (x0, y, x1 - x0, 2.5)
-        }
+        let m = rects[row_t[row_t.len() - 1]];
+        (m.x + m.w + model::GAP * 0.5 - 1.25, top, 2.5, bottom - top)
     };
-    Some((idx, ids, line))
+    Some(InsertPlan {
+        assign,
+        land,
+        line,
+    })
 }
 
 /// 邻居等距吸附(上下左右对称):左右贴齐/紧邻保持 GAP,上下同理。
@@ -7717,11 +7650,15 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         // 抗重叠:任何位置都不允许覆盖其他栅栏(最小位移推开,保持 GAP)
                         nr = model::avoid_overlap(&nr, &others, vx, vy, vw, vh);
                     }
-                    let line = insert.map(|(_, _, l)| l);
+                    let line = insert.as_ref().map(|p| p.line);
                     if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
                         f.rect = nr;
                     }
                     s.insert_line = line;
+                    // 记录最后一次有线的方案:松手瞬间滑出容差也必须能插进去
+                    if let Some(d) = s.drag.as_mut() {
+                        d.last_insert = if chain { insert.clone() } else { None };
+                    }
                     // 被拖栅栏需压过其他兄弟栅栏(穿过邻居时不被盖住),但
                     // 任何时候都不得高于正常窗口:提升锚点=最高兄弟栅栏
                     // (仍在桌面 band 内)。旧的 HWND_TOP 曾把它顶到整个 z 栈
@@ -8171,6 +8108,7 @@ fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     dragged_out: false,
                     icon_was_selected,
                     icon_path,
+                    last_insert: None,
                 });
                 unsafe {
                     SetCapture(hwnd);
@@ -8199,6 +8137,7 @@ fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     dragged_out: false,
                     icon_was_selected: false,
                     icon_path: String::new(),
+                    last_insert: None,
                 });
                 unsafe {
                     SetCapture(hwnd);
@@ -8231,6 +8170,7 @@ fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 dragged_out: false,
                 icon_was_selected: false,
                 icon_path: String::new(),
+                last_insert: None,
             });
             unsafe {
                 SetCapture(hwnd);
@@ -8249,6 +8189,7 @@ fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 dragged_out: false,
                 icon_was_selected: false,
                 icon_path: String::new(),
+                last_insert: None,
             });
             unsafe {
                 SetCapture(hwnd);
@@ -8658,15 +8599,20 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                 }
                 DragMode::Move => {
-                    // 插入式提交:有指示线 → 其余栅栏按视觉顺序拼接被拖者,
-                    // 整链从首槽紧凑重排(1 插到 2/3 之间 → 2,1,3;放不下换行,
-                    // 出屏由 fit_to_monitors 夹回);无指示线 → 原地自由放置。
+                    // 插入式提交(2026-09-02 行内槽位模型):有指示线 → 应用
+                    // model::row_insert_layout 的位置分配(尺寸保持各自,只动
+                    // 受影响两行);无指示线 → 原地自由放置。
                     let (cx, cy) = screen_cursor();
                     let moved = (cx - drag.start_sx) * (cx - drag.start_sx)
                         + (cy - drag.start_sy) * (cy - drag.start_sy)
                         > 64.0;
                     let plan = if moved && (auto_align_on() || grid_align_on()) {
-                        fence_insertion_plan(&drag, cx, cy)
+                        match fence_insertion_plan(&drag, cx, cy) {
+                            Some(p) => Some(p),
+                            // 松手瞬间滑出容差但线还亮着:沿用最后一次方案,
+                            // 保证"看到线即可插入"
+                            None => drag.last_insert.clone(),
+                        }
                     } else {
                         None
                     };
@@ -8676,77 +8622,23 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             f.rect = drag.start_rect;
                         }
                         s.insert_line = None;
-                    } else if let Some((idx, order_ids, _)) = plan {
-                        let snapshot: HashMap<u32, Rect> =
-                            drag.start_layout.iter().map(|f| (f.id, f.rect)).collect();
-                        // 首槽 = 原布局(含被拖者)最左者的位置,链锚点不因移除被拖者而右移
-                        let first = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| !f.hidden && !f.collapsed)
-                            .min_by(|a, b| {
-                                let ka = (a.rect.y + a.rect.h * 0.5, a.rect.x);
-                                let kb = (b.rect.y + b.rect.h * 0.5, b.rect.x);
-                                ka.0.partial_cmp(&kb.0)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                    .then(
-                                        ka.1.partial_cmp(&kb.1)
-                                            .unwrap_or(std::cmp::Ordering::Equal),
-                                    )
-                            })
-                            .map(|f| f.rect)
-                            .unwrap_or(drag.start_rect);
-                        let x0 = first.x;
-                        let y0 = first.y;
-                        let (vx0, vy0, vw0, vh0) = work_area_for_rect(&Rect {
-                            x: x0,
-                            y: y0,
-                            w: drag.start_rect.w,
-                            h: drag.start_rect.h,
-                        });
-                        // 起点夹进工作区;换行右缘用绝对工作区右缘,链不排到屏外
-                        let x0 = x0.max(vx0).min(vx0 + vw0 - drag.start_rect.w.max(1.0));
-                        let y0 = y0.max(vy0).min(vy0 + vh0 - drag.start_rect.h.max(1.0));
-                        let row_right = vx0 + vw0;
-                        // 拼接后的顺序与其尺寸
-                        let mut ordered_ids = order_ids;
-                        let insert_at = idx.min(ordered_ids.len());
-                        ordered_ids.insert(insert_at, fence_id);
-                        let sizes: Vec<(f32, f32)> = ordered_ids
-                            .iter()
-                            .map(|id| {
-                                let r = snapshot.get(id).copied().unwrap_or(drag.start_rect);
-                                (r.w, r.h)
-                            })
-                            .collect();
-                        let slots = model::chain_positions(&sizes, x0, y0, row_right);
-                        let by_id: HashMap<u32, Rect> = ordered_ids
-                            .into_iter()
-                            .zip(slots.into_iter())
-                            .map(|(id, (x, y))| {
-                                let r = snapshot.get(&id).copied().unwrap_or(drag.start_rect);
-                                (
-                                    id,
-                                    Rect {
-                                        x,
-                                        y,
-                                        w: r.w,
-                                        h: r.h,
-                                    },
-                                )
-                            })
-                            .collect();
-                        let areas = all_work_areas();
-                        let mut final_rects: Vec<Rect> = s.fences.iter().map(|f| f.rect).collect();
-                        for (i, f) in s.fences.iter_mut().enumerate() {
-                            if let Some(nr) = by_id.get(&f.id) {
-                                final_rects[i] = *nr;
-                                f.rect = *nr;
+                    } else if let Some(p) = plan {
+                        // 行内槽位落位:只应用分配到的位置(未涉及成员取到
+                        // 自己原位=不动),尺寸保持各自,行结构不塌
+                        for (id, (x, y)) in &p.assign {
+                            if let Some(f) = s.fences.iter_mut().find(|f| f.id == *id) {
+                                f.rect.x = *x;
+                                f.rect.y = *y;
                             }
                         }
-                        model::fit_to_monitors(&mut final_rects, &areas);
-                        for (f, r) in s.fences.iter_mut().zip(final_rects.into_iter()) {
-                            f.rect = r;
+                        // 被拖者落点夹回工作区(行尾延伸槽可能出屏)
+                        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
+                            f.rect.x = p.land.0;
+                            f.rect.y = p.land.1;
+                            let (vx, vy, vw, vh) = work_area_for_rect(&f.rect);
+                            let mut tmp = [f.rect];
+                            model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
+                            f.rect = tmp[0];
                         }
                     } else {
                         // 原地放置(与拖动预览同式:跟手位置 + 夹屏)
