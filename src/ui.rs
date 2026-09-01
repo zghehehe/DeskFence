@@ -398,6 +398,9 @@ struct UiState {
     pub last_resize_ms: u64,
     /// 栅栏移动时间节流:上次移动呈现时刻(毫秒),逐像素跟随但限频
     pub last_move_ms: u64,
+    /// 拖动中内容重渲染(壁纸种子重烘焙)节拍:上次全量 refresh_fence 时刻。
+    /// 位置跟随已由"已有像素重呈现"逐帧完成,内容重烘焙降到 ~30fps。
+    pub last_drag_render_ms: u64,
     /// 拖动对齐参考线（overlay 绘制）：guide_x = 竖线坐标，guide_y = 横线坐标
     pub guide_x: Option<f32>,
     pub guide_y: Option<f32>,
@@ -510,6 +513,7 @@ fn state() -> &'static Mutex<UiState> {
             drag_settle_y: 0.0,
             last_resize_ms: 0,
             last_move_ms: 0,
+            last_drag_render_ms: 0,
             guide_x: None,
             guide_y: None,
             drag_ghost: None,
@@ -6604,7 +6608,14 @@ unsafe extern "system" fn fence_wndproc(
             // (光标早已移走)。放行会"无中生有"点亮悬停高亮再熄灭——
             // 两次无意义整面重绘,表现为点桌面关闭菜单时栅栏闪一下。
             // 消息坐标与真实光标偏差超过阈值即视为陈旧。
-            let stale = {
+            // 拖动中豁免(2026-09-01):跟随位置一律取 GetCursorPos 实时值,
+            // 陈旧消息无副作用;而拖动重渲染积压时丢消息正是"拖动一卡一卡
+            // 不跟手"的来源——积压消息被整批丢弃,只剩零星更新。
+            let dragging = state()
+                .try_lock()
+                .map(|g| g.drag.is_some())
+                .unwrap_or(false);
+            let stale = !dragging && {
                 let mut real = POINT::default();
                 unsafe {
                     let _ = GetCursorPos(&mut real);
@@ -7740,10 +7751,32 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             }
                         }
                     }
+                    // 便宜跟随(2026-09-01):已有像素按新位置重呈现(ULW 一次
+                    // 调用完成移动+上屏,零重绘),逐帧 1:1 跟手;内容重渲染
+                    // (壁纸种子随位置重烘焙)降到 ~30fps。旧的每 tick 全量
+                    // refresh_fence 让 UI 线程饱和,消息积压+渲染掉帧=拖动
+                    // 一卡一卡不跟手。
+                    if let (Some(&h), Some(surface)) =
+                        (s.windows.get(&fence_id), s.surfaces.get(&fence_id))
+                    {
+                        let _ = render::present_existing_surface(
+                            surface,
+                            h,
+                            nr.x.round() as i32,
+                            nr.y.round() as i32,
+                        );
+                    }
+                    let now_ms = resize_now_ms();
+                    let render_due = now_ms.saturating_sub(s.last_drag_render_ms) >= 33;
+                    if render_due {
+                        s.last_drag_render_ms = now_ms;
+                    }
                     drop(s);
                     // 两模式统一(2026-08-26):透明模式同样用快照种子,栅栏
                     // 移动到新壁纸区域必须重渲染(重新取该处壁纸作种子)
-                    refresh_fence(fence_id);
+                    if render_due {
+                        refresh_fence(fence_id);
+                    }
                     update_guides(None, None);
                     return;
                 }
