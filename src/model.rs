@@ -811,7 +811,7 @@ pub fn categorize(name: &str, is_dir: bool) -> String {
     let ext = ext_of(name).to_lowercase();
     let cat = match ext.as_str() {
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" => "图片",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" | "rtf"
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv" | "rtf"
         | "log" => "文档",
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" => {
             "媒体"
@@ -819,7 +819,9 @@ pub fn categorize(name: &str, is_dir: bool) -> String {
         "exe" | "msi" | "lnk" | "bat" | "cmd" | "com" => "软件",
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "part" => "压缩包",
         "js" | "ts" | "py" | "rs" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "cs" | "rb"
-        | "php" | "html" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" => "代码",
+        | "php" | "html" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" | "md" => {
+            "代码"
+        }
         _ => "其他",
     };
     cat.to_string()
@@ -1250,6 +1252,10 @@ pub struct Settings {
     /// (2026-08-28 wdprobe 实测)。置 false 回退为纯自愈行为,供降级排查。
     #[serde(default = "default_z_guard")]
     pub z_guard: bool,
+    /// 常显栅栏边框线(默认关):开=全部栅栏常显边框/标题/角手柄,便于观察
+    /// 布局;关=无边框常显(悬停或拖拽时才浮现)。托盘菜单切换即落盘。
+    #[serde(default)]
+    pub show_chrome: bool,
 }
 
 pub fn default_desktop_state() -> String {
@@ -1323,6 +1329,7 @@ impl Default for Settings {
             auto_category: default_auto_category(),
             desktop_state: default_desktop_state(),
             z_guard: default_z_guard(),
+            show_chrome: false,
         }
     }
 }
@@ -1352,6 +1359,7 @@ pub fn load_settings() -> Settings {
                 auto_category: default_auto_category(),
                 desktop_state: default_desktop_state(),
                 z_guard: default_z_guard(),
+            show_chrome: false,
             }
         }
     }

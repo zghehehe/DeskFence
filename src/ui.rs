@@ -103,6 +103,7 @@ fn set_align_mode_stored(mode: &str) {
         auto_category: auto_category(),
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
+        show_chrome: chrome_always_on(),
     });
 }
 pub fn auto_align_on() -> bool {
@@ -136,6 +137,7 @@ fn set_render_mode_stored(mode: &str) {
         auto_category: auto_category(),
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
+        show_chrome: chrome_always_on(),
     });
 }
 
@@ -161,6 +163,7 @@ fn set_desktop_state_stored(mode: &str) {
         auto_category: auto_category(),
         desktop_state: mode.to_string(),
         z_guard: z_guard_setting(),
+        show_chrome: chrome_always_on(),
     });
 }
 
@@ -186,6 +189,7 @@ fn set_auto_category_stored(v: bool) {
         auto_category: v,
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
+        show_chrome: chrome_always_on(),
     });
 }
 
@@ -193,6 +197,24 @@ fn set_auto_category_stored(v: bool) {
 fn z_guard_setting() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| model::load_settings().z_guard)
+}
+
+/// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
+/// 开=全部栅栏常显边框/标题/角手柄,便于观察布局边界;关=无边框常显基线。
+static SHOW_CHROME: AtomicBool = AtomicBool::new(false);
+pub fn chrome_always_on() -> bool {
+    SHOW_CHROME.load(Ordering::Relaxed)
+}
+fn set_show_chrome_stored(on: bool) {
+    SHOW_CHROME.store(on, Ordering::Relaxed);
+    model::save_settings(&model::Settings {
+        align_mode: align_mode(),
+        render_mode: render_mode(),
+        auto_category: auto_category(),
+        desktop_state: desktop_state(),
+        z_guard: z_guard_setting(),
+        show_chrome: on,
+    });
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
 fn rebuild_pins() {
@@ -250,6 +272,7 @@ const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
 const MENU_RENDER_PRECISE: u32 = 0x5117;
 const MENU_AUTO_CATEGORY: u32 = 0x5118;
 const MENU_HELP: u32 = 0x5119;
+const MENU_TOGGLE_CHROME: u32 = 0x511A;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -2023,7 +2046,10 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     let items = model::display_list(fence, &s.files);
     let lay = model::layout_with_metrics(fence, items.len(), &metrics);
     let hover = *s.hover.get(&fence_id).unwrap_or(&None);
-    let fence_hovered = *s.fence_hover.get(&fence_id).unwrap_or(&false);
+    // fence_hovered 在渲染侧仅控制 chrome 显隐;托盘"显示栅栏边框线"打开时
+    // 全部栅栏常显边框(无边框常显基线的可观察模式)
+    let fence_hovered =
+        *s.fence_hover.get(&fence_id).unwrap_or(&false) || chrome_always_on();
     let active = matches!(&s.drag, Some(d) if d.fence_id == fence_id
         && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
     let marquee = s.marquee;
@@ -2308,6 +2334,64 @@ pub fn show_all_fences() {
     reconcile_desktop_icons();
 }
 
+/// 缺类补建:按当前分类规则找出"有文件但无对应栅栏"的类别并新建栅栏,
+/// 返回新建的类别名。rescan 与 boot 共用——只改分类规则(如 md 文档→代码)
+/// 不动文件集合,rescan 的"无变化早退"永远等不到补建,boot 也必须跑一遍,
+/// 否则受影响文件无栅栏可归=隐身(2026-09-01)。
+fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
+    let mut have: std::collections::HashSet<String> = s
+        .fences
+        .iter()
+        .filter(|f| !f.category.is_empty())
+        .map(|f| f.category.clone())
+        .collect();
+    let mut added = Vec::new();
+    if auto_category() {
+        for cat in model::CATEGORIES {
+            if have.contains(cat) {
+                continue;
+            }
+            if s.files.iter().any(|f| f.category == cat) {
+                added.push(cat.to_string());
+                have.insert(cat.to_string());
+            }
+        }
+    } else if !have.contains(model::UNCATEGORIZED) {
+        // 自定义分类模式:未分配文件都进"未分类",保证没有任何文件隐身
+        added.push(model::UNCATEGORIZED.to_string());
+    }
+    for cat in &added {
+        let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+        s.fences.push(Fence {
+            id: max_id,
+            title: cat.clone(),
+            category: cat.clone(),
+            pinned: Vec::new(),
+            item_order: Vec::new(),
+            rect: Rect {
+                x: 60.0 + max_id as f32 * 40.0,
+                y: 60.0,
+                ..{
+                    let (dw, dh) = default_fence_size();
+                    Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: dw,
+                        h: dh,
+                    }
+                }
+            },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: model::default_sort_mode(),
+        });
+    }
+    added
+}
+
 /// 桌面文件变更刷新
 pub fn rescan() {
     let files = with_recycle_bin(shell::scan_desktop());
@@ -2349,28 +2433,7 @@ pub fn rescan() {
                 .item_order
                 .retain(|p| keep.contains(p) || fence.pinned.contains(p));
         }
-        let mut have: std::collections::HashSet<String> = s
-            .fences
-            .iter()
-            .filter(|f| !f.category.is_empty())
-            .map(|f| f.category.clone())
-            .collect();
-        let mut added = Vec::new();
-        if auto_category() {
-            for cat in model::CATEGORIES {
-                if have.contains(cat) {
-                    continue;
-                }
-                if s.files.iter().any(|f| f.category == cat) {
-                    added.push(cat.to_string());
-                    have.insert(cat.to_string());
-                }
-            }
-        } else if !have.contains(model::UNCATEGORIZED) {
-            // 自定义分类模式:未分配文件都进"未分类",保证没有任何文件隐身
-            added.push(model::UNCATEGORIZED.to_string());
-        }
-        added
+        ensure_missing_category_fences(&mut s)
     };
     {
         let added_any = !new_cats.is_empty();
@@ -2693,6 +2756,7 @@ pub fn startup() {
     model::load_usage();
     {
         let _ = auto_category(); // 预热开关(读设置文件)
+        SHOW_CHROME.store(model::load_settings().show_chrome, Ordering::Relaxed);
     }
     // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载
     // 持久化缓存(快,且免去"原生图标可见时现场捕获"的残影/闪烁问题);无缓存
@@ -2743,6 +2807,7 @@ pub fn startup() {
     let (files, t_names) = bg_names.join().unwrap_or_else(|_| (Vec::new(), 0));
     let (icon_prewarm, t_icons) =
         bg_icons.join().unwrap_or_else(|_| (Default::default(), 0));
+    let mut created_cats: Vec<String> = Vec::new();
     {
         let mut s = state().lock().unwrap();
         let n_files = files.len();
@@ -2780,6 +2845,15 @@ pub fn startup() {
                 });
             }
             let _ = n_files;
+        } else {
+            // 非空配置启动:分类规则可能已变(如 md 文档→代码)而文件集合没变,
+            // rescan 不会触发,这里补建缺类栅栏,防止受影响文件无栅栏可归=隐身
+            created_cats = ensure_missing_category_fences(&mut s);
+            if !created_cats.is_empty() {
+                log(&format!(
+                    "boot created missing category fences: {created_cats:?}"
+                ));
+            }
         }
     }
     rebuild_pins();
@@ -2796,6 +2870,11 @@ pub fn startup() {
         resize_now_ms()
     ));
     settle_all_fences();
+    if !created_cats.is_empty() {
+        // 与 rescan 一致:补建后立即持久化(settle 之后的矩形才是最终位置)
+        let s = state().lock().unwrap();
+        let _ = model::save_config(&s.fences);
+    }
     refit_auto_fence_heights();
     log(&format!("boot pre-show done ({}ms)", resize_now_ms()));
     show_all_fences(); // 桌面壳未就绪时暂缓,由全局定时器自动补挂
@@ -4399,6 +4478,11 @@ fn show_tray_menu(x: i32, y: i32) {
     } else {
         shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     }
+    if chrome_always_on() {
+        shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
+    } else {
+        shell::append_menu(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
+    }
     shell::append_menu(menu, MENU_HELP, "使用说明");
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
@@ -4445,6 +4529,12 @@ fn dispatch_tray_command(id: u32) {
         MENU_RENDER_TRANSPARENT => set_render_mode("transparent"),
         MENU_RENDER_PRECISE => set_render_mode("precise"),
         MENU_AUTO_CATEGORY => toggle_auto_category(),
+        MENU_TOGGLE_CHROME => {
+            let on = !chrome_always_on();
+            set_show_chrome_stored(on);
+            refresh_all_fences();
+            log(&format!("show_chrome={on}"));
+        }
         MENU_HELP => show_help(),
         MENU_AUTOSTART => toggle_autostart(),
         MENU_QUIT => quit_app(),
@@ -4468,10 +4558,10 @@ fn show_help() {
 桌面文件按类型自动进入对应栅栏:
 · 软件:exe/msi/lnk/bat 等程序与快捷方式
 · 文件夹:所有目录
-· 文档:txt/md/word/excel/ppt/pdf 等
+· 文档:txt/word/excel/ppt/pdf 等
 · 图片:jpg/png/gif/svg 等
 · 媒体:mp3/wav/mp4/mkv 等音视频
-· 代码:py/js/ts/rs/go/c/cpp/html/json 等
+· 代码:py/js/ts/rs/go/c/cpp/html/json/md 等
 · 压缩包:zip/rar/7z/tar/gz 等
 · 其他:未识别的类型
 某类栅栏不存在时,首次出现该类文件会自动新建。
@@ -4487,7 +4577,8 @@ fn show_help() {
 【其他】
 拖动栅栏经过两个栅栏之间出现插入线,松手即插入;靠近屏幕边/角自动吸附;
 拖到其他栅栏正上/下方自动保持固定间距;Esc 取消拖动;拖图标到\"回收站\"删除;
-右键栅栏标题可折叠/锁定/重命名/删除。";
+右键栅栏标题可折叠/锁定/重命名/删除。
+托盘菜单勾选\"显示栅栏边框线\"可常显全部栅栏边框(默认隐藏,悬停浮现)。";
     let t = shell::wide(text);
     let cap = shell::wide("DeskFence 使用说明");
     unsafe {
