@@ -7085,13 +7085,16 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
     // 被拖栅栏实时中心(随光标移动):插入判定用它而非光标本身
     let lx = drag.start_rect.x + drag.start_rect.w * 0.5 + (cx - drag.start_sx);
     let ly = drag.start_rect.y + drag.start_rect.h * 0.5 + (cy - drag.start_sy);
-    // 自由放置区:实时中心距最近行中心超过半高容差(至少 48)→ 无槽位
+    // 自由放置区:实时中心距最近行中心超过半高容差(至少 48)→ 无槽位。
+    // 容差额外加一个 GAP:行间中线附近两侧行都恰好差半个 GAP,不加会
+    // 留下一条竖直移动不出线的判定死区
     let half = rows
         .iter()
         .flat_map(|row| row.iter())
         .map(|&i| rects[i].h * 0.5)
         .fold(0f32, f32::max)
-        .max(48.0);
+        .max(48.0)
+        + model::GAP;
     if model::nearest_row_distance(&rects, &rows, ly) > half {
         return None;
     }

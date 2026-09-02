@@ -389,6 +389,19 @@ pub fn row_insert_layout(
     if (hr, hj) == (tr, tk) {
         return (out, slot(a_idx));
     }
+    // 行锚点=该行(含 A)最左成员的 x/y:行首成员移走时,后继成员左滑
+    // 接管行首槽(体感:第一行第一个移走/插入,行首永远有栅栏在)
+    let anchor_i = rows[hr]
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            rects[a]
+                .x
+                .partial_cmp(&rects[b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap();
+    let (ax, ay) = slot(anchor_i);
     let flow = |out: &mut Vec<(f32, f32)>, members: &[usize], x0: f32, y0: f32| {
         let mut x = x0;
         for &i in members {
@@ -401,25 +414,19 @@ pub fn row_insert_layout(
         let mut order: Vec<usize> = row.clone();
         order.remove(hj);
         let k2 = (if tk > hj { tk - 1 } else { tk }).min(order.len());
-        let (ax, ay) = row
-            .iter()
-            .find(|&&i| i != a_idx)
-            .map(|&i| slot(i))
-            .unwrap_or(slot(a_idx));
         order.insert(k2, a_idx);
         flow(&mut out, &order, ax, ay);
     } else {
         let rest: Vec<usize> = rows[hr].iter().copied().filter(|&i| i != a_idx).collect();
         if !rest.is_empty() {
-            let (ax, ay) = slot(rest[0]);
             flow(&mut out, &rest, ax, ay);
         }
         let row_t = &rows[tr.min(rows.len() - 1)];
         let mut order: Vec<usize> = row_t.clone();
         let k2 = tk.min(order.len());
         order.insert(k2, a_idx);
-        let (ax, ay) = slot(row_t[0]);
-        flow(&mut out, &order, ax, ay);
+        let (tx, ty) = slot(row_t[0]);
+        flow(&mut out, &order, tx, ty);
     }
     let land = out[a_idx];
     (out, land)
@@ -3166,6 +3173,43 @@ mod tests {
         assert_eq!(land, (512.0, 424.0));
         assert_eq!(pos[1], (656.0, 424.0)); // G 右移一格
         assert_eq!(pos[0], (0.0, 212.0)); // 中行成员不动
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn head_slot_fills_when_first_member_leaves() {
+        // 行首 A(0,0) 移走进下行:上行 M0 左滑接管行首(0,0),不残留空洞
+        let rects = vec![
+            rr(0.0, 0.0, 132.0, 100.0), // 0 A(行首)
+            rr(144.0, 0.0, 244.0, 100.0), // 1 M0
+            rr(400.0, 0.0, 244.0, 100.0), // 2 M1
+            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(256.0, 112.0, 132.0, 100.0), // 4 M4
+        ];
+        let (pos, land) = row_insert_layout(&rects, 0, (1, 0));
+        assert_eq!(land, (0.0, 112.0));
+        assert_eq!(pos[1], (0.0, 0.0)); // M0 左滑接管行首(0,0)
+        assert_eq!(pos[2], (256.0, 0.0)); // M1 跟进,与 M0 保持固定 GAP
+        // 下行 [A,M3,M4] @ 0/144/400
+        assert_eq!(pos[3], (144.0, 112.0));
+        assert_eq!(pos[4], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn second_member_slides_to_row_head() {
+        // 下行两个 [B1(0),B2(256)],B1 移走进上行:B2 左滑到下行行首(0,112)
+        let rects = vec![
+            rr(0.0, 0.0, 244.0, 100.0), // 0 M0(上行)
+            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
+            rr(0.0, 112.0, 132.0, 100.0), // 2 B1
+            rr(256.0, 112.0, 132.0, 100.0), // 3 B2
+        ];
+        let (pos, land) = row_insert_layout(&rects, 2, (0, 0));
+        assert_eq!(land, (0.0, 0.0));
+        assert_eq!(pos[0], (144.0, 0.0)); // 上行右移让位
+        assert_eq!(pos[1], (400.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0)); // B2 左滑接管下行行首
         assert_no_overlap(&rects, &pos);
     }
 
