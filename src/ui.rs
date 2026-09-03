@@ -2699,9 +2699,33 @@ fn start_arrival_animations(added_paths: &[String]) {
             .get(&fence.id)
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
-        let layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+        let mut layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+        let mut fence = fence;
         if index < layout.first_index || index >= layout.first_index + layout.visible {
-            continue;
+            // 新条目落在滚动页外(2026-09-03):"常用"排序下新文件使用次数为
+            // 零只能排最后,内容超一页的栅栏(如文档 2×4=8 槽)会把它排进
+            // 第二页——旧逻辑这里静默跳过,新文件既无动画也看不见落在哪
+            // (用户实测"新建没动画"的真因)。改为把栅栏滚到该条目所在行,
+            // 让飞入落点可见;连滚都滚不到(不可能:行数≤总行数)才放弃。
+            let cols = layout.cols.max(1);
+            let row = index / cols;
+            let max_scroll = layout.total_rows.saturating_sub(layout.rows);
+            if max_scroll == 0 {
+                continue;
+            }
+            let scroll = row.min(max_scroll);
+            fence.scroll_rows = scroll;
+            if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence.id) {
+                f.scroll_rows = scroll;
+            }
+            layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+            if index < layout.first_index || index >= layout.first_index + layout.visible {
+                continue;
+            }
+            log(&format!(
+                "arrival: scrolled fence {} to row {} for off-page item",
+                fence.id, scroll
+            ));
         }
         let (cell_x, cell_y) = model::cell_pos_with_metrics(&layout, index, &metrics);
         let icon_offset = (metrics.cell_w - metrics.icon_px) / 2.0;
@@ -2728,6 +2752,12 @@ fn start_arrival_animations(added_paths: &[String]) {
     }
     if pending.is_empty() {
         return;
+    }
+    for p in &pending {
+        log(&format!(
+            "arrival: animate '{}' fence={} from=({:.0},{:.0}) to=({:.0},{:.0})",
+            p.name, p.fence_id, p.from.0, p.from.1, p.to.0, p.to.1
+        ));
     }
     s.arrival_animations.extend(pending);
     ensure_guide_window(&mut s);
