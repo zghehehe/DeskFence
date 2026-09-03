@@ -1,4 +1,2 @@
-PROBE-START 11:20:44
-HIT[11:27:05.887] EDIT text='' rect=(173,67)-(256,83) size=83x16 style=0xFFFFFFFF94000004 exstyle=0x80 font=[—ñ ®â´¾°?‘LÐ§?? h=-18 w=400] chain=''
-HIT[11:27:06.148] EDIT text='' rect=(173,67)-(256,99) size=83x32 style=0xFFFFFFFF94000004 exstyle=0x88 font=[—ñ ®â´¾°?‘LÐ§?? h=-18 w=400] chain=''
-PROBE-END 11:30:44 samples=2275
+PROBE-START 13:57:40
+PROBE-END 14:02:40 samples=1139

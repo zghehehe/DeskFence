@@ -1,4 +1,4 @@
-param([int]$Seconds = 75)
+﻿param([int]$Seconds = 75)
 $ErrorActionPreference = 'Stop'
 
 $src = @'
@@ -49,9 +49,13 @@ public class RenProbe {
                 font = lf.Face + " h=" + lf.H + " w=" + lf.Weight;
             }
         }
+        long sel = SendMessage(h, 0x00B0, IntPtr.Zero, IntPtr.Zero).ToInt64();
+        long first = SendMessage(h, 0x00CE, IntPtr.Zero, IntPtr.Zero).ToInt64();
+        long lines = SendMessage(h, 0x00BA, IntPtr.Zero, IntPtr.Zero).ToInt64();
         return string.Format(
-            "EDIT text='{0}' rect=({1},{2})-({3},{4}) size={5}x{6} style=0x{7:X} exstyle=0x{8:X} font=[{9}] chain='{10}'",
-            Txt(h), r.L, r.T, r.R, r.B, r.R - r.L, r.B - r.T, st, ex, font, Chain(GetParent(h)));
+            "EDIT len={0} text='{1}' rect=({2},{3})-({4},{5}) size={6}x{7} sel=({8},{9}) firstvis={10} lines={11} style=0x{12:X} ex=0x{13:X} chain='{14}'",
+            GetWindowTextLength(h), Txt(h), r.L, r.T, r.R, r.B, r.R - r.L, r.B - r.T,
+            sel & 0xFFFF, (sel >> 16) & 0xFFFF, first, lines, st, ex, Chain(GetParent(h)));
     }
     public static List<string> FindEdits() {
         var found = new List<string>();

@@ -6462,6 +6462,10 @@ fn cancel_rename(edit: HWND) {
 // 字体/预选行为与 Explorer 一致,回车或失焦提交,Esc 取消。
 
 const FILE_RENAME_COMMIT_MSG: u32 = WM_USER + 3;
+/// 重命名框行数自适应定时器(120ms):IME 提交不产生 WM_CHAR,纯消息钩子
+/// 会漏掉中文输入——定时器兜底覆盖一切改动来源
+const RENAME_FIT_TIMER: usize = 1;
+const WM_IME_COMPOSITION: u32 = 0x010F;
 const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
 static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
 static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
@@ -6570,15 +6574,18 @@ fn start_file_rename(path: String) {
         }
         let w = shell::wide(&name);
         let _ = SetWindowTextW(edit, PCWSTR::from_raw(w.as_ptr()));
-        // 与 Explorer 一致:预选扩展名之前的部分
+        // 与 Explorer 一致:预选扩展名之前的部分。注意 EM_SETSEL 用
+        // UTF-16 字符下标——旧实现直接用 UTF-8 字节下标,中文名会溢出到
+        // 末尾把扩展名也选中(与原生不一致)
         let sel_end = name
             .rfind('.')
             .filter(|&p| p > 0)
-            .map(|p| p as isize)
+            .map(|p| name[..p].encode_utf16().count() as isize)
             .unwrap_or(-1);
         let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(sel_end));
-        // 初始名就是长名时(多行换行)先按行数增高
+        // 初始名就是长名时(多行换行)先按行数增高;改名期间定时器兜底
         adjust_rename_edit_height(edit);
+        let _ = SetTimer(edit, RENAME_FIT_TIMER, 120, None);
         *FILE_RENAME_PATH.lock().unwrap() = Some(path);
         let old = SetWindowLongPtrW(
             edit,
@@ -6640,6 +6647,26 @@ unsafe extern "system" fn file_rename_edit_proc(
             adjust_rename_edit_height(hwnd);
             return r;
         }
+        WM_IME_COMPOSITION => {
+            // 中文经输入法提交,不走 WM_CHAR——这里必须兜住
+            let r = CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
+            adjust_rename_edit_height(hwnd);
+            return r;
+        }
+        WM_TIMER if wparam.0 as usize == RENAME_FIT_TIMER => {
+            // 120ms 兜底:任何来源(IME/粘贴/程序性)的文本变化都收敛
+            adjust_rename_edit_height(hwnd);
+            return LRESULT(0);
+        }
         WM_CHAR | WM_PASTE => {
             // 多行重命名(与原生一致):输入/粘贴后按实际换行行数增高编辑框
             let r = CallWindowProcW(
@@ -6675,6 +6702,7 @@ unsafe extern "system" fn file_rename_edit_proc(
             return LRESULT(0);
         }
         WM_DESTROY => {
+            KillTimer(hwnd, RENAME_FIT_TIMER);
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
             return LRESULT(0);
         }
@@ -6735,10 +6763,26 @@ fn adjust_rename_edit_height(edit: HWND) {
             20.0
         };
         ReleaseDC(edit, hdc);
-        // 超出工作区底则封顶(保持框体可见)
+        // 高度不超工作区;底边超出时整框上移(末行始终可见可编辑,超长名
+        // 也不会"看不到最后面、删不掉")
         let (_, vy, _, vh) = work_area();
-        let new_h =
+        let mut new_h =
             ((lines * line_h).round() as i32 + 8).min((vy + vh - rc.top as f32).max(24.0) as i32);
+        new_h = new_h.max(24).min(vh as i32);
+        let mut top = rc.top;
+        let bottom_limit = (vy + vh) as i32;
+        if top + new_h > bottom_limit {
+            top = (bottom_limit - new_h).max(vy as i32);
+        }
+        let _ = SetWindowPos(
+            edit,
+            HWND(0),
+            top,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE,
+        );
         if new_h != rc.bottom - rc.top {
             let _ = SetWindowPos(
                 edit,
@@ -6829,6 +6873,7 @@ fn commit_file_rename(edit: HWND) {
     }
     uninstall_rename_mouse_hook();
     unsafe {
+        KillTimer(edit, RENAME_FIT_TIMER);
         let _ = DestroyWindow(edit);
     }
     rescan();
