@@ -6545,14 +6545,16 @@ fn start_file_rename(path: String) {
             PCWSTR::null(),
             // 多行自动换行(2026-09-02 与原生一致):长名向下换行、框随行数
             // 增高(见 adjust_rename_edit_height);不加 ES_AUTOHSCROLL——
-            // 单行无滚动样式时文本到控件右缘就拒绝继续输入
-            // 样式=原生实测(0x540000C5 的编辑部分):LEFT|MULTILINE|
-            // AUTOVSCROLL|NOHIDESEL,无边框;WS_POPUP 是结构必需(ULW 分层
-            // 窗口不能挂子窗口),原生为 WS_CHILD
+            // 多行加它会把换行变成横向滚动。
+            // ES_CENTER(2026-09-03 用户截图比对确认):原生每行水平居中,
+            // 首行/末行短行明显缩进;此前把原生样式 0x540000C5 的 0x1 位
+            // 误读成 ES_LEFT(其值本为 0,无效果)。样式余下部分=
+            // MULTILINE|AUTOVSCROLL|NOHIDESEL;WS_POPUP 是结构必需(ULW
+            // 分层窗口不能挂子窗口),原生为 WS_CHILD
             WINDOW_STYLE(
                 WS_POPUP.0
                     | WS_VISIBLE.0
-                    | ES_LEFT as u32
+                    | ES_CENTER as u32
                     | ES_MULTILINE as u32
                     | ES_AUTOVSCROLL as u32
                     | ES_NOHIDESEL as u32,

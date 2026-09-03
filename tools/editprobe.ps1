@@ -40,10 +40,18 @@ public static class EditProbe {
     public const int WS_POPUP = unchecked((int)0x80000000), WS_VISIBLE = 0x10000000;
     public const int ES_LEFT = 0x0, ES_MULTILINE = 0x4, ES_AUTOVSCROLL = 0x40, ES_NOHIDESEL = 0x100;
     public const int EM_GETRECT = 0xB2, EM_GETLINECOUNT = 0xBA, EM_LINEINDEX = 0xBB, EM_LINELENGTH = 0xC1;
+    public const int EM_POSFROMCHAR = 0xD6;
+    public static int PosCharX(IntPtr e, int idx) {
+        int p = SendMessageW(e, EM_POSFROMCHAR, (IntPtr)idx, IntPtr.Zero);
+        return p & 0xFFFF;
+    }
     public const int EM_GETMARGINS = 0xD4, EM_GETFIRSTVISIBLELINE = 0xCE, WM_GETFONT = 0x31, EM_SETSEL = 0xB1, EM_SCROLLCARET = 0xB7;
 
     public static IntPtr Make(int w, int h) {
         return CreateWindowExW(0x80, "EDIT", "", WS_POPUP | WS_VISIBLE | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_NOHIDESEL, 60, 60, w, h, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+    }
+    public static IntPtr MakeStyled(int w, int h, int style) {
+        return CreateWindowExW(0x80, "EDIT", "", WS_POPUP | WS_VISIBLE | style, 60, 60, w, h, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
     }
     public static IntPtr IconFont() {
         LOGFONTW lf = new LOGFONTW();
@@ -144,3 +152,20 @@ foreach ($w in 111, 120) {
     Write-Host ("   final lens=" + ($lens -join ','))
     [void][EditProbe]::DestroyWindow($e)
 }
+
+
+# --- ES_CENTER check: wrap + per-line first-char x (centering) at w=120
+$style = 0x1 -bor 0x4 -bor 0x40 -bor 0x100  # CENTER|MULTILINE|AUTOVSCROLL|NOHIDESEL
+$ec = [EditProbe]::MakeStyled(120, 200, $style)
+[void][EditProbe]::SendMessageW($ec, 0x30, $fontApp, [IntPtr]1)
+[void][EditProbe]::SetWindowTextW($ec, $txt)
+Start-Sleep -Milliseconds 200
+$lc = [EditProbe]::LineCount($ec)
+$lens = @(); $xs = @()
+for ($i = 0; $i -lt $lc; $i++) {
+    $lens += [EditProbe]::LineLen($ec, $i)
+    $idx = [EditProbe]::LineStart($ec, $i)
+    $xs += [EditProbe]::PosCharX($ec, $idx)
+}
+Write-Host ("ES_CENTER w=120 lineCount={0} lens={1} firstCharX={2} (interior 3..115, centered = 3+(112-wid)/2)" -f $lc, ($lens -join ','), ($xs -join ','))
+[void][EditProbe]::DestroyWindow($ec)
