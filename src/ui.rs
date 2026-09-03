@@ -2517,6 +2517,12 @@ pub fn rescan() {
         let keep: std::collections::HashSet<String> =
             s.files.iter().map(|f| f.path.clone()).collect();
         s.icon_cache.clear();
+        // 已删文件的常用记录同步剔除(2026-09-03):usage.json 残留旧路径时,
+        // 同名新建会继承旧次数直接顶到"常用"第一位(用户实测)
+        let pruned = model::prune_usage(&keep);
+        if pruned > 0 {
+            log(&format!("pruned {pruned} stale usage entries"));
+        }
         s.selected_paths.retain(|p| keep.contains(p));
         if s.focused_path.as_ref().is_some_and(|p| !keep.contains(p)) {
             s.focused_path = None;
@@ -3054,6 +3060,16 @@ pub fn startup() {
         let mut s = state().lock().unwrap();
         let n_files = files.len();
         s.files = files;
+        // 启动即清理已删文件的常用记录(2026-09-03):应用关闭期间删的文件
+        // 同样会在 usage.json 留残账,同名新建继承旧次数顶到常用第一位
+        {
+            let keep: std::collections::HashSet<String> =
+                s.files.iter().map(|f| f.path.clone()).collect();
+            let pruned = model::prune_usage(&keep);
+            if pruned > 0 {
+                log(&format!("pruned {pruned} stale usage entries at boot"));
+            }
+        }
         // 启动持久化缓存命中先入,后台新提取覆盖同键(构造上 fresh 优先)
         for (k, v) in boot_icons {
             s.icon_cache.entry(k).or_insert(v);

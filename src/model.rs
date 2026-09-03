@@ -1051,6 +1051,24 @@ pub fn record_open(path: &str) {
     e.last_ms = now;
 }
 
+/// 剔除已不存在文件的常用记录(2026-09-03):usage.json 残留已删路径的话,
+/// 删除后同名新建会继承旧使用次数,直接顶到"常用"排序第一位(用户实测
+/// "新建文本文档跑到第一位"真因)。返回剔除条数,有剔除才回写磁盘。
+pub fn prune_usage(keep: &std::collections::HashSet<String>) -> usize {
+    let mut g = usage_map();
+    let Some(map) = g.as_mut() else {
+        return 0;
+    };
+    let before = map.len();
+    map.retain(|path, _| keep.contains(path));
+    let removed = before - map.len();
+    drop(g);
+    if removed > 0 {
+        save_usage();
+    }
+    removed
+}
+
 pub fn usage_of(path: &str) -> (u32, u64) {
     let g = usage_map();
     g.as_ref()
