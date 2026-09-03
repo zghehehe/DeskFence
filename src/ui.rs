@@ -10,9 +10,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
-    GetTextExtentPoint32W, GetTextMetricsW, MonitorFromRect, ReleaseDC, SelectObject, HBRUSH,
-    HDC, HFONT, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
-    TEXTMETRICW,
+    GetTextExtentPoint32W, GetTextMetricsW, MonitorFromRect, MonitorFromWindow, ReleaseDC,
+    SelectObject, HBRUSH, HDC, HFONT, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    ScreenToClient, TEXTMETRICW,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::CoInitializeEx;
@@ -6463,8 +6463,9 @@ fn cancel_rename(edit: HWND) {
 
 const FILE_RENAME_COMMIT_MSG: u32 = WM_USER + 3;
 /// 重命名框行数自适应定时器(120ms):IME 提交不产生 WM_CHAR,纯消息钩子
-/// 会漏掉中文输入——定时器兜底覆盖一切改动来源
-const RENAME_FIT_TIMER: usize = 1;
+/// 会漏掉中文输入——定时器兜底覆盖一切改动来源。id 取高位避开 EDIT 内部
+/// 小整数定时器 id(互不覆盖)
+const RENAME_FIT_TIMER: usize = 0x4DF5;
 const WM_IME_COMPOSITION: u32 = 0x010F;
 const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
 static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
@@ -6485,7 +6486,8 @@ fn start_file_rename(path: String) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // 定位该文件所在栅栏的格子,把编辑框盖在名字标签上;找不到就放光标旁。
-    // 宽度与 Explorer 一致:=一个图标格宽(长名换行,不撑宽)。
+    // 宽度与 Explorer 一致:略宽于图标格并对格居中(长名换行,不撑宽),
+    // 见下方 pos 构造处的实测注。
     // 同时记录所在栅栏:改名期间该成员标签由编辑框替代(隐藏),建好编辑框
     // 后强制刷新所在栅栏立即生效。
     let (edit_x, edit_y, edit_w, edit_h, host_fence) = {
@@ -6499,15 +6501,21 @@ fn start_file_rename(path: String) {
                     let lay = model::layout(f, items.len());
                     let (cx, cy) = model::cell_pos(&lay, i);
                     let cs = model::icon_size();
-                    // 编辑框=标签矩形(2026-09-03 实测原生:初始尺寸=标签矩形,
-                    // 两行高;几何与 render.rs draw_item 的标签公式完全一致)
+                    // 编辑框两行高起步;宽度对齐原生(2026-09-03 editprobe 复刻
+                    // EDIT 实测):原生框比标签宽、对图标格水平居中 =
+                    // cell_w+6*scale(本机 150% 下 120 物理px,格式矩形内宽
+                    // 112px 恰好每行 6 个汉字,断行与原生截图逐行一致)。
+                    // 沿用标签宽(cell_w-2*scale)时内宽只装得下 5 个汉字,
+                    // 换行断点、总行数都与原生错位,且末行内容被挤到看不见
+                    // 的行上(用户实测"第一行不一样/看不到全部、没法改最后
+                    // 面"即由此起)。x=格左-3*scale 使框对格居中。
                     let m = model::DpiMetrics::system();
                     let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
                     let label_h = (2.0 * 24.0 + 6.0) * m.scale;
                     pos = Some((
-                        (f.rect.x + cx + m.scale).round() as i32,
+                        (f.rect.x + cx - 3.0 * m.scale).round() as i32,
                         label_top.round() as i32,
-                        (m.cell_w - 2.0 * m.scale).round() as i32,
+                        (m.cell_w + 6.0 * m.scale).round() as i32,
                         label_h.round() as i32,
                     ));
                     host = Some(f.id);
@@ -6519,7 +6527,13 @@ fn start_file_rename(path: String) {
             let (sx, sy) = screen_cursor();
             let m = model::DpiMetrics::system();
             let h = ((2.0 * 24.0 + 6.0) * m.scale).round() as i32;
-            (sx as i32 - 80, sy as i32 - 12, 180, h, None)
+            (
+                sx as i32 - 80,
+                sy as i32 - 12,
+                (model::cell_w() + 6.0 * m.scale).round() as i32,
+                h,
+                None,
+            )
         })
     };
     // 先设 PATH 再建编辑框:绘制路径据此隐藏该成员标签(与原生一致)
@@ -6725,15 +6739,28 @@ unsafe extern "system" fn file_rename_edit_proc(
 fn adjust_rename_edit_height(edit: HWND) {
     unsafe {
         const EM_GETLINECOUNT: u32 = 0x00BA;
+        const EM_GETRECT: u32 = 0x00B2;
+        const EM_SCROLLCARET: u32 = 0x00B7;
         let mut rc = RECT::default();
         let _ = GetWindowRect(edit, &mut rc);
-        let inner_w = ((rc.right - rc.left) as f32 - 10.0).max(40.0);
+        // 换行宽 = EM_GETRECT 格式矩形(内建边距已含在内,L3/R5,勿再猜),
+        // 与 EDIT 实际折行用的宽度严格同源
+        let mut fmt = RECT::default();
+        let _ = SendMessageW(
+            edit,
+            EM_GETRECT,
+            WPARAM(0),
+            LPARAM(&mut fmt as *mut RECT as isize),
+        );
+        let inner_w = ((fmt.right - fmt.left) as f32).max(40.0);
         let hdc = GetDC(edit);
         if hdc.is_invalid() {
             return;
         }
-        // 行数双保险:EM_GETLINECOUNT 对刚 SetWindowText 的编辑框可能仍报
-        // 1,再用字体实测"文本总宽/内宽"向上取整,取两者较大值
+        // 行数以 EM_GETLINECOUNT 为准(editprobe 实测 SetWindowText 后即时
+        // 即准);兜底估计改为逐字贪心模拟换行——EDIT 对 CJK 逐字断行,旧
+        // "文本总宽/内宽向上取整"忽略每行行尾的空隙,长汉字名会被低估
+        // (8 行估成 6 行)。逐字模拟对汉字名精确,拉丁词只会略高不会略低。
         let mut lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
         let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0)).0;
         let old_font = if font != 0 {
@@ -6745,12 +6772,25 @@ fn adjust_rename_edit_height(edit: HWND) {
         if len > 0 {
             let mut buf = vec![0u16; len as usize + 1];
             let _ = GetWindowTextW(edit, &mut buf);
+            let mut est = 1.0f32;
+            let mut x = 0.0f32;
             let mut sz = SIZE::default();
-            if GetTextExtentPoint32W(hdc, &buf[..len as usize], &mut sz).as_bool() && sz.cx > 0 {
-                let est = (sz.cx as f32 / inner_w).ceil();
-                if est > lines {
-                    lines = est;
+            for &u in &buf[..len as usize] {
+                // 逐 UTF-16 码元测宽;代理对拆开只影响兜底估计精度,
+                // 不影响最终行数(仍以 EM_GETLINECOUNT 为主)
+                let one = [u];
+                if GetTextExtentPoint32W(hdc, &one, &mut sz).as_bool() && sz.cx > 0 {
+                    let w = sz.cx as f32;
+                    if x > 0.0 && x + w > inner_w {
+                        est += 1.0;
+                        x = w;
+                    } else {
+                        x += w;
+                    }
                 }
+            }
+            if est > lines {
+                lines = est;
             }
         }
         if let Some(of) = old_font {
@@ -6763,26 +6803,40 @@ fn adjust_rename_edit_height(edit: HWND) {
             20.0
         };
         ReleaseDC(edit, hdc);
-        // 高度不超工作区;底边超出时整框上移(末行始终可见可编辑,超长名
-        // 也不会"看不到最后面、删不掉")
-        let (_, vy, _, vh) = work_area();
-        let mut new_h =
-            ((lines * line_h).round() as i32 + 8).min((vy + vh - rc.top as f32).max(24.0) as i32);
-        new_h = new_h.max(24).min(vh as i32);
+        // 行槽 = 行数+1(editprobe 对照原生截图:原生 6 行框高 ≈(6+1)*24+4,
+        // 末行下留一整槽空白;+1 槽同时吸收兜底估计的瞬时偏差,末行永不贴边)
+        // 封顶改按显示器而非 SPI 工作区:原生编辑框是桌面 listview 的子窗,
+        // 客户区=整块显示器,改名框可以覆住任务栏;旧实现按工作区封顶,栅栏
+        // 靠屏底时尾部行整行消失(用户实测"看不到全部、没法改最后面")。
+        // 仍放不下才整框上移,贴住显示器底缘。
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let in_mon = GetMonitorInfoW(MonitorFromWindow(edit, MONITOR_DEFAULTTONEAREST), &mut mi)
+            .as_bool();
+        let (mon_top, mon_bottom) = if in_mon {
+            (mi.rcMonitor.top as f32, mi.rcMonitor.bottom as f32)
+        } else {
+            let (_, vy, _, vh) = work_area();
+            (vy, vy + vh)
+        };
+        let new_h = ((((lines + 1.0) * line_h).round() as i32 + 8) as f32)
+            .min(mon_bottom - mon_top)
+            .max(24.0) as i32;
         let mut top = rc.top;
-        let bottom_limit = (vy + vh) as i32;
-        if top + new_h > bottom_limit {
-            top = (bottom_limit - new_h).max(vy as i32);
+        if top + new_h > mon_bottom as i32 {
+            top = (mon_bottom as i32 - new_h).max(mon_top as i32);
         }
-        let _ = SetWindowPos(
-            edit,
-            HWND(0),
-            top,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE,
-        );
+        if top != rc.top {
+            let _ = SetWindowPos(
+                edit,
+                HWND(0),
+                top,
+                rc.left,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
         if new_h != rc.bottom - rc.top {
             let _ = SetWindowPos(
                 edit,
@@ -6794,6 +6848,8 @@ fn adjust_rename_edit_height(edit: HWND) {
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        // 尾部行在框内时把光标滚回可见区:改名起点就与原生一致,末尾可直达
+        let _ = SendMessageW(edit, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -6873,7 +6929,7 @@ fn commit_file_rename(edit: HWND) {
     }
     uninstall_rename_mouse_hook();
     unsafe {
-        KillTimer(edit, RENAME_FIT_TIMER);
+        let _ = KillTimer(edit, RENAME_FIT_TIMER);
         let _ = DestroyWindow(edit);
     }
     rescan();
