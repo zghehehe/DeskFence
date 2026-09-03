@@ -6502,20 +6502,19 @@ fn start_file_rename(path: String) {
                     let (cx, cy) = model::cell_pos(&lay, i);
                     let cs = model::icon_size();
                     // 编辑框两行高起步;宽度对齐原生(2026-09-03 editprobe 复刻
-                    // EDIT 实测):原生框比标签宽、对图标格水平居中 =
-                    // cell_w+6*scale(本机 150% 下 120 物理px,格式矩形内宽
-                    // 112px 恰好每行 6 个汉字,断行与原生截图逐行一致)。
-                    // 沿用标签宽(cell_w-2*scale)时内宽只装得下 5 个汉字,
-                    // 换行断点、总行数都与原生错位,且末行内容被挤到看不见
-                    // 的行上(用户实测"第一行不一样/看不到全部、没法改最后
-                    // 面"即由此起)。x=格左-3*scale 使框对格居中。
+                    // EDIT 实测 + 两轮用户截图逐像素比对):原生框外宽 =
+                    // cell_w+4*scale(本机 150% 下 120 物理px),对图标格水平
+                    // 居中,格式矩形内宽 112px——"新建 文本文档"(113px)恰好
+                    // 放不进首行,断行与原生逐行一致。+6*scale(123px)时内宽
+                    // 115px 首行会多装一个汉字,后续行整体错位(用户第二轮
+                    // 截图实测)。x=格左-2*scale 使框对格居中。
                     let m = model::DpiMetrics::system();
                     let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
                     let label_h = (2.0 * 24.0 + 6.0) * m.scale;
                     pos = Some((
-                        (f.rect.x + cx - 3.0 * m.scale).round() as i32,
+                        (f.rect.x + cx - 2.0 * m.scale).round() as i32,
                         label_top.round() as i32,
-                        (m.cell_w + 6.0 * m.scale).round() as i32,
+                        (m.cell_w + 4.0 * m.scale).round() as i32,
                         label_h.round() as i32,
                     ));
                     host = Some(f.id);
@@ -6530,7 +6529,7 @@ fn start_file_rename(path: String) {
             (
                 sx as i32 - 80,
                 sy as i32 - 12,
-                (model::cell_w() + 6.0 * m.scale).round() as i32,
+                (model::cell_w() + 4.0 * m.scale).round() as i32,
                 h,
                 None,
             )
