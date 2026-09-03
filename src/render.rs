@@ -633,6 +633,10 @@ pub fn draw_fence(
     // 正在就地重命名的文件路径:该成员的图标名标签由编辑框替代,不绘制
     // (与原生一致,避免标签从编辑框底下透出)
     hide_label: Option<&str>,
+    // 正在入场动画中的文件路径:不绘制其墨水(图标+标签),但布局槽位保留——
+    // 新文件"先落在桌面、再飞入栅栏"期间栅栏里不能提前露脸,落地(动画结束
+    // 后 refresh_fence)才显形
+    hide_arrivals: &[String],
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
     let w = fence.rect.w;
@@ -709,6 +713,10 @@ pub fn draw_fence(
             for i in 0..layout.visible {
                 let real = layout.first_index + i;
                 let Some(item) = items.get(real) else { break };
+                if hide_arrivals.iter().any(|p| p == &item.path) {
+                    // 入场动画中:槽位保留(几何稳定),墨水不画
+                    continue;
+                }
                 let (ix, iy) = model::cell_pos_with_metrics(layout, real, metrics);
                 let hovered = hover_idx == Some(real);
                 let selected = selected_paths.contains(&item.path);

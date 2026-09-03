@@ -2126,6 +2126,11 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         marquee,
         // 正在就地重命名的成员:标签由编辑框替代(与原生一致)
         FILE_RENAME_PATH.lock().unwrap().as_deref(),
+        // 入场动画中的成员:落地前不在栅栏里露脸(先落在桌面格,再飞入)
+        &s.arrival_animations
+            .iter()
+            .map(|a| a.path.clone())
+            .collect::<Vec<String>>(),
     );
     let t_draw = resize_now_ms() - t_draw0;
     let pos = POINT {
@@ -2264,6 +2269,7 @@ fn warm_renderer_scratch() {
         false,
         None,
         None,
+        &[],
     );
     // 空作业时标签绘制会早退,补一个 1 字符作业触发
     // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
@@ -2542,8 +2548,11 @@ pub fn rescan() {
     }
     rebuild_pins();
     refit_auto_fence_heights();
-    show_all_fences();
+    // 先排队入场动画再渲染栅栏(2026-09-03):栅栏帧按 hide_arrivals 跳过
+    // 飞行中成员的墨水——新文件"先落在桌面格、飞入落地后才在栅栏显形";
+    // 若先渲染后排队,文件会瞬间出现在栅栏里,动画沦为重复影子
     start_arrival_animations(&added_paths);
+    show_all_fences();
 }
 
 /// 默认栅栏尺寸:2 列宽 × 5 行高(用户指定;内容超出自动滚动)
@@ -2731,25 +2740,41 @@ fn start_arrival_animations(added_paths: &[String]) {
 }
 
 fn tick_arrival_animations() {
-    let mut s = state().lock().unwrap();
-    if s.arrival_animations.is_empty() {
-        return;
-    }
-    ensure_guide_window(&mut s);
-    refresh_guide(&mut s);
-    if s.arrival_animations.is_empty() {
-        if let Some(tray) = TRAY_HWND.get().copied() {
-            unsafe {
-                let _ = KillTimer(tray, TIMER_ANIMATION);
-            }
+    let landed: Vec<u32>;
+    {
+        let mut s = state().lock().unwrap();
+        if s.arrival_animations.is_empty() {
+            return;
         }
-        if s.drag_ghost.is_none() && s.guide_x.is_none() && s.guide_y.is_none() {
-            if let Some(hwnd) = s.guide_hwnd {
+        // 已落地(动画到期)的成员:记下栅栏,refresh_guide 的 retain 清掉
+        // 它们之后逐栏刷新——栅栏此前按 hide_arrivals 跳过其墨水,落地即显形
+        let now = resize_now_ms();
+        landed = s
+            .arrival_animations
+            .iter()
+            .filter(|a| now.saturating_sub(a.started_ms) > a.duration_ms + 180)
+            .map(|a| a.fence_id)
+            .collect();
+        ensure_guide_window(&mut s);
+        refresh_guide(&mut s);
+        if s.arrival_animations.is_empty() {
+            if let Some(tray) = TRAY_HWND.get().copied() {
                 unsafe {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    let _ = KillTimer(tray, TIMER_ANIMATION);
+                }
+            }
+            if s.drag_ghost.is_none() && s.guide_x.is_none() && s.guide_y.is_none() {
+                if let Some(hwnd) = s.guide_hwnd {
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
                 }
             }
         }
+    }
+    // 锁外刷新:refresh_fence 内部要拿 state 锁,持锁重入必死锁
+    for fence_id in landed {
+        refresh_fence(fence_id);
     }
 }
 
