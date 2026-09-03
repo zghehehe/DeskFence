@@ -1855,7 +1855,16 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
             "常用" => {
                 let (ca, la) = usage_of(&a.path);
                 let (cb, lb) = usage_of(&b.path);
-                cb.cmp(&ca).then_with(|| lb.cmp(&la)).then_with(fallback)
+                // 次数并列(典型:都是从未打开的新文件)按 mtime 升序——
+                // 先来的在左、新来的追加靠右(2026-09-03 用户实测反馈)。
+                // 旧实现并列时落到名称码点,"新建 Microsooft Excel"(M)会
+                // 压过先建的"新建 文本文档"(文)排到左边,位置毫无预告。
+                // 文件夹仍优先于文件(与 fallback 习惯一致)。
+                cb.cmp(&ca)
+                    .then_with(|| lb.cmp(&la))
+                    .then_with(|| b.is_dir.cmp(&a.is_dir))
+                    .then_with(|| a.mtime_ms.cmp(&b.mtime_ms))
+                    .then_with(fallback)
             }
             "时间" => b.mtime_ms.cmp(&a.mtime_ms).then_with(fallback),
             "名称" => natural_name_cmp(&a.name, &b.name),
@@ -1878,6 +1887,44 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_sort_appends_new_files_to_the_right() {
+        // "常用"排序:两个都从未打开过的文件,先建的(mtime 早)在左,
+        // 后建的追加靠右——不吃名称码点(旧实现 latin 文件名会插到中文前)
+        let fence = Fence {
+            id: 1,
+            title: "文档".into(),
+            category: "文档".into(),
+            pinned: vec![],
+            item_order: vec![],
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: "常用".into(),
+        };
+        let mk = |name: &str, mtime: u64| FileItem {
+            name: name.into(),
+            path: format!(r"C:\Desktop\{name}"),
+            is_dir: false,
+            ext: "txt".into(),
+            category: "文档".into(),
+            mtime_ms: mtime,
+        };
+        // 输入故意先给后建的,验证排序键而非输入顺序
+        let items = vec![mk("新建 Microsoft Excel 工作表.xlsx", 2000), mk("新建 文本文档 (2).txt", 1000)];
+        let out = display_list(&fence, &items);
+        assert_eq!(out[0].name, "新建 文本文档 (2).txt");
+        assert_eq!(out[1].name, "新建 Microsoft Excel 工作表.xlsx");
+    }
 
     #[test]
     fn chain_keeps_drop_position_and_fixed_gaps() {
