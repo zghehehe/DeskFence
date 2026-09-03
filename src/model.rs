@@ -1894,7 +1894,10 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => fallback(),
+                    // 拖拽顺序表里都没有的(纯新建未拖过):按 mtime 升序——
+                    // 先来的在左、新来的追加靠右(2026-09-03 用户实测:excel
+                    // 后建却排到 txt 左边);名称码点无时间语义
+                    (None, None) => a.mtime_ms.cmp(&b.mtime_ms).then_with(fallback),
                 }
             }
         }
@@ -1905,6 +1908,30 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn debug_display_order_real_scan() {
+        let files = crate::shell::scan_desktop();
+        let fence = Fence {
+            id: 3,
+            title: "文档".into(),
+            category: "文档".into(),
+            pinned: vec![],
+            item_order: vec![],
+            rect: Rect { x: 0.0, y: 0.0, w: 244.0, h: 575.0 },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: "常用".into(),
+        };
+        let out = display_list(&fence, &files);
+        for (i, f) in out.iter().enumerate() {
+            println!("{:2}. {} mtime={}", i, f.name, f.mtime_ms);
+        }
+    }
 
     #[test]
     fn usage_sort_appends_new_files_to_the_right() {

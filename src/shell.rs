@@ -2094,6 +2094,35 @@ pub fn start_explorer() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore]
+    fn debug_scan_mtimes() {
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("__probe_fresh.txt");
+        std::fs::write(&probe, b"x").unwrap();
+        let files = crate::shell::scan_desktop();
+        let real = std::fs::metadata(&probe)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match files.iter().find(|f| f.name == "__probe_fresh.txt") {
+            Some(f) => println!(
+                "PROBE: scanned mtime_ms={} real_ms={} delta={}",
+                f.mtime_ms,
+                real,
+                real as i64 - f.mtime_ms as i64
+            ),
+            None => println!("PROBE: fresh file MISSING from scan (real_ms={real})"),
+        }
+        std::fs::remove_file(&probe).ok();
+    }
+
+
     use super::select_image_size;
 
     #[test]
