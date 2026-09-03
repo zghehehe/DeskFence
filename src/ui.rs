@@ -2657,6 +2657,75 @@ fn desktop_free_slot(s: &UiState, used: &mut Vec<Rect>) -> Option<(f32, f32)> {
     None
 }
 
+/// 定位能展示 path 的栅栏及其可见槽位的图标屏幕坐标(图标左上角)。
+/// auto_scroll=槽位在滚动页外时把栅栏滚到该行(新建入场用);false=页外
+/// 直接返回 None(迁移动画抓旧栏起点用,不应为起飞而滚动旧栏)。
+fn fence_slot_screen_pos(
+    s: &mut UiState,
+    path: &str,
+    auto_scroll: bool,
+) -> Option<(u32, (f32, f32))> {
+    let item = s.files.iter().find(|item| item.path == path)?.clone();
+    let mut fence = s
+        .fences
+        .iter()
+        .find(|fence| {
+            fence.pinned.contains(&item.path)
+                || fence.category.is_empty()
+                || fence.category == item.category
+        })?
+        .clone();
+    if fence.hidden || fence.collapsed {
+        return None;
+    }
+    let items = model::display_list(&fence, &s.files);
+    let index = items.iter().position(|c| c.path == item.path)?;
+    let metrics = s
+        .metrics
+        .get(&fence.id)
+        .copied()
+        .unwrap_or_else(model::DpiMetrics::system);
+    let mut layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+    if index < layout.first_index || index >= layout.first_index + layout.visible {
+        // 新条目落在滚动页外(2026-09-03):"常用"排序下新文件使用次数为
+        // 零只能排最后,内容超一页的栅栏(如文档 2×4=8 槽)会把它排进
+        // 第二页——旧逻辑这里静默跳过,新文件既无动画也看不见落在哪
+        // (用户实测"新建没动画"的真因)。改为把栅栏滚到该条目所在行,
+        // 让飞入落点可见;连滚都滚不到(不可能:行数≤总行数)才放弃。
+        if !auto_scroll {
+            return None;
+        }
+        let cols = layout.cols.max(1);
+        let row = index / cols;
+        let max_scroll = layout.total_rows.saturating_sub(layout.rows);
+        if max_scroll == 0 {
+            return None;
+        }
+        let scroll = row.min(max_scroll);
+        fence.scroll_rows = scroll;
+        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence.id) {
+            f.scroll_rows = scroll;
+        }
+        layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+        if index < layout.first_index || index >= layout.first_index + layout.visible {
+            return None;
+        }
+        log(&format!(
+            "arrival: scrolled fence {} to row {} for off-page item",
+            fence.id, scroll
+        ));
+    }
+    let (cell_x, cell_y) = model::cell_pos_with_metrics(&layout, index, &metrics);
+    let icon_offset = (metrics.cell_w - metrics.icon_px) / 2.0;
+    Some((
+        fence.id,
+        (
+            fence.rect.x + cell_x + icon_offset,
+            fence.rect.y + cell_y + 4.0,
+        ),
+    ))
+}
+
 fn start_arrival_animations(added_paths: &[String]) {
     if added_paths.is_empty() || !client_area_animations_enabled() {
         return;
@@ -2672,75 +2741,30 @@ fn start_arrival_animations(added_paths: &[String]) {
         let Some(item) = s.files.iter().find(|item| &item.path == path).cloned() else {
             continue;
         };
-        let Some(fence) = s
-            .fences
-            .iter()
-            .find(|fence| {
-                fence.pinned.contains(path)
-                    || fence.category.is_empty()
-                    || fence.category == item.category
-            })
-            .cloned()
-        else {
-            continue;
-        };
-        if fence.hidden || fence.collapsed {
-            continue;
-        }
-        let items = model::display_list(&fence, &s.files);
-        let Some(index) = items
-            .iter()
-            .position(|candidate| candidate.path == item.path)
-        else {
+        let Some((fence_id, to)) = fence_slot_screen_pos(&mut s, path, true) else {
             continue;
         };
         let metrics = s
             .metrics
-            .get(&fence.id)
+            .get(&fence_id)
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
-        let mut layout = model::layout_with_metrics(&fence, items.len(), &metrics);
-        let mut fence = fence;
-        if index < layout.first_index || index >= layout.first_index + layout.visible {
-            // 新条目落在滚动页外(2026-09-03):"常用"排序下新文件使用次数为
-            // 零只能排最后,内容超一页的栅栏(如文档 2×4=8 槽)会把它排进
-            // 第二页——旧逻辑这里静默跳过,新文件既无动画也看不见落在哪
-            // (用户实测"新建没动画"的真因)。改为把栅栏滚到该条目所在行,
-            // 让飞入落点可见;连滚都滚不到(不可能:行数≤总行数)才放弃。
-            let cols = layout.cols.max(1);
-            let row = index / cols;
-            let max_scroll = layout.total_rows.saturating_sub(layout.rows);
-            if max_scroll == 0 {
-                continue;
-            }
-            let scroll = row.min(max_scroll);
-            fence.scroll_rows = scroll;
-            if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence.id) {
-                f.scroll_rows = scroll;
-            }
-            layout = model::layout_with_metrics(&fence, items.len(), &metrics);
-            if index < layout.first_index || index >= layout.first_index + layout.visible {
-                continue;
-            }
-            log(&format!(
-                "arrival: scrolled fence {} to row {} for off-page item",
-                fence.id, scroll
-            ));
-        }
-        let (cell_x, cell_y) = model::cell_pos_with_metrics(&layout, index, &metrics);
-        let icon_offset = (metrics.cell_w - metrics.icon_px) / 2.0;
-        let to = (
-            fence.rect.x + cell_x + icon_offset,
-            fence.rect.y + cell_y + 4.0,
-        );
         // 新文件先"落在桌面空白处"(围栏外的原生网格位),停留片刻再飞入栅栏;
         // 找不到围栏外空位时回退为从栅栏标题中心飞出
-        let from = desktop_free_slot(&s, &mut used_slots).unwrap_or((
-            fence.rect.x + fence.rect.w * 0.5 - metrics.icon_px * 0.5,
-            (fence.rect.y + metrics.title_h * 0.5 - metrics.icon_px * 0.5).max(0.0),
-        ));
+        let from = desktop_free_slot(&s, &mut used_slots).unwrap_or_else(|| {
+            let (fx, fy, fw) = s
+                .fences
+                .iter()
+                .find(|f| f.id == fence_id)
+                .map(|f| (f.rect.x, f.rect.y, f.rect.w))
+                .unwrap_or((0.0, 0.0, 200.0));
+            (
+                fx + fw * 0.5 - metrics.icon_px * 0.5,
+                (fy + metrics.title_h * 0.5 - metrics.icon_px * 0.5).max(0.0),
+            )
+        });
         pending.push(ArrivalAnimation {
-            fence_id: fence.id,
+            fence_id,
             path: item.path,
             name: render::display_name(&item.name),
             from,
@@ -2767,6 +2791,69 @@ fn start_arrival_animations(added_paths: &[String]) {
         }
     }
     refresh_guide(&mut s);
+}
+
+/// 跨栏迁移动画(2026-09-03):改名改扩展名(如 mp3→md)导致分类变化时,
+/// 从旧栏旧槽位飞向新栏新槽位——与新建入场动画共用同一 overlay 管线。
+/// moves: (路径, 旧栅栏id, 旧槽位屏幕x, y)。必须在 rescan 之后调用:
+/// 旧栏已不含该成员、新栏帧已渲染;排队后刷新新栏把成员藏到落地
+/// (hide_arrivals),飞行由 TIMER_ANIMATION 驱动,落地由 tick 显形。
+fn queue_migration_animations(moves: &[(String, u32, f32, f32)]) {
+    if moves.is_empty() || !client_area_animations_enabled() {
+        return;
+    }
+    let now = resize_now_ms();
+    let mut refresh_ids: Vec<u32> = Vec::new();
+    {
+        let mut s = state().lock().unwrap();
+        let mut queued_any = false;
+        for (path, old_fence, fx, fy) in moves {
+            let Some((fence_id, to)) = fence_slot_screen_pos(&mut s, path, true) else {
+                continue;
+            };
+            if fence_id == *old_fence {
+                continue;
+            }
+            let name = s
+                .files
+                .iter()
+                .find(|i| &i.path == path)
+                .map(|i| render::display_name(&i.name))
+                .unwrap_or_default();
+            log(&format!(
+                "arrival: migrate '{}' fence {}->{} from=({:.0},{:.0}) to=({:.0},{:.0})",
+                name, old_fence, fence_id, fx, fy, to.0, to.1
+            ));
+            s.arrival_animations.push(ArrivalAnimation {
+                fence_id,
+                path: path.clone(),
+                name,
+                from: (*fx, *fy),
+                to,
+                // 旧栏位置短暂停留(150ms)再起飞,飞行距离跨栏更远,不加停留
+                started_ms: now + 150,
+                duration_ms: 520,
+            });
+            if !refresh_ids.contains(&fence_id) {
+                refresh_ids.push(fence_id);
+            }
+            queued_any = true;
+        }
+        if !queued_any {
+            return;
+        }
+        ensure_guide_window(&mut s);
+        refresh_guide(&mut s);
+    }
+    // 锁外刷新:refresh_fence 内部要拿 state 锁
+    for id in refresh_ids {
+        refresh_fence(id);
+    }
+    if let Some(tray) = TRAY_HWND.get().copied() {
+        unsafe {
+            let _ = SetTimer(tray, TIMER_ANIMATION, 16, None);
+        }
+    }
 }
 
 fn tick_arrival_animations() {
@@ -6934,6 +7021,7 @@ fn commit_file_rename(edit: HWND) {
     log("file rename commit");
     let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
     let mut renamed = false;
+    let mut migration: Option<(String, u32, f32, f32)> = None;
     if !old_path.is_empty() {
         let mut buf = [0u16; 512];
         unsafe {
@@ -6982,11 +7070,27 @@ fn commit_file_rename(edit: HWND) {
             // category 必须随名重算(2026-09-03):txt 改名 mp4 后分类仍是
             // 旧值的话文件会永远留在原分类栅栏里;且下面的 rescan 早退
             // 只比路径,内存已同步路径后它必然早退,分类永远不会再算
+            let old_cat = s
+                .files
+                .iter()
+                .find(|f| f.path == old_path)
+                .map(|f| (f.category.clone(), f.is_dir));
+            let new_cat = model::categorize(
+                &new_name,
+                old_cat.as_ref().map(|(_, d)| *d).unwrap_or(false),
+            );
+            let cat_changed = old_cat.as_ref().is_some_and(|(c, _)| *c != new_cat);
+            if cat_changed {
+                // 迁移动画起点:必须在分类同步前抓取旧栏旧槽位
+                // (auto_scroll=false:不为起飞而滚动旧栏)
+                migration = fence_slot_screen_pos(&mut s, &old_path, false)
+                    .map(|(fid, p)| (new_path.clone(), fid, p.0, p.1));
+            }
             for f in s.files.iter_mut() {
                 if f.path == old_path {
                     f.path = new_path.clone();
                     f.name = new_name.clone();
-                    f.category = model::categorize(&new_name, f.is_dir);
+                    f.category = new_cat.clone();
                 }
             }
         } else if !invalid {
@@ -7019,6 +7123,11 @@ fn commit_file_rename(edit: HWND) {
         RENAME_RESCAN_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     rescan();
+    // 跨栏迁移动画必须在 rescan 之后排队:目标分类栅栏(可能新建)已就位、
+    // 新栏帧已渲染,这里排队并刷新新栏把成员藏到落地显形
+    if let Some((new_path, old_fid, fx, fy)) = migration {
+        queue_migration_animations(&[(new_path, old_fid, fx, fy)]);
+    }
 }
 
 fn cancel_file_rename(edit: HWND) {
