@@ -2474,20 +2474,34 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
 /// 桌面文件变更刷新
 pub fn rescan() {
     let files = with_recycle_bin(shell::scan_desktop());
-    let (added_paths, removed_any) = {
+    let (added_paths, removed_any, recat_any) = {
         let s = state().lock().unwrap();
         let added = model::newly_added_paths(&s.files, &files);
         let new_set: std::collections::HashSet<&str> =
             files.iter().map(|f| f.path.as_str()).collect();
         let removed = s.files.iter().any(|f| !new_set.contains(f.path.as_str()));
-        (added, removed)
+        // 分类漂移也算变化(2026-09-03):同名文件的分类变了(改名内存同步
+        // 后、或将来分类规则调整)不能走"无变化早退"——早退会跳过
+        // ensure_missing_category_fences,改名成 mp4 的文件永远留在文档栏
+        let mut old_cats: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for f in s.files.iter() {
+            old_cats.insert(f.path.as_str(), f.category.as_str());
+        }
+        let recat = files
+            .iter()
+            .any(|f| old_cats.get(f.path.as_str()).is_some_and(|&c| c != f.category));
+        (added, removed, recat)
     };
-    if added_paths.is_empty() && !removed_any {
-        // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
-        // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
-        // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
-        // 表现为点桌面/关菜单后栅栏区域闪一下。
-        return;
+    if added_paths.is_empty() && !removed_any && !recat_any {
+        if !RENAME_RESCAN_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
+            // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
+            // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
+            // 表现为点桌面/关菜单后栅栏区域闪一下。
+            return;
+        }
+        // 改名提交强制走一遍:补建缺类栅栏+收敛,尽管 diff 为空
     }
     let new_cats: Vec<String> = {
         let mut s = state().lock().unwrap();
@@ -6470,6 +6484,13 @@ const WM_IME_COMPOSITION: u32 = 0x010F;
 const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
 static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
 static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// 改名提交后置位:rescan 的"无变化早退"必须跳过一次。改名提交已把内存
+/// 文件列表同步到新路径/新分类,磁盘扫描结果与内存全一致,任何 diff 都看
+/// 不出变化——但新分类缺栅栏时 ensure_missing_category_fences 必须跑一遍,
+/// 否则改名成 mp4 的文件无栅栏可归=隐身(2026-09-03 实测"改名后不再自动
+/// 建分类栅栏"的根因:内存同步把变化对 rescan 藏住了)
+static RENAME_RESCAN_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// 系统菜单"重命名"拦截回调(shell.rs 在 init 时注册)
 fn on_shell_rename_request(path: &str) {
@@ -6857,6 +6878,7 @@ fn adjust_rename_edit_height(edit: HWND) {
 fn commit_file_rename(edit: HWND) {
     log("file rename commit");
     let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
+    let mut renamed = false;
     if !old_path.is_empty() {
         let mut buf = [0u16; 512];
         unsafe {
@@ -6874,7 +6896,6 @@ fn commit_file_rename(edit: HWND) {
             || new_name
                 .chars()
                 .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
-        let mut renamed = false;
         if !invalid {
             renamed = shell::rename_path(&old_path, &new_name);
         }
@@ -6902,11 +6923,15 @@ fn commit_file_rename(edit: HWND) {
                 s.selection_anchor = Some(new_path.clone());
             }
             // 同步内存文件列表(2026-09-02,与原生一致):改名立即生效,不等
-            // 异步 rescan——消除"改名后双击旧路径(已不存在)"的窗口期
+            // 异步 rescan——消除"改名后双击旧路径(已不存在)"的窗口期。
+            // category 必须随名重算(2026-09-03):txt 改名 mp4 后分类仍是
+            // 旧值的话文件会永远留在原分类栅栏里;且下面的 rescan 早退
+            // 只比路径,内存已同步路径后它必然早退,分类永远不会再算
             for f in s.files.iter_mut() {
                 if f.path == old_path {
                     f.path = new_path.clone();
                     f.name = new_name.clone();
+                    f.category = model::categorize(&new_name, f.is_dir);
                 }
             }
         } else if !invalid {
@@ -6932,6 +6957,11 @@ fn commit_file_rename(edit: HWND) {
     unsafe {
         let _ = KillTimer(edit, RENAME_FIT_TIMER);
         let _ = DestroyWindow(edit);
+    }
+    if renamed {
+        // 内存已同步,磁盘扫描与内存一致,rescan 的 diff 必为空——
+        // 置强制位让缺类补建跑一遍(改名成 mp4 要能冒出媒体栅栏)
+        RENAME_RESCAN_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     rescan();
 }
