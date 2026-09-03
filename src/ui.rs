@@ -2479,9 +2479,28 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
 
 /// 桌面文件变更刷新
 pub fn rescan() {
-    let files = with_recycle_bin(shell::scan_desktop());
+    let mut files = with_recycle_bin(shell::scan_desktop());
     let (added_paths, removed_any, recat_any, gained_cats) = {
-        let s = state().lock().unwrap();
+        let mut s = state().lock().unwrap();
+        // 扫描宽恕:上一轮在册、本轮扫不到的路径,连续 SCAN_MISS_DROP 轮
+        // 才真正移除(未达阈值时从上一轮找回,保持文件可见)——元数据瞬态
+        // 读取失败不再引发"文件消失/栅栏重排"(用户实测"文档自动移位")
+        {
+            let mut miss = scan_miss_map().lock().unwrap();
+            let present: std::collections::HashSet<String> =
+                files.iter().map(|f| f.path.clone()).collect();
+            for f in s.files.iter() {
+                if present.contains(&f.path) {
+                    miss.remove(&f.path);
+                } else {
+                    let c = miss.entry(f.path.clone()).or_insert(0);
+                    if *c < SCAN_MISS_DROP {
+                        files.push(f.clone());
+                    }
+                }
+            }
+            miss.retain(|k, _| present.contains(k) || s.files.iter().any(|f| f.path == *k));
+        }
         let added = model::newly_added_paths(&s.files, &files);
         let new_set: std::collections::HashSet<&str> =
             files.iter().map(|f| f.path.as_str()).collect();
@@ -5325,6 +5344,8 @@ fn dispatch_file_key(fence_id: u32, packed: usize) {
             .copied()
             .unwrap_or(HWND(0));
         shell::delete_to_recycle_bin_many(hwnd, &delete_paths);
+        // 主动删除:扫描宽恕立即放行,删除当轮即生效
+        mark_scan_removed(&delete_paths);
         rescan();
     }
     for path in open_paths.into_iter().take(32) {
@@ -6669,6 +6690,24 @@ static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
 /// 建分类栅栏"的根因:内存同步把变化对 rescan 藏住了)
 static RENAME_RESCAN_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+// ---------------- 扫描宽恕(2026-09-03) ----------------
+/// 路径→连续扫描未遇次数。刚消失的文件连续 SCAN_MISS_DROP 轮扫不到才真正
+/// 移除:新建/写入中的文件元数据可能被创建方进程短暂锁住,单轮扫描漏掉
+/// 就把在册文件当"消失"会引发栅栏重排、位置漂移(用户实测"文档自动移位")。
+/// 应用主动删除的路径用 mark_scan_removed 立即达阈值,不拖尾巴。
+const SCAN_MISS_DROP: u32 = 2;
+fn scan_miss_map() -> &'static Mutex<std::collections::HashMap<String, u32>> {
+    static M: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn mark_scan_removed(paths: &[String]) {
+    let mut miss = scan_miss_map().lock().unwrap();
+    for p in paths {
+        miss.insert(p.clone(), SCAN_MISS_DROP);
+    }
+}
 
 /// 系统菜单"重命名"拦截回调(shell.rs 在 init 时注册)
 fn on_shell_rename_request(path: &str) {
@@ -8982,6 +9021,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 }
                 if !paths.is_empty() {
                     shell::delete_to_recycle_bin_many(hwnd, &paths);
+                    mark_scan_removed(&paths);
                     rescan();
                 } else {
                     refresh_fence(fence_id);
@@ -9048,6 +9088,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 }
                 if !paths.is_empty() {
                     shell::delete_to_recycle_bin_many(hwnd, &paths);
+                    mark_scan_removed(&paths);
                     rescan();
                 } else {
                     refresh_fence(fence_id);
@@ -9656,6 +9697,7 @@ pub fn on_fence_drop_cb(fence_id: u32, paths: Vec<String>, screen_x: i32, screen
             paths.len()
         ));
         shell::delete_to_recycle_bin_many(hwnd, &paths);
+        mark_scan_removed(&paths);
         rescan();
         return;
     }

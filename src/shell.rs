@@ -338,7 +338,16 @@ fn scan_desktop_dir(dir: &std::path::Path) -> Vec<FileItem> {
     };
     for entry in entries.flatten() {
         let raw_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(md) = entry.metadata() else { continue };
+        // 元数据可能被创建方进程短暂锁住(刚新建的文件):目录项侧失败时
+        // 用路径侧重试一次,仍失败才跳过——跳过=该轮 rescan 认为文件不存在,
+        // 会把刚新建的文件当"消失"处理(2026-09-03 用户实测位置漂移)
+        let md = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => match std::fs::metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            },
+        };
         let attrs = md.file_attributes();
         if raw_name.eq_ignore_ascii_case("desktop.ini") {
             continue;
