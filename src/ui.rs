@@ -2480,7 +2480,7 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
 /// 桌面文件变更刷新
 pub fn rescan() {
     let files = with_recycle_bin(shell::scan_desktop());
-    let (added_paths, removed_any, recat_any) = {
+    let (added_paths, removed_any, recat_any, gained_cats) = {
         let s = state().lock().unwrap();
         let added = model::newly_added_paths(&s.files, &files);
         let new_set: std::collections::HashSet<&str> =
@@ -2497,7 +2497,18 @@ pub fn rescan() {
         let recat = files
             .iter()
             .any(|f| old_cats.get(f.path.as_str()).is_some_and(|&c| c != f.category));
-        (added, removed, recat)
+        // 有成员"迁入"的分类(2026-09-03):外部改名/分类规则调整导致某文件
+        // 分类变化,与在应用内改名同权——清该分类墓碑,否则墓碑挡住缺类补
+        // 建,迁入成员无栏可归=隐身
+        let mut gained: Vec<String> = Vec::new();
+        for f in files.iter() {
+            if let Some(old) = old_cats.get(f.path.as_str()) {
+                if *old != f.category && !gained.contains(&f.category) {
+                    gained.push(f.category.clone());
+                }
+            }
+        }
+        (added, removed, recat, gained)
     };
     if added_paths.is_empty() && !removed_any && !recat_any {
         if !RENAME_RESCAN_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -2537,6 +2548,15 @@ pub fn rescan() {
             fence
                 .item_order
                 .retain(|p| keep.contains(p) || fence.pinned.contains(p));
+        }
+        // 迁入分类的墓碑清理必须在补建之前(否则墓碑挡路,迁入成员隐身)
+        for cat in &gained_cats {
+            if category_tombstone_at(cat).is_some() {
+                clear_category_tombstone(cat);
+                log(&format!(
+                    "category '{cat}' tombstone cleared by incoming member"
+                ));
+            }
         }
         ensure_missing_category_fences(&mut s)
     };
@@ -7097,6 +7117,11 @@ fn commit_file_rename(edit: HWND) {
             );
             let cat_changed = old_cat.as_ref().is_some_and(|(c, _)| *c != new_cat);
             if cat_changed {
+                // 用户主动把文件改名进某分类=明确意图,先清该分类墓碑:
+                // 墓碑的"新文件"判定只看 mtime(改名不变 mtime),不清理的话
+                // 墓碑挡住缺类补建,文件无栏可归=隐身(2026-09-03 用户实测
+                // md→mp3 后媒体栅栏不建、文件失踪)
+                clear_category_tombstone(&new_cat);
                 // 迁移动画起点:必须在分类同步前抓取旧栏旧槽位
                 // (auto_scroll=false:不为起飞而滚动旧栏)
                 migration = fence_slot_screen_pos(&mut s, &old_path, false)
