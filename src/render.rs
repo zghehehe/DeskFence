@@ -630,6 +630,9 @@ pub fn draw_fence(
     fence_hovered: bool,
     active: bool,
     marquee: Option<(f32, f32, f32, f32)>,
+    // 正在就地重命名的文件路径:该成员的图标名标签由编辑框替代,不绘制
+    // (与原生一致,避免标签从编辑框底下透出)
+    hide_label: Option<&str>,
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
     let w = fence.rect.w;
@@ -713,6 +716,7 @@ pub fn draw_fence(
                 draw_item(
                     rt, r, item, ix, iy, metrics, icon_cache, hovered, selected, focused, accent,
                     &mut jobs,
+                    hide_label == Some(item.path.as_str()),
                 );
             }
             if layout.total_rows > layout.rows && show_chrome {
@@ -1238,6 +1242,7 @@ fn draw_item(
     focused: bool,
     accent: [f32; 3],
     jobs: &mut Vec<GdiLabelJob>,
+    hide_label: bool,
 ) {
     unsafe {
         let cs = metrics.icon_px;
@@ -1338,6 +1343,10 @@ fn draw_item(
         // 文字统一交给 GDI ClearType(DrawShadowText,截断按 GDI 经典度量):
         // 有快照时用真实壁纸种子(逐位同原生),无快照时黑种子兜底(引擎/几何
         // 仍与原生一致,仅 ClearType 边缘色近似)。
+        if hide_label {
+            // 就地重命名中:标签由编辑框替代(与原生一致),只画图标
+            return;
+        }
         let trimmed = trim_to_lines(
             &r.dw,
             &txt,

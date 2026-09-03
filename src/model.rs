@@ -432,6 +432,14 @@ pub fn row_insert_layout(
     (out, land)
 }
 
+/// 当前 epoch 毫秒(墓碑/使用统计等墙钟时间戳用)
+pub fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 把栅栏组约束进工作区 [vx,vy,vw,vh]：
 /// 先整体平移回区内（保持相对位置），再逐个夹回；
 /// 不放大也不缩小尺寸，避免拖动时栅栏被越拖越小。
@@ -1396,6 +1404,12 @@ pub struct Settings {
     /// 布局;关=无边框常显(悬停或拖拽时才浮现)。托盘菜单切换即落盘。
     #[serde(default)]
     pub show_chrome: bool,
+    /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
+    /// 分类不再自动重建,除非之后出现该类的**新文件**(mtime 晚于删除)。
+    /// 防止"删了的栅栏又冒出来"(回收站恒在=软件类恒有文件,mp3 常驻=
+    /// 媒体类恒有文件,旧的缺类补建逻辑必然复活它们)。
+    #[serde(default)]
+    pub deleted_category_at: std::collections::HashMap<String, u64>,
 }
 
 pub fn default_desktop_state() -> String {
@@ -1470,6 +1484,7 @@ impl Default for Settings {
             desktop_state: default_desktop_state(),
             z_guard: default_z_guard(),
             show_chrome: false,
+            deleted_category_at: Default::default(),
         }
     }
 }
@@ -1500,6 +1515,7 @@ pub fn load_settings() -> Settings {
                 desktop_state: default_desktop_state(),
                 z_guard: default_z_guard(),
             show_chrome: false,
+            deleted_category_at: Default::default(),
             }
         }
     }

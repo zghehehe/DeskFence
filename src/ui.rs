@@ -6,11 +6,13 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    BOOL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    BOOL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect,
-    HBRUSH, HDC, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
+    ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
+    GetTextExtentPoint32W, GetTextMetricsW, MonitorFromRect, ReleaseDC, SelectObject, HBRUSH,
+    HDC, HFONT, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
+    TEXTMETRICW,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::CoInitializeEx;
@@ -104,6 +106,7 @@ fn set_align_mode_stored(mode: &str) {
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
         show_chrome: chrome_always_on(),
+        deleted_category_at: Default::default(),
     });
 }
 pub fn auto_align_on() -> bool {
@@ -138,6 +141,7 @@ fn set_render_mode_stored(mode: &str) {
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
         show_chrome: chrome_always_on(),
+        deleted_category_at: Default::default(),
     });
 }
 
@@ -164,6 +168,7 @@ fn set_desktop_state_stored(mode: &str) {
         desktop_state: mode.to_string(),
         z_guard: z_guard_setting(),
         show_chrome: chrome_always_on(),
+        deleted_category_at: Default::default(),
     });
 }
 
@@ -190,6 +195,7 @@ fn set_auto_category_stored(v: bool) {
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
         show_chrome: chrome_always_on(),
+        deleted_category_at: Default::default(),
     });
 }
 
@@ -214,7 +220,27 @@ fn set_show_chrome_stored(on: bool) {
         desktop_state: desktop_state(),
         z_guard: z_guard_setting(),
         show_chrome: on,
+        deleted_category_at: Default::default(),
     });
+}
+
+/// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
+/// 复活,除非之后出现该类的新文件(mtime 晚于墓碑)——那时清除墓碑并
+/// 正常补建,保留"首次出现该类文件会自动新建"的原设计。
+fn category_tombstone_at(cat: &str) -> Option<u64> {
+    model::load_settings().deleted_category_at.get(cat).copied()
+}
+fn set_category_tombstone(cat: &str) {
+    let mut s = model::load_settings();
+    s.deleted_category_at
+        .insert(cat.to_string(), model::epoch_ms());
+    model::save_settings(&s);
+}
+fn clear_category_tombstone(cat: &str) {
+    let mut s = model::load_settings();
+    if s.deleted_category_at.remove(cat).is_some() {
+        model::save_settings(&s);
+    }
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
 fn rebuild_pins() {
@@ -2098,6 +2124,8 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         fence_hovered,
         active,
         marquee,
+        // 正在就地重命名的成员:标签由编辑框替代(与原生一致)
+        FILE_RENAME_PATH.lock().unwrap().as_deref(),
     );
     let t_draw = resize_now_ms() - t_draw0;
     let pos = POINT {
@@ -2235,6 +2263,7 @@ fn warm_renderer_scratch() {
         false,
         false,
         None,
+        None,
     );
     // 空作业时标签绘制会早退,补一个 1 字符作业触发
     // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
@@ -2371,6 +2400,20 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
                 continue;
             }
             if s.files.iter().any(|f| f.category == cat) {
+                // 用户手动删过的分类在墓碑期内不复活;该类出现**新文件**
+                // (mtime 晚于删除时刻)才清除墓碑并补建
+                if let Some(ts) = category_tombstone_at(cat) {
+                    let has_newer = s
+                        .files
+                        .iter()
+                        .any(|f| f.category == cat && f.mtime_ms > ts);
+                    if has_newer {
+                        clear_category_tombstone(cat);
+                        log(&format!("category fence '{cat}' resurrected by newer file"));
+                    } else {
+                        continue;
+                    }
+                }
                 added.push(cat.to_string());
                 have.insert(cat.to_string());
             }
@@ -2379,25 +2422,25 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
         // 自定义分类模式:未分配文件都进"未分类",保证没有任何文件隐身
         added.push(model::UNCATEGORIZED.to_string());
     }
+    let mut new_ids = Vec::new();
     for cat in &added {
         let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+        new_ids.push(max_id);
+        // 尺寸按该类当前内容数收窄:不足 5 项宽 1 列(2026-09-02 用户要求)
+        let count = s.files.iter().filter(|f| &f.category == cat).count();
         s.fences.push(Fence {
             id: max_id,
             title: cat.clone(),
             category: cat.clone(),
             pinned: Vec::new(),
             item_order: Vec::new(),
-            rect: Rect {
-                x: 60.0 + max_id as f32 * 40.0,
-                y: 60.0,
-                ..{
-                    let (dw, dh) = default_fence_size();
-                    Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: dw,
-                        h: dh,
-                    }
+            rect: {
+                let (dw, dh) = default_size_for_items(count);
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: dw,
+                    h: dh,
                 }
             },
             collapsed: false,
@@ -2407,6 +2450,23 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
             manual_size: false,
             sort_mode: model::default_sort_mode(),
         });
+    }
+    // 新栅栏落位:第一行最后一个栅栏右侧,靠顶对齐,保持默认间隔
+    // (与手动新建同一规则 new_fence_rect,2026-09-02;旧的左上角落位会
+    // 压到占住左上角的既有栅栏)
+    for id in &new_ids {
+        let Some((w, h)) = s
+            .fences
+            .iter()
+            .find(|f| f.id == *id)
+            .map(|f| (f.rect.w, f.rect.h))
+        else {
+            continue;
+        };
+        let rect = new_fence_rect(s, w, h);
+        if let Some(fence) = s.fences.iter_mut().find(|f| f.id == *id) {
+            fence.rect = rect;
+        }
     }
     added
 }
@@ -2454,44 +2514,13 @@ pub fn rescan() {
         }
         ensure_missing_category_fences(&mut s)
     };
-    {
-        let added_any = !new_cats.is_empty();
-        let mut s = state().lock().unwrap();
-        for cat in new_cats {
-            let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-            s.fences.push(Fence {
-                id: max_id,
-                title: cat.clone(),
-                category: cat,
-                pinned: Vec::new(),
-                item_order: Vec::new(),
-                rect: Rect {
-                    x: 60.0 + max_id as f32 * 40.0,
-                    y: 60.0,
-                    ..{
-                        let (dw, dh) = default_fence_size();
-                        Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            w: dw,
-                            h: dh,
-                        }
-                    }
-                },
-                collapsed: false,
-                scroll_rows: 0,
-                locked: false,
-                hidden: false,
-                manual_size: false,
-                sort_mode: model::default_sort_mode(),
-            });
-        }
-        // 只有真的新增了分类栅栏才收敛；周期 rescan 不应把用户手动摆放的
-        // 位置重排回左上角（推挤式保留相对位置，而不是流式重排）。
-        drop(s);
-        if added_any {
-            settle_preserve_positions();
-        }
+    // 栅栏创建已全部收口在 ensure_missing_category_fences 内部(单一创建
+    // 来源)。此前这里还有第二个创建循环——rescan 路径每个新分类会建出
+    // 两个同名栅栏(2026-09-02 修"mp3 一来冒出两个媒体")。
+    // 只有真的新增了分类栅栏才收敛；周期 rescan 不应把用户手动摆放的
+    // 位置重排回左上角（推挤式保留相对位置，而不是流式重排）。
+    if !new_cats.is_empty() {
+        settle_preserve_positions();
     }
     {
         let s = state().lock().unwrap();
@@ -2505,12 +2534,50 @@ pub fn rescan() {
 
 /// 默认栅栏尺寸:2 列宽 × 5 行高(用户指定;内容超出自动滚动)
 fn default_fence_size() -> (f32, f32) {
-    // 默认高度 4 行:一屏可上下放两排栅栏(build_global_config 的兜底同规则)
     let (title_h, pad) = model::chrome(model::dpi_scale());
     (
         model::cell_w() * 2.0 + pad * 2.0 + 2.0,
         title_h + model::cell_h() * 4.0 + pad * 2.0 + 2.0,
     )
+}
+
+/// 按内容数给默认尺寸(2026-09-02 用户要求):不足 5 项宽 1 列,≥5 项宽 2 列;
+/// 高固定 4 行。与首次运行布局(build_global_config)同一规则
+fn default_size_for_items(n: usize) -> (f32, f32) {
+    let cols = if n < 5 { 1usize } else { 2usize };
+    let (title_h, pad) = model::chrome(model::dpi_scale());
+    (
+        model::cell_w() * cols as f32 + pad * 2.0 + 2.0,
+        title_h + model::cell_h() * 4.0 + pad * 2.0 + 2.0,
+    )
+}
+
+/// 新栅栏落位(2026-09-02 统一规则,手动/自动新建共用):第一行最后一个
+/// 栅栏右侧,与其靠顶对齐、保持默认间隔;无栅栏时放工作区左上角;
+/// 行尾放不下夹回屏内(残余重叠由随后的 settle 推开兜底)。
+fn new_fence_rect(s: &UiState, w: f32, h: f32) -> Rect {
+    let visible: Vec<Rect> = s
+        .fences
+        .iter()
+        .filter(|f| !f.hidden && !f.collapsed)
+        .map(|f| f.rect)
+        .collect();
+    let rows = model::rows_from_rects(&visible);
+    let (x, y) = match rows.first() {
+        Some(row) if !row.is_empty() => {
+            let last = &visible[row[row.len() - 1]];
+            (last.x + last.w + model::GAP, last.y)
+        }
+        _ => {
+            let (vx, vy, _, _) = work_area();
+            (vx, vy)
+        }
+    };
+    let mut r = Rect { x, y, w, h };
+    let (vx, vy, vw, vh) = work_area_for_rect(&r);
+    let mut tmp = [r];
+    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
+    tmp[0]
 }
 
 /// 扫描结果注入回收站虚拟条目(固定显示在"软件"栅栏第一位,可拖拽文件进去删除)
@@ -5442,25 +5509,21 @@ fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
     }
 }
 
-pub fn add_fence_after(base_id: u32) -> u32 {
+pub fn add_fence_after(_base_id: u32) -> u32 {
     push_undo();
     let max_id = {
         let mut s = state().lock().unwrap();
         let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-        let (x, y) = match s.fences.iter().find(|f| f.id == base_id) {
-            Some(b) => (b.rect.x + 40.0, b.rect.y + 40.0),
-            None => (200.0, 200.0),
-        };
+        // 手动新建为空栅栏:宽 1 列;落位=第一行末尾右侧+靠顶(统一规则)
+        let (dw, dh) = default_size_for_items(0);
+        let r = new_fence_rect(&s, dw, dh);
         s.fences.push(Fence {
             id: max_id,
             title: "新栅栏".into(),
             category: String::new(),
             pinned: Vec::new(),
             item_order: Vec::new(),
-            rect: {
-                let (dw, dh) = default_fence_size();
-                Rect { x, y, w: dw, h: dh }
-            },
+            rect: r,
             collapsed: false,
             scroll_rows: 0,
             locked: false,
@@ -5538,9 +5601,75 @@ fn delete_fence(fence_id: u32) {
         return;
     }
     push_undo();
+    // 同行左移补洞(2026-09-02 行内槽位模型):先按删除前的行结构算出
+    // "洞后成员各左移一格(接管前一成员的槽)"的分配,删除后应用——
+    // 体感:删掉行中间/行首的栅栏,右侧成员自动左移补位
+    let shift: Vec<(u32, (f32, f32))> = {
+        let s = state().lock().unwrap();
+        let ids: Vec<u32> = s
+            .fences
+            .iter()
+            .filter(|f| !f.hidden && !f.collapsed)
+            .map(|f| f.id)
+            .collect();
+        let rects: Vec<Rect> = ids
+            .iter()
+            .map(|id| {
+                s.fences
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .map(|f| f.rect)
+                    .unwrap()
+            })
+            .collect();
+        let slot = |i: usize| (rects[i].x, rects[i].y);
+        let rows = model::rows_from_rects(&rects);
+        let own = ids
+            .iter()
+            .position(|id| *id == fence_id)
+            .and_then(|pos| {
+                rows.iter().enumerate().find_map(|(ri, row)| {
+                    row.iter().position(|&i| i == pos).map(|j| (ri, j))
+                })
+            });
+        let mut out = Vec::new();
+        if let Some((ri, j)) = own {
+            // 行锚点=该行(含被删者)最左成员;洞后成员按各自宽度+GAP 从锚点
+            // 重排——宽度不同也不会重叠(旧的"接管前一槽"轮转在非等宽行
+            // 必然重叠,已废弃)
+            let anchor_i = rows[ri]
+                .iter()
+                .copied()
+                .min_by(|&a, &b| {
+                    rects[a]
+                        .x
+                        .partial_cmp(&rects[b].x)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            let (ax, ay) = slot(anchor_i);
+            let mut x = ax;
+            for &t in rows[ri].iter().filter(|&&t| t != rows[ri][j]) {
+                out.push((ids[t], (x, ay)));
+                x += rects[t].w + model::GAP;
+            }
+        }
+        out
+    };
     let hwnd = {
         let mut s = state().lock().unwrap();
         clear_fence_interaction(&mut s, fence_id);
+        // 分类栅栏(自动建的)删除记墓碑:缺类补建不再复活它,直到该类
+        // 出现新文件(2026-09-02 修"删了的栅栏又冒出来")
+        if let Some(f) = s.fences.iter().find(|f| f.id == fence_id) {
+            if !f.category.is_empty() {
+                set_category_tombstone(&f.category);
+                log(&format!(
+                    "category fence '{}' deleted, tombstone set",
+                    f.category
+                ));
+            }
+        }
         let removed = s.windows.remove(&fence_id);
         s.metrics.remove(&fence_id);
         s.presented.remove(&fence_id);
@@ -5549,6 +5678,12 @@ fn delete_fence(fence_id: u32) {
             render::release_surface(sf);
         }
         s.fences.retain(|f| f.id != fence_id);
+        for (id, (x, y)) in &shift {
+            if let Some(f) = s.fences.iter_mut().find(|f| f.id == *id) {
+                f.rect.x = *x;
+                f.rect.y = *y;
+            }
+        }
         let cfg = s.fences.clone();
         let _ = model::save_config(&cfg);
         removed
@@ -5558,6 +5693,10 @@ fn delete_fence(fence_id: u32) {
             let _ = RevokeDragDrop(h);
             let _ = DestroyWindow(h);
         }
+    }
+    // 左移补洞的成员重渲染(位置变了)
+    for (id, _) in &shift {
+        refresh_fence(*id);
     }
     finish_interaction_cleanup();
     reconcile_desktop_icons();
@@ -6342,28 +6481,13 @@ fn start_file_rename(path: String) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // 定位该文件所在栅栏的格子,把编辑框盖在名字标签上;找不到就放光标旁。
-    // 宽度与 Explorer 一致:随文件名文本自适应增长(不小于一个图标格宽)。
-    let (edit_x, edit_y, edit_w) = {
+    // 宽度与 Explorer 一致:=一个图标格宽(长名换行,不撑宽)。
+    // 同时记录所在栅栏:改名期间该成员标签由编辑框替代(隐藏),建好编辑框
+    // 后强制刷新所在栅栏立即生效。
+    let (edit_x, edit_y, edit_w, edit_h, host_fence) = {
         let s = state().lock().unwrap();
-        let text_w = s.renderer.as_ref().and_then(|r| {
-            let w16 = shell::wide(&name);
-            unsafe {
-                r.dw.CreateTextLayout(
-                    &w16[..w16.len().saturating_sub(1)],
-                    &r.name_fmt,
-                    4096.0,
-                    64.0,
-                )
-                .ok()
-                .map(|lay| {
-                    let mut m = Default::default();
-                    let _ = lay.GetMetrics(&mut m);
-                    m.width
-                })
-            }
-        });
-        let text_w = text_w.unwrap_or(0.0);
         let mut pos = None;
+        let mut host = None;
         'outer: for f in &s.fences {
             let items = model::display_list(f, &s.files);
             for (i, it) in items.iter().enumerate() {
@@ -6371,39 +6495,66 @@ fn start_file_rename(path: String) {
                     let lay = model::layout(f, items.len());
                     let (cx, cy) = model::cell_pos(&lay, i);
                     let cs = model::icon_size();
-                    let cw = model::cell_w();
+                    // 编辑框=标签矩形(2026-09-03 实测原生:初始尺寸=标签矩形,
+                    // 两行高;几何与 render.rs draw_item 的标签公式完全一致)
+                    let m = model::DpiMetrics::system();
+                    let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
+                    let label_h = (2.0 * 24.0 + 6.0) * m.scale;
                     pos = Some((
-                        (f.rect.x + cx - 6.0).round() as i32,
-                        (f.rect.y + cy + cs + 4.0).round() as i32,
-                        (cw + 12.0).max(text_w + 24.0).round() as i32,
+                        (f.rect.x + cx + m.scale).round() as i32,
+                        label_top.round() as i32,
+                        (m.cell_w - 2.0 * m.scale).round() as i32,
+                        label_h.round() as i32,
                     ));
+                    host = Some(f.id);
                     break 'outer;
                 }
             }
         }
-        pos.unwrap_or_else(|| {
+        pos.map(|(x, y, w, h)| (x, y, w, h, host)).unwrap_or_else(|| {
             let (sx, sy) = screen_cursor();
-            (sx as i32 - 80, sy as i32 - 12, 180)
+            let m = model::DpiMetrics::system();
+            let h = ((2.0 * 24.0 + 6.0) * m.scale).round() as i32;
+            (sx as i32 - 80, sy as i32 - 12, 180, h, None)
         })
     };
+    // 先设 PATH 再建编辑框:绘制路径据此隐藏该成员标签(与原生一致)
+    *FILE_RENAME_PATH.lock().unwrap() = Some(path.clone());
     unsafe {
         let edit_cls = shell::wide("EDIT");
         let edit = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             PCWSTR::from_raw(edit_cls.as_ptr()),
             PCWSTR::null(),
-            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | WS_VISIBLE.0 | (ES_CENTER as u32)),
+            // 多行自动换行(2026-09-02 与原生一致):长名向下换行、框随行数
+            // 增高(见 adjust_rename_edit_height);不加 ES_AUTOHSCROLL——
+            // 单行无滚动样式时文本到控件右缘就拒绝继续输入
+            // 样式=原生实测(0x540000C5 的编辑部分):LEFT|MULTILINE|
+            // AUTOVSCROLL|NOHIDESEL,无边框;WS_POPUP 是结构必需(ULW 分层
+            // 窗口不能挂子窗口),原生为 WS_CHILD
+            WINDOW_STYLE(
+                WS_POPUP.0
+                    | WS_VISIBLE.0
+                    | ES_LEFT as u32
+                    | ES_MULTILINE as u32
+                    | ES_AUTOVSCROLL as u32
+                    | ES_NOHIDESEL as u32,
+            ),
             edit_x,
             edit_y,
             edit_w,
-            24,
+            edit_h,
             HWND(0),
             HMENU(0),
             hinstance(),
             None,
         );
         if edit.0 == 0 {
+            *FILE_RENAME_PATH.lock().unwrap() = None;
             return;
+        }
+        if let Some(fid) = host_fence {
+            refresh_fence(fid); // 立即重绘:标签隐去,编辑框取而代之
         }
         // desktop_icon_font 已返回按系统 DPI 换算后的像素高度，这里只应用一次。
         let (family, px, weight) = shell::desktop_icon_font();
@@ -6426,6 +6577,8 @@ fn start_file_rename(path: String) {
             .map(|p| p as isize)
             .unwrap_or(-1);
         let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(sel_end));
+        // 初始名就是长名时(多行换行)先按行数增高
+        adjust_rename_edit_height(edit);
         *FILE_RENAME_PATH.lock().unwrap() = Some(path);
         let old = SetWindowLongPtrW(
             edit,
@@ -6473,6 +6626,34 @@ unsafe extern "system" fn file_rename_edit_proc(
                 let _ = PostMessageW(hwnd, FILE_RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
                 return LRESULT(0);
             }
+            // 多行重命名(与原生一致):删除键可能减少行数
+            let r = CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
+            adjust_rename_edit_height(hwnd);
+            return r;
+        }
+        WM_CHAR | WM_PASTE => {
+            // 多行重命名(与原生一致):输入/粘贴后按实际换行行数增高编辑框
+            let r = CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
+            adjust_rename_edit_height(hwnd);
+            return r;
         }
         WM_KILLFOCUS | WM_CANCELMODE => {
             let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
@@ -6509,6 +6690,67 @@ unsafe extern "system" fn file_rename_edit_proc(
         wparam,
         lparam,
     )
+}
+
+/// 多行重命名框(与原生一致):按当前文本的实际换行行数增高编辑框。
+/// 输入/粘贴/删除后由编辑框子类过程调用。
+fn adjust_rename_edit_height(edit: HWND) {
+    unsafe {
+        const EM_GETLINECOUNT: u32 = 0x00BA;
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(edit, &mut rc);
+        let inner_w = ((rc.right - rc.left) as f32 - 10.0).max(40.0);
+        let hdc = GetDC(edit);
+        if hdc.is_invalid() {
+            return;
+        }
+        // 行数双保险:EM_GETLINECOUNT 对刚 SetWindowText 的编辑框可能仍报
+        // 1,再用字体实测"文本总宽/内宽"向上取整,取两者较大值
+        let mut lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
+        let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0)).0;
+        let old_font = if font != 0 {
+            Some(SelectObject(hdc, HFONT(font as _)))
+        } else {
+            None
+        };
+        let len = GetWindowTextLengthW(edit);
+        if len > 0 {
+            let mut buf = vec![0u16; len as usize + 1];
+            let _ = GetWindowTextW(edit, &mut buf);
+            let mut sz = SIZE::default();
+            if GetTextExtentPoint32W(hdc, &buf[..len as usize], &mut sz).as_bool() && sz.cx > 0 {
+                let est = (sz.cx as f32 / inner_w).ceil();
+                if est > lines {
+                    lines = est;
+                }
+            }
+        }
+        if let Some(of) = old_font {
+            SelectObject(hdc, of);
+        }
+        let mut tm = TEXTMETRICW::default();
+        let line_h = if GetTextMetricsW(hdc, &mut tm).as_bool() {
+            (tm.tmHeight + tm.tmExternalLeading) as f32
+        } else {
+            20.0
+        };
+        ReleaseDC(edit, hdc);
+        // 超出工作区底则封顶(保持框体可见)
+        let (_, vy, _, vh) = work_area();
+        let new_h =
+            ((lines * line_h).round() as i32 + 8).min((vy + vh - rc.top as f32).max(24.0) as i32);
+        if new_h != rc.bottom - rc.top {
+            let _ = SetWindowPos(
+                edit,
+                HWND(0),
+                0,
+                0,
+                rc.right - rc.left,
+                new_h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 
 fn commit_file_rename(edit: HWND) {
@@ -6556,7 +6798,15 @@ fn commit_file_rename(edit: HWND) {
                 s.focused_path = Some(new_path.clone());
             }
             if s.selection_anchor.as_deref() == Some(&old_path) {
-                s.selection_anchor = Some(new_path);
+                s.selection_anchor = Some(new_path.clone());
+            }
+            // 同步内存文件列表(2026-09-02,与原生一致):改名立即生效,不等
+            // 异步 rescan——消除"改名后双击旧路径(已不存在)"的窗口期
+            for f in s.files.iter_mut() {
+                if f.path == old_path {
+                    f.path = new_path.clone();
+                    f.name = new_name.clone();
+                }
             }
         } else if !invalid {
             log(&format!("file rename failed: {} -> {}", old_path, new_name));
