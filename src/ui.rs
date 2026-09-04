@@ -6764,7 +6764,7 @@ fn start_file_rename(path: String) {
                     // 上限加边框余量,水平中心与图标格一致;短名在后续调整中收窄。
                     let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
                     let label_h = (2.0 * 24.0 + 6.0) * m.scale;
-                    let edit_w = (m.cell_w + 4.0 * m.scale).round() as i32;
+                    let edit_w = (m.cell_w - 2.0 * m.scale).round() as i32;
                     pos = Some((
                         (f.rect.x + cx - 2.0 * m.scale).round() as i32,
                         label_top.round() as i32,
@@ -7088,10 +7088,12 @@ fn adjust_rename_edit_height(edit: HWND) {
             .get(&edit.0)
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
-        let width_pad = (14.0 * m.scale).round() as i32;
-        let min_w = (64.0 * m.scale).round() as i32;
-        let max_w = (m.cell_w + 4.0 * m.scale).round() as i32;
-        let new_w = ((text_w.round() as i32).saturating_add(width_pad)).clamp(min_w, max_w);
+        // Explorer's measured short-name frame uses physical EDIT margins; these
+        // are control chrome pixels, not part of the icon-cell scale.
+        let width_pad = 14i32;
+        let min_w = 64i32;
+        let max_w = (m.cell_w - 2.0 * m.scale).round() as i32;
+        let new_w = ((text_w.round() as i32).saturating_add(width_pad)).clamp(min_w, max_w.max(min_w));
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
