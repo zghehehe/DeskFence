@@ -7011,6 +7011,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         let m = model::DpiMetrics::system();
         let new_w = ((text_w + 14.0) as i32)
             .clamp(64, (m.cell_w + 4.0 * m.scale).round() as i32);
+        // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
                 edit,
@@ -7037,42 +7038,54 @@ fn adjust_rename_edit_height(edit: HWND) {
             SelectObject(hdc, of);
         }
         ReleaseDC(edit, hdc);
-        let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形
+        let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形(换行已同步)
+        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         let in_mon = GetMonitorInfoW(MonitorFromWindow(edit, MONITOR_DEFAULTTONEAREST), &mut mi)
             .as_bool();
-        let (mon_top, mon_bottom) = if in_mon {
-            (mi.rcMonitor.top as f32, mi.rcMonitor.bottom as f32)
+        let (mon_left, mon_top, mon_right, mon_bottom) = if in_mon {
+            (
+                mi.rcMonitor.left as i32,
+                mi.rcMonitor.top as i32,
+                mi.rcMonitor.right as i32,
+                mi.rcMonitor.bottom as i32,
+            )
         } else {
-            let (_, vy, _, vh) = work_area();
-            (vy, vy + vh)
+            let (vx, vy, vw, vh) = work_area();
+            (vx as i32, vy as i32, (vx + vw) as i32, (vy + vh) as i32)
         };
-        let new_h = (((lines * line_h).round() as i32 + 12) as f32)
-            .min(mon_bottom - mon_top)
-            .max(34.0) as i32;
+        // 位置:水平保持"对格居中"(创建时即格居中,宽度缩放后中心不动——
+        // 2026-09-04 用户对照:原生框居中于图标正下方,左对齐=歪到格边);
+        // 垂直顶在标签起点,向下生长;越界时整体收回显示器内
+        let old_w = rc.right - rc.left;
+        let mut left = rc.left + (old_w - new_w) / 2;
         let mut top = rc.top;
+        let new_h = (((lines * line_h).round() as i32 + 12) as f32)
+            .min((mon_bottom - mon_top) as f32)
+            .max(34.0) as i32;
         if top + new_h > mon_bottom as i32 {
-            top = (mon_bottom as i32 - new_h).max(mon_top as i32);
+            top = (mon_bottom - new_h).max(mon_top);
         }
-        if top != rc.top {
+        left = left.clamp(mon_left, (mon_right - new_w).max(mon_left));
+        if left != rc.left || top != rc.top {
             let _ = SetWindowPos(
                 edit,
                 HWND(0),
+                left,
                 top,
-                rc.left,
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
-        if new_h != rc.bottom - rc.top {
+        if new_h != rc.bottom - rc.top || new_w != old_w {
             let _ = SetWindowPos(
                 edit,
                 HWND(0),
                 0,
                 0,
-                rc.right - rc.left,
+                new_w,
                 new_h,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
