@@ -7116,13 +7116,14 @@ fn adjust_rename_edit_height(edit: HWND) {
         } else {
             client_w.saturating_sub(14).max(1)
         };
-        // 换行宽 = 名字宽×0.6,夹 [64, 格宽-2*scale](2026-09-04 三个原生实测
-        // 点拟合:xxx.txt 60→框75、v4flash测试.txt→换行在"测|试"(宽≈89)、
-        // 32字长名→6字/行(宽≥108)——恒定宽无法同时满足,原生换行宽随名字
-        // 收放)。外框 = 换行宽+10(内建边距L3/R5+WS_BORDER 2px)。
-        let fmt_w = ((text_w * 0.6).round() as i32)
-            .clamp(64, (m.cell_w - 2.0 * m.scale).round() as i32);
-        let new_w = fmt_w + 10;
+        // 换行宽 = 名字宽×0.55,夹 [66, 格宽-2*scale](2026-09-04 用 GDI
+        // TextRenderer 精确实测后修正:原生有效换行宽窗口 [60,72)——
+        // "v4flash测"(60)留在首行、"+试"(72)换行;32字长名 6字/行(≥108);
+        // 恒定宽无法同时满足,原生换行宽随名字收放。取窗口中值 66 安全。
+        // 外框 = 换行宽+12(内建边距L3/R5+WS_BORDER 2px)。
+        let fmt_w = ((text_w * 0.55).round() as i32)
+            .clamp(66, (m.cell_w - 2.0 * m.scale).round() as i32);
+        let new_w = fmt_w + 12;
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
