@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{
     BOOL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
+    ClientToScreen, CreateFontIndirectW, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
     GetTextExtentPoint32W, GetTextMetricsW, MonitorFromRect, MonitorFromWindow, ReleaseDC,
     SelectObject, HBRUSH, HDC, HFONT, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     ScreenToClient, TEXTMETRICW,
@@ -432,6 +432,10 @@ struct UiState {
     pub rename_edit: Option<HWND>,
     /// 文件就地重命名的 EDIT 窗口（图标名标签上的编辑框）
     pub file_rename_edit: Option<HWND>,
+    /// Target-fence metrics and stable cell centers for active file editors.
+    pub rename_metrics: HashMap<isize, model::DpiMetrics>,
+    pub rename_centers: HashMap<isize, i32>,
+    pub rename_fonts: HashMap<isize, HFONT>,
     /// 拖动节流：上次真正重排时的鼠标位置（用于抑制高频 WM_MOUSEMOVE 抖动）
     pub drag_settle_x: f32,
     pub drag_settle_y: f32,
@@ -550,6 +554,9 @@ fn state() -> &'static Mutex<UiState> {
             rename_fence: None,
             rename_edit: None,
             file_rename_edit: None,
+            rename_metrics: HashMap::new(),
+            rename_centers: HashMap::new(),
+            rename_fonts: HashMap::new(),
             drag_settle_x: 0.0,
             drag_settle_y: 0.0,
             last_resize_ms: 0,
@@ -6715,6 +6722,13 @@ fn on_shell_rename_request(path: &str) {
 }
 
 fn start_file_rename(path: String) {
+    // Do not create a second editor while another rename is active.
+    {
+        let s = state().lock().unwrap();
+        if s.rename_fence.is_some() || s.rename_edit.is_some() || s.file_rename_edit.is_some() {
+            return;
+        }
+    }
     // 回收站虚拟条目不可重命名
     if model::is_recycle_bin(&path) {
         return;
@@ -6724,43 +6738,56 @@ fn start_file_rename(path: String) {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     // 定位该文件所在栅栏的格子,把编辑框盖在名字标签上;找不到就放光标旁。
-    // 宽度与 Explorer 一致:略宽于图标格并对格居中(长名换行,不撑宽),
-    // 见下方 pos 构造处的实测注。
+    // 宽度按 Explorer 的编辑框策略处理:短名按内容收窄,长名在 cell
+    // 级上限内换行;外框始终以固定 cell 中心为锚,不随当前宽度漂移。
     // 同时记录所在栅栏:改名期间该成员标签由编辑框替代(隐藏),建好编辑框
     // 后强制刷新所在栅栏立即生效。
-    let (edit_x, edit_y, edit_w, edit_h, host_fence) = {
+    let (edit_x, edit_y, edit_w, edit_h, host_fence, edit_metrics) = {
         let s = state().lock().unwrap();
         let mut pos = None;
         let mut host = None;
+        let mut edit_metrics = None;
         'outer: for f in &s.fences {
             let items = model::display_list(f, &s.files);
             for (i, it) in items.iter().enumerate() {
                 if it.path == path {
-                    let lay = model::layout(f, items.len());
-                    let (cx, cy) = model::cell_pos(&lay, i);
-                    let cs = model::icon_size();
-                    // 编辑框两行高起步;宽度对齐原生(2026-09-03 editprobe 复刻
-                    // EDIT 实测 + 两轮用户截图逐像素比对):原生框外宽 =
-                    // cell_w+4*scale(本机 150% 下 120 物理px),对图标格水平
-                    // 居中,格式矩形内宽 112px——"新建 文本文档"(113px)恰好
-                    // 放不进首行,断行与原生逐行一致。+6*scale(123px)时内宽
-                    // 115px 首行会多装一个汉字,后续行整体错位(用户第二轮
-                    // 截图实测)。x=格左-2*scale 使框对格居中。
-                    let m = model::DpiMetrics::system();
+                    let m = s
+                        .metrics
+                        .get(&f.id)
+                        .copied()
+                        .unwrap_or_else(model::DpiMetrics::system);
+                    let lay = model::layout_with_metrics(f, items.len(), &m);
+                    let (cx, cy) = model::cell_pos_with_metrics(&lay, i, &m);
+                    let cs = m.icon_px;
+                    // 编辑框两行高起步;宽度按 cell 上限对齐原生(2026-09-03 editprobe 复刻
+                    // EDIT 实测 + 两轮用户截图逐像素比对):原生框外宽按 cell
+                    // 上限加边框余量,水平中心与图标格一致;短名在后续调整中收窄。
                     let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
                     let label_h = (2.0 * 24.0 + 6.0) * m.scale;
+                    let edit_w = (m.cell_w + 4.0 * m.scale).round() as i32;
                     pos = Some((
                         (f.rect.x + cx - 2.0 * m.scale).round() as i32,
                         label_top.round() as i32,
-                        (m.cell_w + 4.0 * m.scale).round() as i32,
+                        edit_w,
                         label_h.round() as i32,
                     ));
                     host = Some(f.id);
+                    edit_metrics = Some(m);
                     break 'outer;
                 }
             }
         }
-        pos.map(|(x, y, w, h)| (x, y, w, h, host)).unwrap_or_else(|| {
+        pos.map(|(x, y, w, h)| {
+            (
+                x,
+                y,
+                w,
+                h,
+                host,
+                edit_metrics.unwrap_or_else(model::DpiMetrics::system),
+            )
+        })
+        .unwrap_or_else(|| {
             let (sx, sy) = screen_cursor();
             let m = model::DpiMetrics::system();
             let h = ((2.0 * 24.0 + 6.0) * m.scale).round() as i32;
@@ -6770,6 +6797,7 @@ fn start_file_rename(path: String) {
                 (model::cell_w() + 4.0 * m.scale).round() as i32,
                 h,
                 None,
+                m,
             )
         })
     };
@@ -6816,17 +6844,25 @@ fn start_file_rename(path: String) {
         if let Some(fid) = host_fence {
             refresh_fence(fid); // 立即重绘:标签隐去,编辑框取而代之
         }
-        // desktop_icon_font 已返回按系统 DPI 换算后的像素高度，这里只应用一次。
-        let (family, px, weight) = shell::desktop_icon_font();
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfHeight = -(px.round() as i32);
-        lf.lfWeight = weight;
-        for (i, c) in family.encode_utf16().take(31).enumerate() {
-            lf.lfFaceName[i] = c;
-        }
+        // 直接复用 SPI_GETICONTITLELOGFONT 的完整原生字体；查询失败时
+        // 使用按目标栅栏 DPI 缩放的最小回退字体。
+        let lf = shell::icon_title_logfont().unwrap_or_else(|| {
+            let mut fallback: LOGFONTW = std::mem::zeroed();
+            fallback.lfHeight = -((16.0 * edit_metrics.scale).round() as i32);
+            fallback.lfWeight = 400;
+            fallback
+        });
         let font = CreateFontIndirectW(&lf);
         if !font.is_invalid() {
             let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+        {
+            let mut s = state().lock().unwrap();
+            s.rename_metrics.insert(edit.0, edit_metrics);
+            s.rename_centers.insert(edit.0, edit_x + edit_w / 2);
+            if !font.is_invalid() {
+                s.rename_fonts.insert(edit.0, font);
+            }
         }
         let w = shell::wide(&name);
         let _ = SetWindowTextW(edit, PCWSTR::from_raw(w.as_ptr()));
@@ -6958,9 +6994,46 @@ unsafe extern "system" fn file_rename_edit_proc(
             return LRESULT(0);
         }
         WM_DESTROY => {
-            KillTimer(hwnd, RENAME_FIT_TIMER);
+            let _ = KillTimer(hwnd, RENAME_FIT_TIMER);
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
             return LRESULT(0);
+        }
+        WM_NCDESTROY => {
+            let owned = state()
+                .lock()
+                .unwrap()
+                .file_rename_edit
+                .map(|edit| edit == hwnd)
+                .unwrap_or(false);
+            if owned {
+                *FILE_RENAME_PATH.lock().unwrap() = None;
+                let ids = {
+                    let mut s = state().lock().unwrap();
+                    s.file_rename_edit = None;
+                    s.rename_metrics.remove(&hwnd.0);
+                    s.rename_centers.remove(&hwnd.0);
+                    s.fences.iter().filter(|f| !f.hidden).map(|f| f.id).collect::<Vec<_>>()
+                };
+                uninstall_rename_mouse_hook();
+                let font = state().lock().unwrap().rename_fonts.remove(&hwnd.0);
+                if let Some(font) = font {
+                    let _ = DeleteObject(font);
+                }
+                for id in ids {
+                    refresh_fence(id);
+                }
+            }
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            return CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
         }
         _ => {}
     }
@@ -7008,9 +7081,17 @@ fn adjust_rename_edit_height(edit: HWND) {
                 text_w = sz.cx as f32;
             }
         }
-        let m = model::DpiMetrics::system();
-        let new_w = ((text_w + 14.0) as i32)
-            .clamp(64, (m.cell_w + 4.0 * m.scale).round() as i32);
+        let m = state()
+            .lock()
+            .unwrap()
+            .rename_metrics
+            .get(&edit.0)
+            .copied()
+            .unwrap_or_else(model::DpiMetrics::system);
+        let width_pad = (14.0 * m.scale).round() as i32;
+        let min_w = (64.0 * m.scale).round() as i32;
+        let max_w = (m.cell_w + 4.0 * m.scale).round() as i32;
+        let new_w = ((text_w.round() as i32).saturating_add(width_pad)).clamp(min_w, max_w);
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
@@ -7059,14 +7140,21 @@ fn adjust_rename_edit_height(edit: HWND) {
         // 2026-09-04 用户对照:原生框居中于图标正下方,左对齐=歪到格边);
         // 垂直顶在标签起点,向下生长;越界时整体收回显示器内
         let old_w = rc.right - rc.left;
-        let mut left = rc.left + (old_w - new_w) / 2;
+        let current_center = {
+            let s = state().lock().unwrap();
+            s.rename_centers
+                .get(&edit.0)
+                .copied()
+                .unwrap_or(rc.left + old_w / 2)
+        };
+        let mut left = current_center - new_w / 2;
         let mut top = rc.top;
-        let new_h = (((lines * line_h).round() as i32 + 12) as f32)
-            .min((mon_bottom - mon_top) as f32)
-            .max(34.0) as i32;
-        if top + new_h > mon_bottom as i32 {
-            top = (mon_bottom - new_h).max(mon_top);
-        }
+        let available_h = (mon_bottom - mon_top).max(1);
+        let min_h = (34.0 * m.scale).round() as i32;
+        let new_h = ((lines * line_h).round() as i32)
+            .saturating_add((8.0 * m.scale).round() as i32)
+            .clamp(min_h.min(available_h), available_h);
+        top = top.clamp(mon_top, (mon_bottom - new_h).max(mon_top));
         left = left.clamp(mon_left, (mon_right - new_w).max(mon_left));
         if left != rc.left || top != rc.top {
             let _ = SetWindowPos(
@@ -7101,7 +7189,8 @@ fn commit_file_rename(edit: HWND) {
     let mut renamed = false;
     let mut migration: Option<(String, u32, f32, f32)> = None;
     if !old_path.is_empty() {
-        let mut buf = [0u16; 512];
+        let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
         unsafe {
             let _ = GetWindowTextW(edit, &mut buf);
         }
