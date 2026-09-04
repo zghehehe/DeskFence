@@ -7116,11 +7116,13 @@ fn adjust_rename_edit_height(edit: HWND) {
         } else {
             client_w.saturating_sub(14).max(1)
         };
-        let width_pad = (client_w - format_w).max(0);
-        let min_w = 64i32;
-        let max_w = (m.cell_w - 2.0 * m.scale).round() as i32;
-        let measured_w = (text_w.round() as i32).saturating_add(width_pad);
-        let new_w = measured_w.clamp(min_w, max_w.max(min_w));
+        // 换行宽 = 名字宽×0.6,夹 [64, 格宽-2*scale](2026-09-04 三个原生实测
+        // 点拟合:xxx.txt 60→框75、v4flash测试.txt→换行在"测|试"(宽≈89)、
+        // 32字长名→6字/行(宽≥108)——恒定宽无法同时满足,原生换行宽随名字
+        // 收放)。外框 = 换行宽+10(内建边距L3/R5+WS_BORDER 2px)。
+        let fmt_w = ((text_w * 0.6).round() as i32)
+            .clamp(64, (m.cell_w - 2.0 * m.scale).round() as i32);
+        let new_w = fmt_w + 10;
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
