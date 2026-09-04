@@ -7121,9 +7121,12 @@ fn adjust_rename_edit_height(edit: HWND) {
         // "v4flash测"(60)留在首行、"+试"(72)换行;32字长名 6字/行(≥108);
         // 恒定宽无法同时满足,原生换行宽随名字收放。取窗口中值 66 安全。
         // 外框 = 换行宽+12(内建边距L3/R5+WS_BORDER 2px)。
-        let fmt_w = ((text_w * 0.55).round() as i32)
+        // 系数 0.69:应用内实测 text_w(v4flash测试.txt)=123,原生同名的
+        // 可见换行点在"测|试"→ 原生有效换行宽 ≈ 85(窗口 [82,97)),0.69×123
+        // = 85 正中;xxx.txt(43)→ 66 保单行;长名(690)→ 封顶 111 保 6 字/行。
+        let fmt_w = ((text_w * 0.69).round() as i32)
             .clamp(66, (m.cell_w - 2.0 * m.scale).round() as i32);
-        let new_w = fmt_w + 12;
+        let new_w = fmt_w + 10;
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
@@ -7228,6 +7231,9 @@ fn adjust_rename_edit_height(edit: HWND) {
             );
         }
         // 尾部行在框内时把光标滚回可见区:改名起点就与原生一致,末尾可直达
+        log(&format!(
+            "rename fit: text_w={text_w} fmt_w={fmt_w} new_w={new_w} lines={lines} new_h={new_h} left={left} top={top}"
+        ));
         let _ = SendMessageW(edit, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
     }
 }
@@ -9864,4 +9870,77 @@ fn open_item(path: &str) {
 
 fn do_drag_out(paths: Vec<String>) {
     ole::drag_out_files(&paths, |_target| {});
+}
+
+
+#[cfg(test)]
+mod rename_geom_tests {
+    use super::*;
+    use windows::core::PCWSTR;
+
+    /// 实测 adjust 几何:同款字体+文本创建 EDIT,调用 adjust 后回读
+    /// 宽/高/首行内容,验证换行点与原生一致( ignored:会创建真实窗口 )。
+    #[test]
+    #[ignore]
+    fn debug_adjust_wrap_geometry() {
+        unsafe {
+            let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+            let cls = crate::shell::wide("EDIT");
+            let edit = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                PCWSTR::from_raw(cls.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0 | WS_BORDER.0 | 0xC5),
+                60,
+                60,
+                111,
+                54,
+                HWND(0),
+                HMENU(0),
+                hinstance(),
+                None,
+            );
+            assert!(edit.0 != 0);
+            let lf = crate::shell::icon_title_logfont().unwrap();
+            let font = CreateFontIndirectW(&lf);
+            let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            let name = "v4flash测试.txt";
+            let w16 = crate::shell::wide(name);
+            let _ = SetWindowTextW(edit, PCWSTR::from_raw(w16.as_ptr()));
+            // 模拟真实选中(0..basename)
+            let _ = SendMessageW(edit, 0x00B1 /*EM_SETSEL*/, WPARAM(0), LPARAM(name.encode_utf16().count() as isize - 4));
+            adjust_rename_edit_height(edit);
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(edit, &mut rc);
+            let lines = SendMessageW(edit, 0x00BA, WPARAM(0), LPARAM(0)).0;
+            let mut first = [0u16; 64];
+            first[0] = 63;
+            let _ = SendMessageW(edit, 0x00C1 /*EM_GETLINE*/, WPARAM(0), LPARAM(first.as_mut_ptr() as isize));
+            let mut dump = String::new();
+            for li in 0..lines {
+                let mut b = [0u16; 128];
+                b[0] = 127;
+                let _ = SendMessageW(edit, 0x00C1, WPARAM(li as usize), LPARAM(b.as_mut_ptr() as isize));
+                let n = SendMessageW(edit, 0x00C1, WPARAM(li as usize), LPARAM(b.as_mut_ptr() as isize)).0 as usize;
+                dump.push_str(&format!("L{}='{}' ", li, String::from_utf16_lossy(&b[0..n.min(126)])));
+            }
+            println!(
+                "ADJ-RESULT: outer={}x{} lines={} {}",
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                lines,
+                dump
+            );
+            let _ = DestroyWindow(edit);
+        }
+    }
+
+    fn pcw(s: &str) -> PCWSTR {
+        let mut v: Vec<u16> = s.encode_utf16().collect();
+        v.push(0);
+        let mut leak = v.leak();
+        PCWSTR::from_raw(unsafe { leak.as_mut_ptr() })
+    }
 }
