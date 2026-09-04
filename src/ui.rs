@@ -7067,10 +7067,9 @@ fn adjust_rename_edit_height(edit: HWND) {
         } else {
             None
         };
-        // —— 宽度:整名宽度+左右留白,短名收窄、长名格宽封顶 ——
-        // 原生框宽随内容收放(2026-09-04 用户对照:xxx.txt 原生 ~75px,
-        // 栅栏恒 120px 短名时左右大量留白还悬出格外)。只依赖文本总量,
-        // 与换行互不反馈,无震荡。
+        // —— 宽度:整名宽度+原生 EDIT 外框留白,短名收窄、长名在 cell 内换行 ——
+        // 宽度只由一行文字测量结果决定,再受 cell 上限约束,避免换行和宽度
+        // 互相反馈造成抖动。
         let len = GetWindowTextLengthW(edit);
         let mut text_w = 0.0f32;
         if len > 0 {
@@ -7152,9 +7151,12 @@ fn adjust_rename_edit_height(edit: HWND) {
         let mut left = current_center - new_w / 2;
         let mut top = rc.top;
         let available_h = (mon_bottom - mon_top).max(1);
-        let min_h = (34.0 * m.scale).round() as i32;
+        // Keep a one-line name one line tall. The EDIT's measured line height
+        // already includes the native font metrics; only the border inset is extra.
+        let vertical_pad = (8.0 * m.scale).round() as i32;
+        let min_h = (line_h.round() as i32).saturating_add(vertical_pad);
         let new_h = ((lines * line_h).round() as i32)
-            .saturating_add((8.0 * m.scale).round() as i32)
+            .saturating_add(vertical_pad)
             .clamp(min_h.min(available_h), available_h);
         top = top.clamp(mon_top, (mon_bottom - new_h).max(mon_top));
         left = left.clamp(mon_left, (mon_right - new_w).max(mon_left));
