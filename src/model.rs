@@ -1880,6 +1880,18 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
                 // 文件夹仍优先于文件(与 fallback 习惯一致)。
                 cb.cmp(&ca)
                     .then_with(|| lb.cmp(&la))
+                    // 到达顺序(登记序):先来在左、后来靠右(迁移/新建的文件
+                    // 追加在末尾,不再被旧 mtime 拉到最前面)
+                    .then_with(|| {
+                        let pa = fence.item_order.iter().position(|p| p == &a.path);
+                        let pb = fence.item_order.iter().position(|p| p == &b.path);
+                        match (pa, pb) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    })
                     .then_with(|| b.is_dir.cmp(&a.is_dir))
                     .then_with(|| a.mtime_ms.cmp(&b.mtime_ms))
                     .then_with(fallback)

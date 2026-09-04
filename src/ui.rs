@@ -2604,7 +2604,22 @@ pub fn rescan() {
                 ));
             }
         }
-        ensure_missing_category_fences(&mut s)
+        let new_cats_inner = ensure_missing_category_fences(&mut s);
+        // 到达顺序登记进 item_order(2026-09-04):新出现/迁入的成员追加到
+        // 所在栅栏拖拽顺序表末尾,排序按"先来在左、后来靠右"——迁移来的
+        // 文件不再因旧 mtime 排到最前面
+        // MutexGuard 的 Deref 不支持字段级分裂借用:先克隆文件列表
+        let files_snapshot = s.files.clone();
+        for fence in s.fences.iter_mut() {
+            let items = model::display_list(fence, &files_snapshot);
+            let missing: Vec<String> = items
+                .iter()
+                .filter(|it| !fence.item_order.contains(&it.path))
+                .map(|it| it.path.clone())
+                .collect();
+            fence.item_order.extend(missing);
+        }
+        new_cats_inner
     };
     // 栅栏创建已全部收口在 ensure_missing_category_fences 内部(单一创建
     // 来源)。此前这里还有第二个创建循环——rescan 路径每个新分类会建出
@@ -2620,12 +2635,12 @@ pub fn rescan() {
     }
     rebuild_pins();
     refit_auto_fence_heights();
-    // 先排队入场动画再渲染栅栏(2026-09-03):栅栏帧按 hide_arrivals 跳过
-    // 飞行中成员的墨水——新文件"先落在桌面格、飞入落地后才在栅栏显形";
-    // 若先渲染后排队,文件会瞬间出现在栅栏里,动画沦为重复影子
     // 空分类栅栏自动移除(右侧左移补位)——先于 show_all_fences,避免
     // 空栏闪现;不记墓碑,该类再来文件时缺类补建照常重建
     remove_empty_category_fences();
+    // 先排队入场动画再渲染栅栏(2026-09-03):栅栏帧按 hide_arrivals 跳过
+    // 飞行中成员的墨水——新文件"先落在桌面格、飞入落地后才在栅栏显形";
+    // 若先渲染后排队,文件会瞬间出现在栅栏里,动画沦为重复影子
     start_arrival_animations(&added_paths);
     show_all_fences();
 }
@@ -9622,6 +9637,13 @@ fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
     let hit = model::hit_test_with_metrics(fence, &lay, x, y, n, &metrics);
     if let Hit::Icon(i) = hit {
         if let Some(it) = items.get(i) {
+            // 已选中图标的再次点击(无论快慢)= 改名意图(原生"慢双击重命名"):
+            // 不打开——否则慢双击改名时系统 DBLCLK 会把文件误打开
+            // (2026-09-04 用户实测 mp3 慢双击改名被误播放)
+            let already_selected = s.selected_paths.contains(&it.path);
+            if already_selected {
+                return;
+            }
             let p = it.path.clone();
             drop(s);
             open_item(&p);
