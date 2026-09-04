@@ -6765,8 +6765,9 @@ fn start_file_rename(path: String) {
                     let label_top = f.rect.y + cy + (6.5 + 2.0) * m.scale + cs;
                     let label_h = (2.0 * 24.0 + 6.0) * m.scale;
                     let edit_w = (m.cell_w - 2.0 * m.scale).round() as i32;
+                    let cell_center_x = f.rect.x + cx + m.cell_w * 0.5;
                     pos = Some((
-                        (f.rect.x + cx - 2.0 * m.scale).round() as i32,
+                        (cell_center_x - edit_w as f32 * 0.5).round() as i32,
                         label_top.round() as i32,
                         edit_w,
                         label_h.round() as i32,
@@ -6859,7 +6860,10 @@ fn start_file_rename(path: String) {
         {
             let mut s = state().lock().unwrap();
             s.rename_metrics.insert(edit.0, edit_metrics);
-            s.rename_centers.insert(edit.0, edit_x + edit_w / 2);
+            s.rename_centers.insert(
+                edit.0,
+                (edit_x as f32 + edit_w as f32 * 0.5).round() as i32,
+            );
             if !font.is_invalid() {
                 s.rename_fonts.insert(edit.0, font);
             }
@@ -7054,6 +7058,7 @@ unsafe extern "system" fn file_rename_edit_proc(
 fn adjust_rename_edit_height(edit: HWND) {
     unsafe {
         const EM_GETLINECOUNT: u32 = 0x00BA;
+        const EM_GETRECT: u32 = 0x00B2;
         const EM_SCROLLCARET: u32 = 0x00B7;
         let mut rc = RECT::default();
         let _ = GetWindowRect(edit, &mut rc);
@@ -7087,12 +7092,27 @@ fn adjust_rename_edit_height(edit: HWND) {
             .get(&edit.0)
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
-        // Explorer's measured short-name frame uses physical EDIT margins; these
-        // are control chrome pixels, not part of the icon-cell scale.
-        let width_pad = 14i32;
+        // Match the EDIT's own formatting rectangle instead of estimating its
+        // wrapping width from the outer window alone.
+        let mut format = RECT::default();
+        let format_ok = SendMessageW(
+            edit,
+            EM_GETRECT,
+            WPARAM(0),
+            LPARAM((&mut format as *mut RECT) as isize),
+        )
+        .0 != 0;
+        let client_w = (rc.right - rc.left).max(1);
+        let format_w = if format_ok {
+            (format.right - format.left).max(1)
+        } else {
+            client_w.saturating_sub(14).max(1)
+        };
+        let width_pad = (client_w - format_w).max(0);
         let min_w = 64i32;
         let max_w = (m.cell_w - 2.0 * m.scale).round() as i32;
-        let new_w = ((text_w.round() as i32).saturating_add(width_pad)).clamp(min_w, max_w.max(min_w));
+        let measured_w = (text_w.round() as i32).saturating_add(width_pad);
+        let new_w = measured_w.clamp(min_w, max_w.max(min_w));
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
@@ -7153,7 +7173,13 @@ fn adjust_rename_edit_height(edit: HWND) {
         let available_h = (mon_bottom - mon_top).max(1);
         // Keep a one-line name one line tall. The EDIT's measured line height
         // already includes the native font metrics; only the border inset is extra.
-        let vertical_pad = (8.0 * m.scale).round() as i32;
+        let client_h = (rc.bottom - rc.top).max(1);
+        let format_h = if format_ok {
+            (format.bottom - format.top).max(1)
+        } else {
+            client_h.saturating_sub((8.0 * m.scale).round() as i32).max(1)
+        };
+        let vertical_pad = (client_h - format_h).max((4.0 * m.scale).round() as i32);
         let min_h = (line_h.round() as i32).saturating_add(vertical_pad);
         let new_h = ((lines * line_h).round() as i32)
             .saturating_add(vertical_pad)
