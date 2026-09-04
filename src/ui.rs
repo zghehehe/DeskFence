@@ -2485,6 +2485,26 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
 }
 
 /// 桌面文件变更刷新
+/// 空分类栅栏自动移除(2026-09-04 用户要求):分类成员走光(改名换类/
+/// 删除)后栅栏不再占位,右侧栅栏经 delete_fence_ex 的行内左移补位。
+/// 只处理分类栅栏(category 非空;手动新建的空栏是用户预留,不自动删);
+/// 不记墓碑。逐个走 delete_fence_ex(含 undo/左移/落盘),须在 state 锁外调用。
+fn remove_empty_category_fences() {
+    let empty_ids: Vec<u32> = {
+        let s = state().lock().unwrap();
+        s.fences
+            .iter()
+            .filter(|f| !f.category.is_empty())
+            .filter(|f| model::display_list(f, &s.files).is_empty())
+            .map(|f| f.id)
+            .collect()
+    };
+    for id in empty_ids {
+        log(&format!("auto-removed empty category fence {}", id));
+        delete_fence_ex(id, false);
+    }
+}
+
 pub fn rescan() {
     let mut files = with_recycle_bin(shell::scan_desktop());
     let (added_paths, removed_any, recat_any, gained_cats) = {
@@ -2603,6 +2623,9 @@ pub fn rescan() {
     // 先排队入场动画再渲染栅栏(2026-09-03):栅栏帧按 hide_arrivals 跳过
     // 飞行中成员的墨水——新文件"先落在桌面格、飞入落地后才在栅栏显形";
     // 若先渲染后排队,文件会瞬间出现在栅栏里,动画沦为重复影子
+    // 空分类栅栏自动移除(右侧左移补位)——先于 show_all_fences,避免
+    // 空栏闪现;不记墓碑,该类再来文件时缺类补建照常重建
+    remove_empty_category_fences();
     start_arrival_animations(&added_paths);
     show_all_fences();
 }
@@ -5811,6 +5834,12 @@ fn toggle_lock(fence_id: u32) {
 }
 
 fn delete_fence(fence_id: u32) {
+    delete_fence_ex(fence_id, true);
+}
+
+/// tombstone=false:空栏自动移除用——不记墓碑,该类之后再来文件时缺类
+/// 补建照常重建(空栏移除≠用户拒绝该分类)。
+fn delete_fence_ex(fence_id: u32, tombstone: bool) {
     if !state()
         .lock()
         .unwrap()
@@ -5880,14 +5909,18 @@ fn delete_fence(fence_id: u32) {
         let mut s = state().lock().unwrap();
         clear_fence_interaction(&mut s, fence_id);
         // 分类栅栏(自动建的)删除记墓碑:缺类补建不再复活它,直到该类
-        // 出现新文件(2026-09-02 修"删了的栅栏又冒出来")
-        if let Some(f) = s.fences.iter().find(|f| f.id == fence_id) {
-            if !f.category.is_empty() {
-                set_category_tombstone(&f.category);
-                log(&format!(
-                    "category fence '{}' deleted, tombstone set",
-                    f.category
-                ));
+        // 出现新文件(2026-09-02 修"删了的栅栏又冒出来")。
+        // 空栏自动移除(tombstone=false)不记墓碑:空栏移除≠用户拒绝该分类,
+        // 之后该类再来文件时应照常补建。
+        if tombstone {
+            if let Some(f) = s.fences.iter().find(|f| f.id == fence_id) {
+                if !f.category.is_empty() {
+                    set_category_tombstone(&f.category);
+                    log(&format!(
+                        "category fence '{}' deleted, tombstone set",
+                        f.category
+                    ));
+                }
             }
         }
         let removed = s.windows.remove(&fence_id);
