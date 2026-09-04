@@ -6788,10 +6788,13 @@ fn start_file_rename(path: String) {
             // 首行/末行短行明显缩进;此前把原生样式 0x540000C5 的 0x1 位
             // 误读成 ES_LEFT(其值本为 0,无效果)。样式余下部分=
             // MULTILINE|AUTOVSCROLL|NOHIDESEL;WS_POPUP 是结构必需(ULW
-            // 分层窗口不能挂子窗口),原生为 WS_CHILD
+            // 分层窗口不能挂子窗口),原生为 WS_CHILD。
+            // WS_BORDER(2026-09-04 用户对照):原生框有 1px 描边,栅栏
+            // 无边框白块与原生观感差异明显
             WINDOW_STYLE(
                 WS_POPUP.0
                     | WS_VISIBLE.0
+                    | WS_BORDER.0
                     | ES_CENTER as u32
                     | ES_MULTILINE as u32
                     | ES_AUTOVSCROLL as u32
@@ -6978,76 +6981,63 @@ unsafe extern "system" fn file_rename_edit_proc(
 fn adjust_rename_edit_height(edit: HWND) {
     unsafe {
         const EM_GETLINECOUNT: u32 = 0x00BA;
-        const EM_GETRECT: u32 = 0x00B2;
         const EM_SCROLLCARET: u32 = 0x00B7;
         let mut rc = RECT::default();
         let _ = GetWindowRect(edit, &mut rc);
-        // 换行宽 = EM_GETRECT 格式矩形(内建边距已含在内,L3/R5,勿再猜),
-        // 与 EDIT 实际折行用的宽度严格同源
-        let mut fmt = RECT::default();
-        let _ = SendMessageW(
-            edit,
-            EM_GETRECT,
-            WPARAM(0),
-            LPARAM(&mut fmt as *mut RECT as isize),
-        );
-        let inner_w = ((fmt.right - fmt.left) as f32).max(40.0);
         let hdc = GetDC(edit);
         if hdc.is_invalid() {
             return;
         }
-        // 行数以 EM_GETLINECOUNT 为准(editprobe 实测 SetWindowText 后即时
-        // 即准);兜底估计改为逐字贪心模拟换行——EDIT 对 CJK 逐字断行,旧
-        // "文本总宽/内宽向上取整"忽略每行行尾的空隙,长汉字名会被低估
-        // (8 行估成 6 行)。逐字模拟对汉字名精确,拉丁词只会略高不会略低。
-        let mut lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
         let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0)).0;
         let old_font = if font != 0 {
             Some(SelectObject(hdc, HFONT(font as _)))
         } else {
             None
         };
+        // —— 宽度:整名宽度+左右留白,短名收窄、长名格宽封顶 ——
+        // 原生框宽随内容收放(2026-09-04 用户对照:xxx.txt 原生 ~75px,
+        // 栅栏恒 120px 短名时左右大量留白还悬出格外)。只依赖文本总量,
+        // 与换行互不反馈,无震荡。
         let len = GetWindowTextLengthW(edit);
+        let mut text_w = 0.0f32;
         if len > 0 {
             let mut buf = vec![0u16; len as usize + 1];
             let _ = GetWindowTextW(edit, &mut buf);
-            let mut est = 1.0f32;
-            let mut x = 0.0f32;
             let mut sz = SIZE::default();
-            for &u in &buf[..len as usize] {
-                // 逐 UTF-16 码元测宽;代理对拆开只影响兜底估计精度,
-                // 不影响最终行数(仍以 EM_GETLINECOUNT 为主)
-                let one = [u];
-                if GetTextExtentPoint32W(hdc, &one, &mut sz).as_bool() && sz.cx > 0 {
-                    let w = sz.cx as f32;
-                    if x > 0.0 && x + w > inner_w {
-                        est += 1.0;
-                        x = w;
-                    } else {
-                        x += w;
-                    }
-                }
-            }
-            if est > lines {
-                lines = est;
+            if GetTextExtentPoint32W(hdc, &buf[..len as usize], &mut sz).as_bool() {
+                text_w = sz.cx as f32;
             }
         }
-        if let Some(of) = old_font {
-            SelectObject(hdc, of);
+        let m = model::DpiMetrics::system();
+        let new_w = ((text_w + 14.0) as i32)
+            .clamp(64, (m.cell_w + 4.0 * m.scale).round() as i32);
+        if new_w != rc.right - rc.left {
+            let _ = SetWindowPos(
+                edit,
+                HWND(0),
+                0,
+                0,
+                new_w,
+                0,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
+        // —— 高度:实际换行行数×行高+贴身边距(原生单行框≈行高+8) ——
+        // 旧的 行数+1 余量槽在单行名时多出整整一行空白(用户对照反馈),
+        // 余量槽退役;防裁切由 EM_GETLINECOUNT 实时准确(editprobe 实测)
+        // + 显示器封顶兜底承担。
+        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
         let mut tm = TEXTMETRICW::default();
         let line_h = if GetTextMetricsW(hdc, &mut tm).as_bool() {
             (tm.tmHeight + tm.tmExternalLeading) as f32
         } else {
             20.0
         };
+        if let Some(of) = old_font {
+            SelectObject(hdc, of);
+        }
         ReleaseDC(edit, hdc);
-        // 行槽 = 行数+1(editprobe 对照原生截图:原生 6 行框高 ≈(6+1)*24+4,
-        // 末行下留一整槽空白;+1 槽同时吸收兜底估计的瞬时偏差,末行永不贴边)
-        // 封顶改按显示器而非 SPI 工作区:原生编辑框是桌面 listview 的子窗,
-        // 客户区=整块显示器,改名框可以覆住任务栏;旧实现按工作区封顶,栅栏
-        // 靠屏底时尾部行整行消失(用户实测"看不到全部、没法改最后面")。
-        // 仍放不下才整框上移,贴住显示器底缘。
+        let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         let in_mon = GetMonitorInfoW(MonitorFromWindow(edit, MONITOR_DEFAULTTONEAREST), &mut mi)
@@ -7058,9 +7048,9 @@ fn adjust_rename_edit_height(edit: HWND) {
             let (_, vy, _, vh) = work_area();
             (vy, vy + vh)
         };
-        let new_h = ((((lines + 1.0) * line_h).round() as i32 + 8) as f32)
+        let new_h = (((lines * line_h).round() as i32 + 12) as f32)
             .min(mon_bottom - mon_top)
-            .max(24.0) as i32;
+            .max(34.0) as i32;
         let mut top = rc.top;
         if top + new_h > mon_bottom as i32 {
             top = (mon_bottom as i32 - new_h).max(mon_top as i32);
