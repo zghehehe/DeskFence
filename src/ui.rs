@@ -6999,8 +6999,16 @@ unsafe extern "system" fn file_rename_edit_proc(
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, RENAME_FIT_TIMER);
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-            return LRESULT(0);
+            return CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
         }
         WM_NCDESTROY => {
             let owned = state()
@@ -7095,13 +7103,13 @@ fn adjust_rename_edit_height(edit: HWND) {
         // Match the EDIT's own formatting rectangle instead of estimating its
         // wrapping width from the outer window alone.
         let mut format = RECT::default();
-        let format_ok = SendMessageW(
+        let _ = SendMessageW(
             edit,
             EM_GETRECT,
             WPARAM(0),
             LPARAM((&mut format as *mut RECT) as isize),
-        )
-        .0 != 0;
+        );
+        let format_ok = format.right > format.left && format.bottom > format.top;
         let client_w = (rc.right - rc.left).max(1);
         let format_w = if format_ok {
             (format.right - format.left).max(1)
@@ -7141,6 +7149,14 @@ fn adjust_rename_edit_height(edit: HWND) {
         }
         ReleaseDC(edit, hdc);
         let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形(换行已同步)
+        format = RECT::default();
+        let _ = SendMessageW(
+            edit,
+            EM_GETRECT,
+            WPARAM(0),
+            LPARAM((&mut format as *mut RECT) as isize),
+        );
+        let format_ok = format.right > format.left && format.bottom > format.top;
         let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -7309,11 +7325,6 @@ fn commit_file_rename(edit: HWND) {
             }
         }
     }
-    *FILE_RENAME_PATH.lock().unwrap() = None;
-    {
-        let mut s = state().lock().unwrap();
-        s.file_rename_edit = None;
-    }
     uninstall_rename_mouse_hook();
     unsafe {
         let _ = KillTimer(edit, RENAME_FIT_TIMER);
@@ -7334,11 +7345,6 @@ fn commit_file_rename(edit: HWND) {
 
 fn cancel_file_rename(edit: HWND) {
     log("file rename cancel");
-    *FILE_RENAME_PATH.lock().unwrap() = None;
-    {
-        let mut s = state().lock().unwrap();
-        s.file_rename_edit = None;
-    }
     uninstall_rename_mouse_hook();
     unsafe {
         let _ = DestroyWindow(edit);
