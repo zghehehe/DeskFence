@@ -6026,6 +6026,15 @@ static SHOWN_PENDING_MS: AtomicU64 = AtomicU64::new(0);
 
 /// 全带是否存在"可见且非 topmost 的外来窗"(=有可见应用窗)。
 /// 与 band_attach_anchor 主规则同源判定。
+/// 大尺寸窗口判定(物理px):宽高均 ≥250 视为真实应用窗——topmost 且
+/// 大尺寸的可视窗口(腾讯会议被 SPES/系统翻成 topmost 的场景)必须让
+/// 免疫模式退出,栅栏不允许浮在应用上(2026-09-04 用户指令)。
+fn is_large_window(w: HWND) -> bool {
+    let mut r = RECT::default();
+    let ok = unsafe { GetWindowRect(w, &mut r) }.is_ok();
+    ok && (r.right - r.left) >= 250 && (r.bottom - r.top) >= 250
+}
+
 fn band_has_live_foreign() -> bool {
     let Some(host) = desktop_shell_window() else {
         return true; // 宿主未知时保守视为有(不开免疫)
@@ -6039,10 +6048,17 @@ fn band_has_live_foreign() -> bool {
             break;
         }
         if is_own_fence_window(w)
-            || is_topmost_window(w)
             || band_aux(w, mh, tr)
             || band_invisible(w, &vs)
         {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        // topmost 且可见:仅小尺寸杂层容忍(宽高均 <250 物理px 的 SPES 钩子
+        // 层等);大尺寸可视 topmost 窗是真实应用窗(会议/应用窗被翻成
+        // topmost 的场景),必须视为"有可见应用窗"让免疫退出,否则栅栏
+        // 浮在应用上(2026-09-04 用户指令:栅栏不允许浮在应用上)
+        if is_topmost_window(w) && !is_large_window(w) {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
             continue;
         }
