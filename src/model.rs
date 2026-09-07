@@ -343,6 +343,29 @@ pub fn space_rows_gap(rects: &mut [Rect]) -> bool {
     changed
 }
 
+/// 首行贴左(P1 布局规范化第三步)：把首行(rows_from_rects 最上行)整体
+/// 平移，使行内最左栅栏的 x 落到 anchor_x(工作区左缘)——行内间距与
+/// 相对位置保持，只是整排从屏幕左侧起步。anchor_x 由调用方按首行
+/// 最左栅栏所在显示器的工作区取值。返回是否有矩形被改动。
+pub fn align_first_row_left(rects: &mut [Rect], anchor_x: f32) -> bool {
+    let rows = rows_from_rects(rects);
+    let Some(first) = rows.first() else {
+        return false;
+    };
+    let min_x = first
+        .iter()
+        .map(|&i| rects[i].x)
+        .fold(f32::MAX, f32::min);
+    if min_x == anchor_x {
+        return false;
+    }
+    let dx = anchor_x - min_x;
+    for &i in first {
+        rects[i].x += dx;
+    }
+    true
+}
+
 // ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
 
 /// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
@@ -3453,5 +3476,25 @@ mod tests {
         assert!(!space_rows_gap(&mut rects));
         assert_eq!(rects[0].y, 300.0);
         assert_eq!(rects[1].y, 340.0);
+    }
+
+    #[test]
+    fn align_first_row_left_translates_row_to_edge() {
+        // 首行整体平移到工作区左缘,行内间距保持;第二行不动
+        let mut rects = vec![
+            rr(120.0, 0.0, 200.0, 100.0), // 首行最左
+            rr(360.0, 20.0, 132.0, 100.0), // 首行第二(中心差 20 ≤ 60)
+            rr(300.0, 300.0, 132.0, 100.0), // 第二行
+        ];
+        assert!(align_first_row_left(&mut rects, 0.0));
+        assert_eq!(rects[0].x, 0.0);
+        assert_eq!(rects[1].x, 240.0); // 随整行平移 -120
+        assert_eq!(rects[2].x, 300.0); // 第二行不动
+    }
+
+    #[test]
+    fn align_first_row_left_noop_when_already_at_edge() {
+        let mut rects = vec![rr(0.0, 0.0, 200.0, 100.0)];
+        assert!(!align_first_row_left(&mut rects, 0.0));
     }
 }
