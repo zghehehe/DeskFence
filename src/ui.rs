@@ -8380,9 +8380,10 @@ fn settle_all_fences() {
 }
 
 /// settle 归一(P1 布局规范化)：① 行贴顶——同一行(可见集,与拖拽/删除
-/// 槽位模型同口径)所有栅栏的 y 归一到该行最顶栅栏顶边;② 两两收敛推挤
-/// 解除重叠(按最小位移推开,归一新引入的行间挤压在此兜底);③ 夹回屏幕。
-/// 不改变栅栏顺序/行结构,行内相对 y 会归一。
+/// 槽位模型同口径)所有栅栏的 y 归一到该行最顶栅栏顶边;② 行间固定间隔
+/// ——自上而下级联,下行顶=上行最深底+GAP,过近推下过远拉上(首行顶锚
+/// 不动);③ 两两收敛推挤解除重叠(级联已保证行间恰为 GAP,推挤只兜横
+/// 向/夹回残冲突);④ 夹回屏幕。不改变栅栏顺序/行结构,行内相对 y 会归一。
 fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
     let n = fences.len();
     if n == 0 {
@@ -8396,14 +8397,18 @@ fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
         f.rect.h = h;
     }
     let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
-    // 行贴顶只作用于可见集:隐藏/折叠栅栏不参与行分组,也不会把历史
+    // 行规范化只作用于可见集:隐藏/折叠栅栏不参与行分组,也不会把历史
     // 位置的 y 带进来当行顶锚(与 fence_insertion_plan/delete_fence_ex
-    // 的 !hidden && !collapsed 口径一致)
+    // 的 !hidden && !collapsed 口径一致)。① 行贴顶;② 行间固定间隔
+    // (级联,过近推下过远拉上);新引入的残余冲突仍由下面的推挤与
+    // 屏幕夹回兜底。
     let vis: Vec<usize> = (0..n)
         .filter(|&i| !fences[i].hidden && !fences[i].collapsed)
         .collect();
     let mut vis_rects: Vec<Rect> = vis.iter().map(|&i| rects[i]).collect();
-    if model::align_rows_top(&mut vis_rects) {
+    let aligned = model::align_rows_top(&mut vis_rects);
+    let spaced = model::space_rows_gap(&mut vis_rects);
+    if aligned || spaced {
         for (k, &i) in vis.iter().enumerate() {
             rects[i] = vis_rects[k];
         }
@@ -8429,9 +8434,10 @@ fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
     }
 }
 
-/// 周期性 rescan 用的收敛：行贴顶归一 + 推挤 + 夹回屏幕，除行内 y 归一外
-/// 保留用户手动摆放的相对位置，避免自动对齐模式下每 30 秒把所有栅栏
-/// 流式重排回左上角(与 settle_all_fences 当前同体,仅语义标注不同)。
+/// 周期性 rescan 用的收敛：行规范化(贴顶+行间 GAP) + 推挤 + 夹回屏幕，
+/// 除行内 y 归一与行距归一外保留用户手动摆放的相对位置，避免自动对齐
+/// 模式下每 30 秒把所有栅栏流式重排回左上角(与 settle_all_fences 当前
+/// 同体,仅语义标注不同)。
 fn settle_preserve_positions() {
     let areas = all_work_areas();
     let mut s = state().lock().unwrap();

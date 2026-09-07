@@ -312,6 +312,37 @@ pub fn align_rows_top(rects: &mut [Rect]) -> bool {
     changed
 }
 
+/// 行间固定间隔(P1 布局规范化第二步)：自上而下级联，每行顶边 =
+/// 上一行最深底边 + GAP(与水平间距同源常量)。行距不足被推下、过远
+/// 被拉上；首行顶边保持不动(整列锚定，不向左上漂移)。行序天然保持
+/// (落点必在上一行底 + GAP，恒 > 上一行底)，行间不会交叉。
+/// 输入应为已行贴顶的矩形(先跑 align_rows_top)，行结构与
+/// rows_from_rects 同源。返回是否有矩形被改动。
+pub fn space_rows_gap(rects: &mut [Rect]) -> bool {
+    let rows = rows_from_rects(rects);
+    let mut changed = false;
+    let mut prev_bottom: Option<f32> = None;
+    for row in &rows {
+        if let Some(pb) = prev_bottom {
+            let top = row.iter().map(|&i| rects[i].y).fold(f32::MAX, f32::min);
+            let want = pb + GAP;
+            if top != want {
+                let dy = want - top;
+                for &i in row {
+                    rects[i].y += dy;
+                }
+                changed = true;
+            }
+        }
+        let bottom = row
+            .iter()
+            .map(|&i| rects[i].y + rects[i].h)
+            .fold(f32::MIN, f32::max);
+        prev_bottom = Some(bottom);
+    }
+    changed
+}
+
 // ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
 
 /// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
@@ -3396,5 +3427,31 @@ mod tests {
         assert!(!align_rows_top(&mut rects));
         assert_eq!(rects[0].y, 0.0);
         assert_eq!(rects[1].y, 115.0);
+    }
+
+    #[test]
+    fn space_rows_gap_cascades_to_fixed_gap() {
+        // 行距不足被推下、过远被拉上;首行顶锚不动;下行顶=上行最深底+GAP
+        let mut rects = vec![
+            rr(0.0, 100.0, 200.0, 100.0), // 行0(中心150)顶锚
+            rr(0.0, 190.0, 132.0, 100.0), // 行1(中心240,差90>60)过近
+            rr(0.0, 400.0, 132.0, 100.0), // 行2(中心450)过远
+        ];
+        assert!(space_rows_gap(&mut rects));
+        assert_eq!(rects[0].y, 100.0); // 首行不动
+        assert_eq!(rects[1].y, 212.0); // 100+100+GAP(推下)
+        assert_eq!(rects[2].y, 324.0); // 212+100+GAP(拉上)
+    }
+
+    #[test]
+    fn space_rows_gap_keeps_single_row_anchored() {
+        // 单行:顶锚保持,成员各自 y 不动(对齐是 align_rows_top 的职责)
+        let mut rects = vec![
+            rr(0.0, 300.0, 200.0, 100.0),
+            rr(220.0, 340.0, 132.0, 100.0), // 同行(中心差 40 ≤ 60)
+        ];
+        assert!(!space_rows_gap(&mut rects));
+        assert_eq!(rects[0].y, 300.0);
+        assert_eq!(rects[1].y, 340.0);
     }
 }
