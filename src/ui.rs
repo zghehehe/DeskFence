@@ -6764,6 +6764,23 @@ fn mark_scan_removed(paths: &[String]) {
     }
 }
 
+// ---------------- 双击打开延迟执行(2026-09-04 兼顾两种手势) ----------------
+// DBLCLK 先登记"待打开"而不立即执行;随后的 UP 判定:与上一次图标 UP 的
+// 间隔 > 系统双击时长 = 慢双击改名意图(取消打开、进入改名);否则执行
+// 打开。快速双击=打开、慢双击=改名,互不误伤,与原生同款时序语义。
+fn pending_open() -> &'static Mutex<Option<String>> {
+    static M: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(None))
+}
+fn last_icon_up_ms() -> &'static std::sync::atomic::AtomicU64 {
+    static M: OnceLock<std::sync::atomic::AtomicU64> = OnceLock::new();
+    M.get_or_init(|| std::sync::atomic::AtomicU64::new(0))
+}
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetDoubleClickTime() -> u32;
+}
+
 /// 系统菜单"重命名"拦截回调(shell.rs 在 init 时注册)
 fn on_shell_rename_request(path: &str) {
     start_file_rename(path.to_string());
@@ -9168,6 +9185,9 @@ fn release_on_recycle_bin_screen(s: &UiState, sx: f32, sy: f32, source_fence: u3
 }
 
 fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
+    let now_ms = resize_now_ms();
+    // 交换出"上一次图标 UP"的时间:本 UP 与它的间隔=双击/慢击判定依据
+    let prev_up_ms = last_icon_up_ms().swap(now_ms as u64, Ordering::Relaxed) as i64;
     let mut s = match state().try_lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -9352,14 +9372,18 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             if let DragMode::Icon(_) = drag.mode {
                 let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
                 let moved = (dx * dx + dy * dy) > 64.0;
+                let slow_rename = now_ms as i64 - prev_up_ms > unsafe { GetDoubleClickTime() } as i64;
                 if drag.icon_was_selected
                     && !ctrl
                     && !moved
+                    && slow_rename
                     && !drag.icon_path.is_empty()
                     && !model::is_recycle_bin(&drag.icon_path)
                 {
                     let path = drag.icon_path.clone();
                     s.marquee = None;
+                    // 慢双击改名:取消 DBLCLK 登记的待打开(否则文件误打开)
+                    *pending_open().lock().unwrap() = None;
                     drop(s);
                     refresh_fence(fence_id);
                     start_file_rename(path);
@@ -9368,6 +9392,12 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                     return;
                 }
+            }
+            // 未进入改名的图标 UP:执行 DBLCLK 登记的待打开(快速双击=打开)
+            if let Some(p) = pending_open().lock().unwrap().take() {
+                drop(s);
+                open_item(&p);
+                return;
             }
             let others: Vec<Rect> = s
                 .fences
@@ -9637,16 +9667,11 @@ fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
     let hit = model::hit_test_with_metrics(fence, &lay, x, y, n, &metrics);
     if let Hit::Icon(i) = hit {
         if let Some(it) = items.get(i) {
-            // 已选中图标的再次点击(无论快慢)= 改名意图(原生"慢双击重命名"):
-            // 不打开——否则慢双击改名时系统 DBLCLK 会把文件误打开
-            // (2026-09-04 用户实测 mp3 慢双击改名被误播放)
-            let already_selected = s.selected_paths.contains(&it.path);
-            if already_selected {
-                return;
-            }
             let p = it.path.clone();
             drop(s);
-            open_item(&p);
+            // 延迟执行:是否真打开由随后的 UP 判定(快双击=执行打开;
+            // 慢双击=取消打开进入改名)。见 pending_open 注释。
+            *pending_open().lock().unwrap() = Some(p);
             return;
         }
     }
