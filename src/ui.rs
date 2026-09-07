@@ -9409,12 +9409,6 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     return;
                 }
             }
-            // 未进入改名的图标 UP:执行 DBLCLK 登记的待打开(快速双击=打开)
-            if let Some(p) = pending_open().lock().unwrap().take() {
-                drop(s);
-                open_item(&p);
-                return;
-            }
             let others: Vec<Rect> = s
                 .fences
                 .iter()
@@ -9661,6 +9655,14 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 }
             }
         }
+    }
+    // DBLCLK 登记的待打开在此无条件执行(2026-09-04):快速双击时系统以
+    // DBLCLK 替代第二次 DOWN,UP 时拖拽已被首次 UP 取走——执行点若放在
+    // 拖拽块内,快速双击的打开永远不会发生,直到后续点击才补开(用户实测
+    // "打不开/很久才有反应")。打开走工作线程:ShellExecute 启动播放器
+    // 会被安全软件扫描,同步执行会挂住 UI 线程(用户实测"卡死")。
+    if let Some(p) = pending_open().lock().unwrap().take() {
+        std::thread::spawn(move || open_item(&p));
     }
 }
 
