@@ -292,6 +292,26 @@ pub fn push_chain(rects: &mut [Rect], anchor: usize) {
     }
 }
 
+// ---------- settle 行贴顶归一(P1 布局规范化第一步) ----------
+
+/// 同一行所有栅栏的 y 归一到该行最顶栅栏的顶边，只动 y 不动 x/尺寸。
+/// 行结构与 rows_from_rects 同源；归一可能新引入的行间挤压由调用方
+/// 既有的推挤/夹回兜底。返回是否有矩形被改动。
+pub fn align_rows_top(rects: &mut [Rect]) -> bool {
+    let rows = rows_from_rects(rects);
+    let mut changed = false;
+    for row in &rows {
+        let top = row.iter().map(|&i| rects[i].y).fold(f32::MAX, f32::min);
+        for &i in row {
+            if rects[i].y != top {
+                rects[i].y = top;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 // ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
 
 /// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
@@ -3344,5 +3364,37 @@ mod tests {
         assert_eq!(row_slot_of(&rects, &rows, (10.0, 50.0)), (0, 0));
         // 距行中心很远 = 自由区
         assert!(nearest_row_distance(&rects, &rows, 2000.0) > 300.0);
+    }
+
+    #[test]
+    fn align_rows_top_normalizes_row_tops() {
+        // 同行错位:行内 y 归一到最顶栅栏顶边,两行各自归一互不越行;
+        // x/尺寸一律不动
+        let mut rects = vec![
+            rr(0.0, 30.0, 200.0, 100.0), // 0 行0 顶
+            rr(220.0, 80.0, 200.0, 100.0), // 1 行0 错位(中心差 50 ≤ 容差 60)
+            rr(0.0, 180.0, 132.0, 100.0), // 2 行1 顶
+            rr(220.0, 220.0, 132.0, 100.0), // 3 行1 错位
+        ];
+        assert!(align_rows_top(&mut rects));
+        assert_eq!(rects[0].y, 30.0);
+        assert_eq!(rects[1].y, 30.0);
+        assert_eq!(rects[2].y, 180.0);
+        assert_eq!(rects[3].y, 180.0);
+        assert_eq!(rects[1].x, 220.0);
+        assert_eq!(rects[1].w, 200.0);
+        assert_eq!(rects[1].h, 100.0);
+    }
+
+    #[test]
+    fn align_rows_top_keeps_distinct_rows_intact() {
+        // 中心距超容差=两行,各自顶边已是最小 → 无改动(归一不合并行)
+        let mut rects = vec![
+            rr(0.0, 0.0, 132.0, 100.0),    // 中心 50
+            rr(0.0, 115.0, 132.0, 100.0), // 中心 165,差 115 > 容差 60
+        ];
+        assert!(!align_rows_top(&mut rects));
+        assert_eq!(rects[0].y, 0.0);
+        assert_eq!(rects[1].y, 115.0);
     }
 }

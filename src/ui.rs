@@ -2625,7 +2625,7 @@ pub fn rescan() {
     // 来源)。此前这里还有第二个创建循环——rescan 路径每个新分类会建出
     // 两个同名栅栏(2026-09-02 修"mp3 一来冒出两个媒体")。
     // 只有真的新增了分类栅栏才收敛；周期 rescan 不应把用户手动摆放的
-    // 位置重排回左上角（推挤式保留相对位置，而不是流式重排）。
+    // 位置重排回左上角（推挤式保留相对位置 + 行贴顶归一，而不是流式重排）。
     if !new_cats.is_empty() {
         settle_preserve_positions();
     }
@@ -5962,9 +5962,38 @@ fn delete_fence_ex(fence_id: u32, tombstone: bool) {
             let _ = DestroyWindow(h);
         }
     }
+    // 删除后的 settle 归一(P1 触发时机"删除后"):行贴顶+推挤+夹回。
+    // 左移补洞只重排本行,其余行的历史错位在此一并归一;矩形有变的成员
+    // (可能与 shift 重合,刷新幂等)补重渲染并落盘最终位置。
+    let pre_settle: Vec<(u32, Rect)> = state()
+        .lock()
+        .unwrap()
+        .fences
+        .iter()
+        .map(|f| (f.id, f.rect))
+        .collect();
+    settle_all_fences();
+    let settled_moved: Vec<u32> = {
+        let s = state().lock().unwrap();
+        s.fences
+            .iter()
+            .filter(|f| pre_settle.iter().any(|(id, r)| *id == f.id && *r != f.rect))
+            .map(|f| f.id)
+            .collect()
+    };
+    if !settled_moved.is_empty() {
+        let s = state().lock().unwrap();
+        let cfg = s.fences.clone();
+        let _ = model::save_config(&cfg);
+    }
     // 左移补洞的成员重渲染(位置变了)
     for (id, _) in &shift {
         refresh_fence(*id);
+    }
+    for id in &settled_moved {
+        if !shift.iter().any(|(sid, _)| sid == id) {
+            refresh_fence(*id);
+        }
     }
     finish_interaction_cleanup();
     reconcile_desktop_icons();
@@ -8350,8 +8379,10 @@ fn settle_all_fences() {
     push_settle(&mut s.fences, &areas);
 }
 
-/// 仅推挤解除重叠 + 夹回屏幕，不改变栅栏顺序/相对位置。
-/// 两两收敛：反复检查每一对栅栏，按最小位移推开重叠。
+/// settle 归一(P1 布局规范化)：① 行贴顶——同一行(可见集,与拖拽/删除
+/// 槽位模型同口径)所有栅栏的 y 归一到该行最顶栅栏顶边;② 两两收敛推挤
+/// 解除重叠(按最小位移推开,归一新引入的行间挤压在此兜底);③ 夹回屏幕。
+/// 不改变栅栏顺序/行结构,行内相对 y 会归一。
 fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
     let n = fences.len();
     if n == 0 {
@@ -8365,6 +8396,18 @@ fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
         f.rect.h = h;
     }
     let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
+    // 行贴顶只作用于可见集:隐藏/折叠栅栏不参与行分组,也不会把历史
+    // 位置的 y 带进来当行顶锚(与 fence_insertion_plan/delete_fence_ex
+    // 的 !hidden && !collapsed 口径一致)
+    let vis: Vec<usize> = (0..n)
+        .filter(|&i| !fences[i].hidden && !fences[i].collapsed)
+        .collect();
+    let mut vis_rects: Vec<Rect> = vis.iter().map(|&i| rects[i]).collect();
+    if model::align_rows_top(&mut vis_rects) {
+        for (k, &i) in vis.iter().enumerate() {
+            rects[i] = vis_rects[k];
+        }
+    }
     for _ in 0..24 {
         let mut moved = false;
         for i in 0..n {
@@ -8386,8 +8429,9 @@ fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
     }
 }
 
-/// 周期性 rescan 用的收敛：只推挤 + 夹回屏幕，保留用户手动摆放的相对位置，
-/// 避免自动对齐模式下每 30 秒把所有栅栏流式重排回左上角。
+/// 周期性 rescan 用的收敛：行贴顶归一 + 推挤 + 夹回屏幕，除行内 y 归一外
+/// 保留用户手动摆放的相对位置，避免自动对齐模式下每 30 秒把所有栅栏
+/// 流式重排回左上角(与 settle_all_fences 当前同体,仅语义标注不同)。
 fn settle_preserve_positions() {
     let areas = all_work_areas();
     let mut s = state().lock().unwrap();
@@ -9210,6 +9254,8 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     };
     if let Some(drag) = s.drag.take() {
         let mut changed_final: Vec<u32> = Vec::new();
+        // Move 拖拽真实位移过:松手后要跑一次 settle 归一(P1 触发时机)
+        let mut drop_move_settle = false;
         // 内部图标残影拖拽收尾:松手在栅栏内 = 预览顺序生效(落格重排已实时完成,
         // 只需持久化);松手在栅栏外 = 未移动,回滚到原始顺序
         if s.drag_ghost.is_some() {
@@ -9560,6 +9606,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                     s.insert_line = None;
                     changed_final = s.fences.iter().map(|f| f.id).collect();
+                    drop_move_settle = moved;
                 }
                 DragMode::Resize { edges } => {
                     // 用户手动缩放：此后高度不再自动收敛到内容（尊重用户意图）
@@ -9610,6 +9657,16 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         }
         s.marquee = None;
         drop(s);
+        if drop_move_settle {
+            // 拖动落位后的 settle 归一(P1 触发时机"拖动后"):行贴顶+推挤+
+            // 夹回一次跑完。Move 分支 changed_final 已是全体 id,归一动到
+            // 的栅栏会随下面的刷新一并重渲染。settle 自取状态锁,必须在
+            // drop(s) 之后调用;归一后的最终矩形才是应持久化的位置。
+            settle_all_fences();
+            let s = state().lock().unwrap();
+            let cfg = s.fences.clone();
+            let _ = model::save_config(&cfg);
+        }
         if changed_final.is_empty() {
             refresh_fence(fence_id);
         } else {
