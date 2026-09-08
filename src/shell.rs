@@ -980,7 +980,6 @@ pub const DL_CMD_REFRESH: u32 = 0x6006;
 pub const DL_CMD_QUIT: u32 = 0x6007;
 /// 渲染模式切换(透明 ↔ 精确)
 pub const DL_CMD_RENDER_MODE: u32 = 0x6009;
-pub const DL_CMD_HELP: u32 = 0x600A;
 
 /// 系统"图标标题"原始 LOGFONT(与 Explorer 桌面文字同源;精确模式 GDI 绘制用)
 pub fn icon_title_logfont() -> Option<LOGFONTW> {
@@ -1518,7 +1517,6 @@ pub fn show_desktop_context_menu(
             return 0;
         };
         append_menu(sub, DL_CMD_ADD_FENCE, "新建栅栏");
-        append_menu(sub, DL_CMD_HELP, "使用说明");
         append_menu(sub, DL_CMD_SHOW_ALL, "显示全部栅栏");
         append_menu(sub, DL_CMD_HIDE_ALL, "隐藏全部栅栏");
         append_menu(sub, DL_CMD_UNDO, "撤销上次布局调整");

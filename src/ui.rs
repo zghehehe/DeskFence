@@ -190,10 +190,6 @@ pub(crate) fn z_guard_setting() -> bool {
     *g = Some(v);
     v
 }
-pub(crate) fn set_z_guard_stored(v: bool) {
-    *Z_GUARD.lock().unwrap() = Some(v);
-    update_stored_settings(|s| s.z_guard = v);
-}
 
 /// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
 /// 开=全部栅栏常显边框/标题/角手柄,便于观察布局边界;关=无边框常显基线。

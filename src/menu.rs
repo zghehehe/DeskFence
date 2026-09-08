@@ -2,7 +2,6 @@
 //! 托盘菜单/栅栏倒三角菜单/桌面右键子菜单的构建、弹出(track)与命令分发。
 use std::sync::atomic::Ordering;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
@@ -38,13 +37,11 @@ const MENU_SORT_MANUAL: u32 = 0x5113;
 const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
 const MENU_RENDER_PRECISE: u32 = 0x5117;
 const MENU_AUTO_CATEGORY: u32 = 0x5118;
-const MENU_HELP: u32 = 0x5119;
 const MENU_TOGGLE_CHROME: u32 = 0x511A;
 // 管理分类子菜单(2026-09-08 分类面板):表项=base+表内下标,上限 16 项
 const MENU_CATS_BASE: u32 = 0x5120;
 const MENU_CATS_ADD: u32 = 0x5130;
 const MENU_CHECK_UPDATE: u32 = 0x5131;
-const MENU_Z_GUARD: u32 = 0x5132;
 
 pub(crate) fn show_tray_menu(x: i32, y: i32) {
     let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
@@ -121,39 +118,37 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         }
     }
     shell::append_submenu(menu, "渲染模式", render);
+    // 自动分类子菜单(2026-09-08 用户定案,与管理分类合而为一):悬停展开
+    // 即见开关+当前全部分类;点击分类名进面板就地改名,底部"新增分类…"直接
+    // 建空分类;删除用面板行内 ×。菜单做不了行内编辑/×按钮,承载面板见
+    // cats_panel.rs。
+    let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
     if auto_category() {
-        shell::append_menu_checked(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
-        // 管理分类子菜单(2026-09-08):展开即见当前分类(点击进面板就地改名),
-        // 底部"新增分类…"直接建空分类;删除用面板行内 ×。菜单做不了行内
-        // 编辑/×按钮,承载面板见 cats_panel.rs。
-        let table = model::category_table();
-        let cats = unsafe { CreatePopupMenu().unwrap_or_default() };
-        let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
-        for (i, c) in table.iter().take(shown).enumerate() {
-            let label = if c.name == model::FALLBACK_CATEGORY {
-                format!("{}(兜底)", c.name)
-            } else {
-                c.name.clone()
-            };
-            shell::append_menu(cats, MENU_CATS_BASE + i as u32, &label);
-        }
-        shell::append_separator(cats);
-        shell::append_menu(cats, MENU_CATS_ADD, "新增分类…");
-        shell::append_submenu(menu, "管理分类", cats);
+        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "启用自动分类");
     } else {
-        shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
+        shell::append_menu(auto, MENU_AUTO_CATEGORY, "启用自动分类");
     }
+    shell::append_separator(auto);
+    let table = model::category_table();
+    let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
+    for (i, c) in table.iter().take(shown).enumerate() {
+        let label = if c.name == model::FALLBACK_CATEGORY {
+            format!("{}(兜底)", c.name)
+        } else {
+            c.name.clone()
+        };
+        shell::append_menu(auto, MENU_CATS_BASE + i as u32, &label);
+    }
+    shell::append_separator(auto);
+    shell::append_menu(auto, MENU_CATS_ADD, "新增分类…");
+    shell::append_submenu(menu, "自动分类", auto);
     if chrome_always_on() {
         shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
     } else {
         shell::append_menu(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
     }
-    if z_guard_setting() {
-        shell::append_menu_checked(menu, MENU_Z_GUARD, "z 序守卫(浮窗/闪屏异常时可关)");
-    } else {
-        shell::append_menu(menu, MENU_Z_GUARD, "z 序守卫(浮窗/闪屏异常时可关)");
-    }
-    shell::append_menu(menu, MENU_HELP, "使用说明");
+    // z 序守卫不设菜单入口(2026-09-08 用户要求):降级开关走 settings.json
+    // 的 z_guard 字段,默认开=实测验证过的正确状态。
     // 检查更新:浏览器打开 GitHub Releases 页(应用进程零联网)
     shell::append_menu(menu, MENU_CHECK_UPDATE, "检查更新(打开发布页)");
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
@@ -213,12 +208,6 @@ fn dispatch_tray_command(id: u32) {
             refresh_all_fences();
             log(&format!("show_chrome={on}"));
         }
-        MENU_Z_GUARD => {
-            let v = !z_guard_setting();
-            set_z_guard_stored(v);
-            log(&format!("z_guard={v}"));
-        }
-        MENU_HELP => show_help(),
         MENU_CHECK_UPDATE => check_update(),
         MENU_AUTOSTART => toggle_autostart(),
         MENU_QUIT => quit_app(),
@@ -232,48 +221,6 @@ pub(crate) fn set_render_mode(mode: &str) {
     invalidate_wallpaper();
     refresh_all_fences();
     log(&format!("render_mode={mode}"));
-}
-
-/// 软件内使用说明(托盘/桌面右键菜单"使用说明")
-fn show_help() {
-    let text = "DeskFence 桌面整理 · 使用说明
-
-【默认自动分类(8类)】
-桌面文件按类型自动进入对应栅栏:
-· 软件:exe/msi/lnk/bat 等程序与快捷方式
-· 文件夹:所有目录
-· 文档:txt/word/excel/ppt/pdf 等
-· 图片:jpg/png/gif/svg 等
-· 媒体:mp3/wav/mp4/mkv 等音视频
-· 代码:py/js/ts/rs/go/c/cpp/html/json/md 等
-· 压缩包:zip/rar/7z/tar/gz 等
-· 其他:未识别的类型
-某类栅栏不存在时,首次出现该类文件会自动新建。
-
-【自定义分类模式】
-托盘菜单取消勾选\"自动分类(默认8类)\"即切换为自定义模式:
-· 不再按文件类型归类,文件只属于你拖它进去的栅栏
-· 用\"新建栅栏\"自由创建并命名(右键标题可重命名/删除)
-· 把图标从一个栅栏拖到另一个栅栏上松手即完成分配
-· 未分配的文件集中在\"未分类\"栅栏,不会丢失
-· 重新勾选\"自动分类\"即恢复 8 类默认模式
-
-【其他】
-拖动栅栏经过两个栅栏之间出现插入线,松手即插入;靠近屏幕边/角自动吸附;
-拖到其他栅栏正上/下方自动保持固定间距;Esc 取消拖动;拖图标到\"回收站\"删除;
-右键栅栏标题可折叠/锁定/重命名/删除。
-托盘菜单勾选\"显示栅栏边框线\"可常显全部栅栏边框(默认隐藏,悬停浮现)。";
-    let t = shell::wide(text);
-    let cap = shell::wide("DeskFence 使用说明");
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            None,
-            PCWSTR::from_raw(t.as_ptr()),
-            PCWSTR::from_raw(cap.as_ptr()),
-            windows::Win32::UI::WindowsAndMessaging::MB_OK
-                | windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
-        );
-    }
 }
 
 /// 切换自动分类:开=固定8类自动归类;关=自定义分类(新建栅栏自由命名,
@@ -995,7 +942,6 @@ pub(crate) fn dispatch_desktop_command(id: u32) {
             };
             set_render_mode(next);
         }
-        shell::DL_CMD_HELP => show_help(),
         shell::DL_CMD_REFRESH => rescan(),
         shell::DL_CMD_QUIT => quit_app(),
         _ => {}
