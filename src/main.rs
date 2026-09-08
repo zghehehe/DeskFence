@@ -6,6 +6,7 @@ mod menu;
 mod model;
 mod ole;
 mod render;
+mod selfheal;
 mod shell;
 mod ui;
 
