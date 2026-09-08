@@ -284,6 +284,11 @@ const DEFAULT_IME_CLASS: [u16; 11] = [
     0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
 ]; // "Default IME"
 
+const CATS_PANEL_CLASS: [u16; 18] = [
+    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x43, 0x61, 0x74,
+    0x73, 0x50, 0x61, 0x6E, 0x65, 0x6C,
+]; // "DeskFenceCatsPanel"
+
 /// band 走查的"不可见"判据:隐藏/最小化/离屏/退化尺寸(≤2px,GDI+ 钩子与
 /// 锁屏残留 CoreWindow 常以 1x1@0,0 插队,实际遮不住)/cloaked(visible
 /// 位有效但 DWM 不合成)。
@@ -315,6 +320,10 @@ fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
         || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
         || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
         || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
+        // 分类管理面板(2026-09-08):自有辅助窗,可见时可压在栅栏区域上,
+        // 不容忍的话面板一开=全栅栏 walk-break→3 拍后 z-chain repair
+        // 整面重排=用户可见闪(run.log 17:36:48 实锤,与菜单宿主同款待遇)
+        || (n == 18 && cls_buf[..18] == CATS_PANEL_CLASS)
 }
 
 pub(crate) fn ensure_all_attached() {
@@ -1278,4 +1287,15 @@ pub(crate) fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray:
         return false;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    /// 手编 UTF-16 类名常量的守门:与真实注册名逐字一致(band_aux 容忍匹配
+    /// 靠它;编码错一位=容忍失效=面板一开就闪)
+    #[test]
+    fn cats_panel_class_encoding_matches_registered_name() {
+        let expect: Vec<u16> = "DeskFenceCatsPanel".encode_utf16().collect();
+        assert_eq!(super::CATS_PANEL_CLASS.to_vec(), expect);
+    }
 }
