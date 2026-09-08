@@ -447,9 +447,6 @@ struct UiState {
     /// 拖动中内容重渲染(壁纸种子重烘焙)节拍:上次全量 refresh_fence 时刻。
     /// 位置跟随已由"已有像素重呈现"逐帧完成,内容重烘焙降到 ~30fps。
     pub last_drag_render_ms: u64,
-    /// 拖动对齐参考线（overlay 绘制）：guide_x = 竖线坐标，guide_y = 横线坐标
-    pub guide_x: Option<f32>,
-    pub guide_y: Option<f32>,
     /// 内部图标拖拽残影:被拖图标(半透明)跟随鼠标的屏幕坐标绘制在 overlay 上
     pub drag_ghost: Option<(Vec<String>, f32, f32)>,
     /// 拖拽实时预览(松手生效,取消回滚)
@@ -563,8 +560,6 @@ fn state() -> &'static Mutex<UiState> {
             last_resize_ms: 0,
             last_move_ms: 0,
             last_drag_render_ms: 0,
-            guide_x: None,
-            guide_y: None,
             drag_ghost: None,
             ghost_preview: None,
             insert_line: None,
@@ -595,8 +590,6 @@ fn clear_all_interaction(s: &mut UiState) {
     s.drag = None;
     s.drag_ghost = None;
     s.ghost_preview = None;
-    s.guide_x = None;
-    s.guide_y = None;
     s.arrival_animations.clear();
 }
 
@@ -618,8 +611,6 @@ fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
         s.marquee = None;
         s.drag_ghost = None;
         s.ghost_preview = None;
-        s.guide_x = None;
-        s.guide_y = None;
     }
     // Selection is global because pinned items can appear in multiple fences.
     // A lifecycle change invalidates any visual ownership, so clear it wholesale.
@@ -640,11 +631,7 @@ fn finish_interaction_cleanup() {
             }
         }
     }
-    if s.guide_x.is_none()
-        && s.guide_y.is_none()
-        && s.drag_ghost.is_none()
-        && s.arrival_animations.is_empty()
-    {
+    if s.drag_ghost.is_none() && s.arrival_animations.is_empty() {
         if let Some(hwnd) = s.guide_hwnd {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -2971,7 +2958,7 @@ fn tick_arrival_animations() {
                     let _ = KillTimer(tray, TIMER_ANIMATION);
                 }
             }
-            if s.drag_ghost.is_none() && s.guide_x.is_none() && s.guide_y.is_none() {
+            if s.drag_ghost.is_none() {
                 if let Some(hwnd) = s.guide_hwnd {
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_HIDE);
@@ -5239,7 +5226,7 @@ fn dispatch_file_key(fence_id: u32, packed: usize) {
             rollback_ghost_preview(&mut s);
             drop(s);
             refresh_fence(fence_id);
-            update_guides(None, None);
+            update_overlay();
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -5265,7 +5252,7 @@ fn dispatch_file_key(fence_id: u32, packed: usize) {
                     let _ = ReleaseCapture();
                 }
                 refresh_all_fences();
-                update_guides(None, None);
+                update_overlay();
                 log("fence drag cancelled by Esc: restored snapshot");
             }
         }
@@ -8097,7 +8084,7 @@ fn ensure_guide_window(s: &mut UiState) {
     }
 }
 
-/// 绘制并显示对齐参考线 overlay（s.guide_x / s.guide_y 为当前参考线）。
+/// 绘制并显示 overlay：内部图标拖拽残影、新文件飞入动画、插入指示线。
 fn refresh_guide(s: &mut UiState) {
     let Some(hwnd) = s.guide_hwnd else { return };
     let factory = match &s.renderer {
@@ -8225,8 +8212,7 @@ fn refresh_guide(s: &mut UiState) {
     }
     let insert_line_local = s.insert_line.map(|(x, y, w, h)| (x - vx, y - vy, w, h));
     if let Some(surf) = s.guide_surface.as_ref() {
-        // 参考线是屏幕坐标,换算到虚拟桌面原点
-        // 残影(内部图标拖拽):同样换算到 overlay 本地坐标
+        // 残影/动画/插入线都是屏幕坐标,换算到 overlay 本地坐标(虚拟桌面原点)
         let label_scale = frames
             .first()
             .and_then(|_| animation_meta.first())
@@ -8236,8 +8222,6 @@ fn refresh_guide(s: &mut UiState) {
             .unwrap_or_else(|| model::DpiMetrics::system().scale);
         let jobs = render::draw_guides(
             &surf.target,
-            vw,
-            vh,
             frames
                 .first()
                 .and_then(|_| animation_meta.first())
@@ -8251,8 +8235,6 @@ fn refresh_guide(s: &mut UiState) {
                 .unwrap_or_else(model::icon_size),
             label_scale,
             guide_metrics.cell_w - 2.0 * guide_metrics.scale,
-            s.guide_x.map(|g| g - vx),
-            s.guide_y.map(|g| g - vy),
             insert_line_local,
             ghost
                 .as_ref()
@@ -8269,15 +8251,12 @@ fn refresh_guide(s: &mut UiState) {
     }
 }
 
-/// 更新参考线状态并刷新 overlay；拖动结束后传入 (None, None) 隐藏。
-/// 内部图标拖拽残影存在时 overlay 保持显示。
-fn update_guides(gx: Option<f32>, gy: Option<f32>) {
+/// 刷新 overlay(图标残影/飞入动画/插入线)；三者皆无时隐藏 overlay 窗口。
+/// 拖拽各路径的每帧与收尾都必须调用一次,否则 overlay 残留旧帧浮在
+/// 其他应用上方(2026-09-08 误删此泵导致,勿再删)。
+fn update_overlay() {
     let mut s = state().lock().unwrap();
-    s.guide_x = gx;
-    s.guide_y = gy;
-    if gx.is_none()
-        && gy.is_none()
-        && s.drag_ghost.is_none()
+    if s.drag_ghost.is_none()
         && s.arrival_animations.is_empty()
         && s.insert_line.is_none()
     {
@@ -8305,9 +8284,6 @@ fn update_ghost(x: f32, y: f32) {
     ensure_guide_window(&mut s);
     refresh_guide(&mut s);
 }
-
-/// 让所有栅栏相互保持间距且全部落在屏幕内（新建/加载/恢复布局后调用）。
-/// 统一为链式推挤 + 夹回屏幕(多显示器感知),保留栅栏的相对位置/顺序(自由组合模型)。
 
 /// 高度自适应内容：未手动缩放过的栅栏，高度收敛到内容所需行数
 /// （空栅栏至少 2 行，保证拖放目标可见），上限为所在工作区可容纳的最大
@@ -8622,7 +8598,8 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     if render_due {
                         refresh_fence(fence_id);
                     }
-                    update_guides(None, None);
+                    // 每帧刷新 overlay(插入线显示/收起都走这里)
+                    update_overlay();
                     return;
                 }
                 DragMode::Resize { edges } => {
@@ -8657,12 +8634,12 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                     if unchanged {
                         drop(s);
-                        update_guides(None, None);
+                        update_overlay();
                         return;
                     }
                     drop(s);
                     refresh_fence(fence_id);
-                    update_guides(None, None);
+                    update_overlay();
                     return;
                 }
                 DragMode::ScrollThumb { grab } => {
@@ -9310,7 +9287,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 } else {
                     refresh_fence(fence_id);
                 }
-                update_guides(None, None);
+                update_overlay();
                 return;
             }
             s.trash_target = false;
@@ -9377,7 +9354,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 } else {
                     refresh_fence(fence_id);
                 }
-                update_guides(None, None);
+                update_overlay();
                 return;
             } else {
                 // 松手在其他栅栏上 = 把拖动的文件分配给那个栅栏
@@ -9436,7 +9413,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             drop(s);
             rebuild_pins();
             refresh_all_fences();
-            update_guides(None, None);
+            update_overlay();
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -9700,8 +9677,8 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 refresh_fence(id);
             }
         }
-        // 松手后清除对齐参考线和框选矩形
-        update_guides(None, None);
+        // 松手后刷新 overlay(插入线/残影已清,无内容即隐藏)并清除框选矩形
+        update_overlay();
         unsafe {
             let _ = ReleaseCapture();
         }

@@ -552,12 +552,17 @@
 
 - 渲染：src/render.rs（ink 常驻：透明底+1/255 隐形命中层+seeded GDI 文字；
   透明/精确两模式共用同一文字管线，区别仅种子来源与启动守卫）
-- 拖拽管线（2026-08-24 改为**插入式**）：拖动中被拖者跟手、其余完全不动，
-  指示线（UiState.insert_line，overlay 绘制）提示插入点，松手才拼接重排；
-  栅栏 = ui.rs `fence_insertion_plan` + model.rs `chain_positions`（整链紧凑、
-  放不下换行、fit_to_monitors 夹回不许出屏）；图标 = `update_ghost_preview`
-  只算目标槽与指示线，松手 `reorder_paths_as_block` 拼接。自由移动档无插入线。
-  （旧的实时挤压预览 preview_move_layout 已删，别按旧文档找）
+- 拖拽管线（2026-08-24 改为**插入式**，2026-09-08 三档语义分明）：
+  自动档 = 插入线模式：拖动中被拖者跟手、其余完全不动，指示线
+  （UiState.insert_line，overlay 绘制）提示插入点，松手按
+  ui.rs `fence_insertion_plan` + model.rs `row_insert_layout` 落位
+  （行内槽位模型，行贴顶由 settle 归一保证）；网格档 = 棋盘模式：
+  只对齐最近图标格线，不吸附栅栏、无插入线（2026-09-08）；
+  自由档 = 随手放 + 邻居磁吸（model.rs snap_gap_to_neighbors，x/y 双轴）。
+  图标 = `update_ghost_preview` 只算目标槽与指示线，松手
+  `reorder_paths_as_block` 拼接。（旧的实时挤压预览 preview_move_layout、
+  chain_positions、对齐参考线死代码 guide_x/guide_y/update_guides/
+  snap_candidates 均已删，别按旧文档找）
 - 应用图标：矢量源 `assets/deskfence-icon.svg`，`python tools/rebuild_icon.py`
   重建 `assets/deskfence.ico`（需 `pip install resvg-py`），随后 cargo build
   --release 重新嵌入。

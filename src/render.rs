@@ -876,13 +876,9 @@ pub struct ArrivalFrame {
 
 pub fn draw_guides(
     rt: &ID2D1DCRenderTarget,
-    w: f32,
-    h: f32,
     icon_px: f32,
     scale: f32,
     label_w: f32,
-    gx: Option<f32>,
-    gy: Option<f32>,
     insert_line: Option<(f32, f32, f32, f32)>,
     ghost: Option<(&[u8], &str, f32, f32)>,
     arrivals: &[ArrivalFrame],
@@ -891,16 +887,6 @@ pub fn draw_guides(
     unsafe {
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
-        if let Some(x) = gx {
-            if let Some(b) = brush(rt, &color(0.30, 0.62, 1.0, 0.95)) {
-                rt.FillRectangle(&rect(x, 0.0, x + 1.0, h), as_brush(&b));
-            }
-        }
-        if let Some(y) = gy {
-            if let Some(b) = brush(rt, &color(0.30, 0.62, 1.0, 0.95)) {
-                rt.FillRectangle(&rect(0.0, y, w, y + 1.0), as_brush(&b));
-            }
-        }
         // 插入指示线:线体垂直于排列方向(竖线=水平邻居之间,横线=上下邻居之间),
         // 两端各一段垂直小端点,宽度 2.5px
         if let Some((lx, ly, lw, lh)) = insert_line {
