@@ -179,9 +179,20 @@ fn set_auto_category_stored(v: bool) {
 }
 
 /// z 守卫设置(缓存读取,模式同上):菜单落盘点需要带上当前值。
+/// 2026-09-08 起暴露为托盘开关(异常降级用),缓存需可写。
+static Z_GUARD: Mutex<Option<bool>> = Mutex::new(None);
 fn z_guard_setting() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| model::load_settings().z_guard)
+    let mut g = Z_GUARD.lock().unwrap();
+    if let Some(v) = *g {
+        return v;
+    }
+    let v = model::load_settings().z_guard;
+    *g = Some(v);
+    v
+}
+fn set_z_guard_stored(v: bool) {
+    *Z_GUARD.lock().unwrap() = Some(v);
+    update_stored_settings(|s| s.z_guard = v);
 }
 
 /// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
@@ -274,6 +285,8 @@ const MENU_TOGGLE_CHROME: u32 = 0x511A;
 // 管理分类子菜单(2026-09-08 分类面板):表项=base+表内下标,上限 16 项
 const MENU_CATS_BASE: u32 = 0x5120;
 const MENU_CATS_ADD: u32 = 0x5130;
+const MENU_CHECK_UPDATE: u32 = 0x5131;
+const MENU_Z_GUARD: u32 = 0x5132;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -4813,7 +4826,14 @@ fn show_tray_menu(x: i32, y: i32) {
     } else {
         shell::append_menu(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
     }
+    if z_guard_setting() {
+        shell::append_menu_checked(menu, MENU_Z_GUARD, "z 序守卫(浮窗/闪屏异常时可关)");
+    } else {
+        shell::append_menu(menu, MENU_Z_GUARD, "z 序守卫(浮窗/闪屏异常时可关)");
+    }
     shell::append_menu(menu, MENU_HELP, "使用说明");
+    // 检查更新:浏览器打开 GitHub Releases 页(应用进程零联网)
+    shell::append_menu(menu, MENU_CHECK_UPDATE, "检查更新(打开发布页)");
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
     if shell::get_autostart() {
@@ -4871,7 +4891,13 @@ fn dispatch_tray_command(id: u32) {
             refresh_all_fences();
             log(&format!("show_chrome={on}"));
         }
+        MENU_Z_GUARD => {
+            let v = !z_guard_setting();
+            set_z_guard_stored(v);
+            log(&format!("z_guard={v}"));
+        }
         MENU_HELP => show_help(),
+        MENU_CHECK_UPDATE => check_update(),
         MENU_AUTOSTART => toggle_autostart(),
         MENU_QUIT => quit_app(),
         _ => log(&format!("unknown tray command: {}", id)),
@@ -5117,6 +5143,13 @@ pub(crate) fn apply_category_add(base: &str) -> Option<String> {
     refresh_all_fences();
     log(&format!("category added '{name}'"));
     Some(name)
+}
+
+/// 检查更新:系统浏览器打开 GitHub Releases 页,由用户比对最新版本。
+/// 应用进程自身不发起网络请求——README"程序不联网"的承诺保持成立。
+fn check_update() {
+    shell::open_url("https://github.com/zghehehe/DeskFence/releases/latest");
+    log("check update: releases page opened in browser");
 }
 
 /// 切换开机自启(HKCU Run)

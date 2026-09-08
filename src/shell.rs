@@ -808,6 +808,23 @@ pub fn open_in_explorer(path: &str) {
     }
 }
 
+/// 用系统默认浏览器打开 URL("检查更新"用):应用进程自身不发起任何
+/// 网络请求,零联网承诺不受影响
+pub fn open_url(url: &str) {
+    let verb = wide("open");
+    let target = wide(url);
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND(0),
+            PCWSTR::from_raw(verb.as_ptr()),
+            PCWSTR::from_raw(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// 追加一个菜单项
 pub fn append_menu(menu: HMENU, id: u32, text: &str) {
     let w = wide(text);
