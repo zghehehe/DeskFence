@@ -1893,9 +1893,10 @@ pub(crate) fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
                 have.insert(cat.to_string());
             }
         }
-    } else if !have.contains(model::UNCATEGORIZED) {
-        // 自定义分类模式:未分配文件都进"未分类",保证没有任何文件隐身
-        added.push(model::UNCATEGORIZED.to_string());
+    } else if !have.contains(model::FALLBACK_CATEGORY) {
+            // 自定义分类模式:未归位文件统一进兜底"其他",保证没有任何文件隐身
+            // (2026-09-09 起不再自动新建"未分类"栅栏——切模式不冒出多余栅栏)
+            added.push(model::FALLBACK_CATEGORY.to_string());
     }
     let mut new_ids = Vec::new();
     for cat in &added {

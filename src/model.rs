@@ -1866,12 +1866,25 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
     // 自定义模式下切换不打乱现状——已建类别栅栏继续按类显示,
     // 只是新建类别栅栏停止、无类可归的进"未分类"。
     let _ = auto_category();
-    if fence.category == UNCATEGORIZED {
-        if !auto_category() {
-            for f in all.iter() {
-                if !pinned_elsewhere(&f.path) && !has_category_fence(&f.category) {
-                    out.push(f.clone());
-                }
+    // 自定义模式的孤儿(未被拖入任何栅栏且其类别无对应栅栏)归属:
+    // 有旧"未分类"栅栏则进它(兼容旧配置),没有才进兜底"其他"——
+    // 2026-09-09 起切自定义模式不再自动新建"未分类"栅栏(用户要求:
+    // 不冒出多余栅栏)。兜底栅栏同时显示自己的常规成员,按路径去重。
+    let orphan_home = if has_category_fence(UNCATEGORIZED) {
+        UNCATEGORIZED
+    } else {
+        FALLBACK_CATEGORY
+    };
+    if !auto_category() && fence.category == orphan_home {
+        let fb_members = fence.category == FALLBACK_CATEGORY;
+        for f in all.iter() {
+            if pinned_elsewhere(&f.path) {
+                continue;
+            }
+            let is_orphan = !has_category_fence(&f.category);
+            let is_member = fb_members && f.category == fence.category;
+            if (is_orphan || is_member) && !out.iter().any(|x| x.path == f.path) {
+                out.push(f.clone());
             }
         }
     } else {

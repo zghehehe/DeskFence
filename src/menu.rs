@@ -125,17 +125,20 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     // 建空分类;删除用面板行内 ×(承载面板见 cats_panel.rs)。父项对钩
     // 显示当前是否自动模式。
     let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
-    if auto_category() {
-        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
-    } else {
-        shell::append_menu(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
-    }
+    // 自定义(拖入归类)在上、自动分类(按类型归类)在其下(2026-09-09 用户
+    // 定案):分隔线之后紧贴的类别清单一眼可知归属自动分类;类别行用全角
+    // 空格缩进,与两个模式项拉开层次。
     if auto_category() {
         shell::append_menu(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
     } else {
         shell::append_menu_checked(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
     }
     shell::append_separator(auto);
+    if auto_category() {
+        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+    } else {
+        shell::append_menu(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+    }
     let table = model::category_table();
     let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
     for (i, c) in table.iter().take(shown).enumerate() {
@@ -144,10 +147,10 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         } else {
             c.name.clone()
         };
-        shell::append_menu(auto, MENU_CATS_BASE + i as u32, &label);
+        shell::append_menu(auto, MENU_CATS_BASE + i as u32, &format!("　{label}"));
     }
     shell::append_separator(auto);
-    shell::append_menu(auto, MENU_CATS_ADD, "新增分类…");
+    shell::append_menu(auto, MENU_CATS_ADD, "　新增分类…");
     if auto_category() {
         shell::append_submenu_checked(menu, "自动分类", auto);
     } else {
@@ -244,39 +247,8 @@ fn set_category_mode(v: bool) {
     }
     set_auto_category_stored(v);
     log(&format!("auto_category={v}"));
-    if !v {
-        // 自定义模式必须有"未分类"兜底,保证没有文件隐身
-        let need = {
-            let s = state().lock().unwrap();
-            !s.fences.iter().any(|f| f.category == model::UNCATEGORIZED)
-        };
-        if need {
-            let mut s = state().lock().unwrap();
-            let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-            let (dw, dh) = default_fence_size();
-            s.fences.push(Fence {
-                id: max_id,
-                title: model::UNCATEGORIZED.to_string(),
-                category: model::UNCATEGORIZED.to_string(),
-                pinned: Vec::new(),
-                item_order: Vec::new(),
-                rect: Rect {
-                    x: 60.0 + max_id as f32 * 40.0,
-                    y: 60.0,
-                    w: dw,
-                    h: dh,
-                },
-                collapsed: false,
-                scroll_rows: 0,
-                locked: false,
-                hidden: false,
-                manual_size: false,
-                sort_mode: model::default_sort_mode(),
-            });
-            let cfg = s.fences.clone();
-            let _ = model::save_config(&cfg);
-        }
-    }
+    // 切模式不再自动建"未分类"栅栏(2026-09-09 用户要求):未归位文件由
+    // display_list 统一收进兜底"其他"(或旧未分类栅栏),不冒出多余栅栏
     rebuild_pins();
     settle_preserve_positions();
     refresh_all_fences();
