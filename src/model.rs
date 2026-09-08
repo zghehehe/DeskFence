@@ -1743,29 +1743,57 @@ pub fn align_local_chain(rects: &mut [Rect], anchor: usize, vx: f32, vy: f32, vw
     }
 }
 
-pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> (f32, bool) {
-    let mut best: Option<(f32, f32)> = None; // (吸附x, 距离)
+/// 邻居等距磁吸(自由/网格档拖拽用,2026-09-07 P2 扩 y 向)。
+/// x 向——同带(行)邻居左右邻接保持 GAP(原有);
+/// y 向(2026-09-07 新增)——同列邻居三候选:「顶边对齐」y=o.y(吸齐
+/// 行顶,与 P1 行贴顶同款目标)、「紧贴下方」y=o.y+o.h+GAP 与
+/// 「紧贴上方」y=o.y-GAP-r.h(行间邻接,与 P1 行间固定间隔同款)。
+/// 同带/同列判定=y/x 范围重叠留 GAP*0.5 容差;全部候选里只取距离
+/// 最近的一个应用,未命中轴保持原值,吸完的位置即 P1 规范位
+/// (落位后 settle 归一仍会兜底)。返回((x,y), 是否吸附)。
+pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> ((f32, f32), bool) {
+    let mut best: Option<(f32, f32, f32)> = None; // (吸附x, 吸附y, 距离)
     let same_row = |o: &Rect| o.y < r.y + r.h + GAP * 0.5 && r.y < o.y + o.h + GAP * 0.5;
+    let same_col = |o: &Rect| o.x < r.x + r.w + GAP * 0.5 && r.x < o.x + o.w + GAP * 0.5;
     for o in others {
-        if !same_row(o) {
-            continue;
+        if same_row(o) {
+            // 放在 o 右侧: x = o.x + o.w + GAP
+            let cand_r = o.x + o.w + GAP;
+            let d_r = (r.x - cand_r).abs();
+            if d_r < threshold && best.map_or(true, |(_, _, d)| d_r < d) {
+                best = Some((cand_r, r.y, d_r));
+            }
+            // 放在 o 左侧: x = o.x - GAP - r.w
+            let cand_l = o.x - GAP - r.w;
+            let d_l = (r.x - cand_l).abs();
+            if d_l < threshold && best.map_or(true, |(_, _, d)| d_l < d) {
+                best = Some((cand_l, r.y, d_l));
+            }
         }
-        // 放在 o 右侧: x = o.x + o.w + GAP
-        let cand_r = o.x + o.w + GAP;
-        let d_r = (r.x - cand_r).abs();
-        if d_r < threshold && best.map_or(true, |(_, d)| d_r < d) {
-            best = Some((cand_r, d_r));
-        }
-        // 放在 o 左侧: x = o.x - GAP - r.w
-        let cand_l = o.x - GAP - r.w;
-        let d_l = (r.x - cand_l).abs();
-        if d_l < threshold && best.map_or(true, |(_, d)| d_l < d) {
-            best = Some((cand_l, d_l));
+        if same_col(o) {
+            // 行顶对齐: y = o.y
+            let cand_t = o.y;
+            let d_t = (r.y - cand_t).abs();
+            if d_t < threshold && best.map_or(true, |(_, _, d)| d_t < d) {
+                best = Some((r.x, cand_t, d_t));
+            }
+            // 紧贴下方: y = o.y + o.h + GAP
+            let cand_d = o.y + o.h + GAP;
+            let d_d = (r.y - cand_d).abs();
+            if d_d < threshold && best.map_or(true, |(_, _, d)| d_d < d) {
+                best = Some((r.x, cand_d, d_d));
+            }
+            // 紧贴上方: y = o.y - GAP - r.h
+            let cand_u = o.y - GAP - r.h;
+            let d_u = (r.y - cand_u).abs();
+            if d_u < threshold && best.map_or(true, |(_, _, d)| d_u < d) {
+                best = Some((r.x, cand_u, d_u));
+            }
         }
     }
     match best {
-        Some((x, _)) => (x, true),
-        None => (r.x, false),
+        Some((x, y, _)) => ((x, y), true),
+        None => ((r.x, r.y), false),
     }
 }
 
@@ -2164,11 +2192,73 @@ mod tests {
             h: 704.0,
         }];
         // 靠近"放在 other 左侧"的吸附位(700-12-244=444)时应吸附
-        let (x, snapped) = snap_gap_to_neighbors(&Rect { x: 448.0, ..r }, &others, 18.0);
+        let ((x, y), snapped) = snap_gap_to_neighbors(&Rect { x: 448.0, ..r }, &others, 18.0);
         assert!(snapped && (x - 444.0).abs() < 0.01);
+        assert_eq!(y, 60.0); // 未命中轴保持原值
         // 远离时不吸附
-        let (x2, snapped2) = snap_gap_to_neighbors(&Rect { x: 100.0, ..r }, &others, 18.0);
+        let ((x2, _), snapped2) = snap_gap_to_neighbors(&Rect { x: 100.0, ..r }, &others, 18.0);
         assert!(!snapped2 && x2 == 100.0);
+    }
+
+    #[test]
+    fn gap_snap_aligns_row_top_when_close() {
+        // 同列(与下方一行 x 范围重叠):贴近其顶边(差 12)→ 吸齐行顶
+        let r = Rect {
+            x: 0.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 20.0,
+            y: 112.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((x, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(snapped);
+        assert_eq!(y, 112.0); // 行顶对齐(P1 行贴顶同款)
+        assert_eq!(x, 0.0); // x 轴未命中保持原值
+    }
+
+    #[test]
+    fn gap_snap_stacks_below_at_gap() {
+        // 上方邻居底 200:贴近下方邻接位(200+GAP=212)→ 吸到固定行距
+        let r = Rect {
+            x: 0.0,
+            y: 210.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 0.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((_, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(snapped);
+        assert_eq!(y, 212.0); // P1 行间固定间隔同款
+    }
+
+    #[test]
+    fn gap_snap_no_y_when_column_disjoint() {
+        // x 范围不相交(不同列):不做 y 向吸附,位置原样
+        let r = Rect {
+            x: 500.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 0.0,
+            y: 112.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((x, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(!snapped);
+        assert_eq!((x, y), (500.0, 100.0));
     }
 
     fn fence(id: u32) -> Fence {

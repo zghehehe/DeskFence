@@ -208,6 +208,7 @@ fn z_guard_setting() -> bool {
 /// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
 /// 开=全部栅栏常显边框/标题/角手柄,便于观察布局边界;关=无边框常显基线。
 static SHOW_CHROME: AtomicBool = AtomicBool::new(false);
+
 pub fn chrome_always_on() -> bool {
     SHOW_CHROME.load(Ordering::Relaxed)
 }
@@ -8054,11 +8055,13 @@ fn snap_drag(s: &UiState, fence_id: u32, nr: Rect) -> (Rect, Option<f32>, Option
         x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
         y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
     }
-    // 靠近邻居 -> 磁吸到恰好 GAP 间距(优先于网格格点)
+    // 靠近邻居 -> 磁吸到恰好 GAP 间距(优先于网格格点;x/y 双轴,2026-09-07 P2)
     let probe = Rect { x, y, ..nr };
-    let (sx, snapped) = model::snap_gap_to_neighbors(&probe, &others, model::SNAP_THRESHOLD * 1.5);
+    let ((sx, sy), snapped) =
+        model::snap_gap_to_neighbors(&probe, &others, model::SNAP_THRESHOLD * 1.5);
     if snapped {
         x = sx;
+        y = sy;
     }
     (Rect { x, y, ..nr }, None, None)
 }
@@ -8514,13 +8517,14 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
                         }
                         let probe = Rect { x, y, ..nr };
-                        let (sx, snapped) = model::snap_gap_to_neighbors(
+                        let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
                             &probe,
                             &others,
                             model::SNAP_THRESHOLD * 1.5,
                         );
                         if snapped {
                             x = sx;
+                            y = sy;
                         }
                         nr = Rect { x, y, ..nr };
                     }
@@ -8548,7 +8552,13 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     if vy + vh - (nr.y + nr.h) < EDGE {
                         nr.y = vy + vh - nr.h;
                     }
-                    // 无插入线(上下方自由放置/自由档):邻居固定间隔吸附
+                    // 无插入线:只做 ≤16px 的轻磁吸贴齐,不做抗重叠推挤。
+                    // (2026-09-08 修"向左拖吃力":P1 归一后布局恰为 GAP 紧排,
+                    // 原位动 1px 就与邻居构成 GAP 冲突,预览被 avoid_overlap
+                    // 按在原位不跟手;右向因槽位模型把自身按下位计入统计,
+                    // 线立即出现走原始跟手,才显得"向右自然"。被拖者已提升
+                    // 到兄弟之上,预览覆盖邻居无碍;解重叠由松手落位+settle
+                    // 负责。)
                     if insert.is_none() {
                         let others: Vec<Rect> = drag
                             .start_layout
@@ -8557,8 +8567,6 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             .map(|f| f.rect)
                             .collect();
                         snap_rect_to_neighbors(&mut nr, &others);
-                        // 抗重叠:任何位置都不允许覆盖其他栅栏(最小位移推开,保持 GAP)
-                        nr = model::avoid_overlap(&nr, &others, vx, vy, vw, vh);
                     }
                     let line = insert.as_ref().map(|p| p.line);
                     if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
@@ -9584,13 +9592,14 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                                 y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
                             }
                             let probe = Rect { x, y, ..nr };
-                            let (sx, snapped) = model::snap_gap_to_neighbors(
+                            let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
                                 &probe,
                                 &others,
                                 model::SNAP_THRESHOLD * 1.5,
                             );
                             if snapped {
                                 x = sx;
+                                y = sy;
                             }
                             nr = Rect { x, y, ..nr };
                         }
