@@ -2103,7 +2103,13 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
             && cy >= wp.origin_y as f32
             && cy < (wp.origin_y + wp.h as i32) as f32
     });
-    let surf_ref = s.surfaces.get(&fence_id).unwrap();
+    let Some(surf_ref) = s.surfaces.get(&fence_id) else {
+        // 防御(2026-09-08):上方 needs_new 分支正常已保证表面存在;万一未来
+        // 路径破坏该不变式,跳过本帧留痕即可,不 panic 整个进程(图标还在
+        // 隐藏态,进程一死用户看到的就是"程序凭空消失")
+        log(&format!("draw skip: surface missing fence {fence_id}"));
+        return;
+    };
     let t_draw0 = resize_now_ms();
     let jobs = render::draw_fence(
         &surf_ref.target,
@@ -8699,15 +8705,20 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     if !drag.dragged_out && (dx * dx + dy * dy) > 64.0 {
                         // 判断拖拽目标:仍在当前栅栏内 → 内部残影拖拽(松手重排);
                         // 拖出栅栏 → OLE 拖拽(可与资源管理器互拖)
-                        let inside = {
-                            let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
-                            x >= 0.0 && y >= 0.0 && x <= fence.rect.w && y <= fence.rect.h
-                        };
-                        let paths: Vec<String> = {
-                            let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
+                        // 防御(2026-09-08):栅栏若在按住期间被删除/重建(分类
+                        // 编辑、rescan 等路径),放弃本次拖拽而不是 panic 全进程
+                        let (inside, paths) = {
+                            let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
+                                log("icon drag aborted: fence vanished mid-press");
+                                s.drag = None;
+                                drop(s);
+                                return;
+                            };
+                            let inside =
+                                x >= 0.0 && y >= 0.0 && x <= fence.rect.w && y <= fence.rect.h;
                             let items = model::display_list(fence, &s.files);
                             let pressed = items.get(idx).map(|it| it.path.clone());
-                            if pressed
+                            let paths: Vec<String> = if pressed
                                 .as_ref()
                                 .is_some_and(|p| s.selected_paths.contains(p))
                             {
@@ -8718,7 +8729,8 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                                     .collect()
                             } else {
                                 pressed.into_iter().collect()
-                            }
+                            };
+                            (inside, paths)
                         };
                         if let Some(d) = s.drag.as_mut() {
                             d.dragged_out = true;
@@ -8729,7 +8741,13 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             let hx = sx - model::icon_size() / 2.0;
                             let hy = sy - model::icon_size() / 2.0;
                             let (original, original_sort_mode) = {
-                                let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
+                                let Some(fence) = s.fences.iter().find(|f| f.id == fence_id)
+                                else {
+                                    log("icon drag aborted: fence vanished mid-press");
+                                    s.drag = None;
+                                    drop(s);
+                                    return;
+                                };
                                 (
                                     model::display_list(fence, &s.files)
                                         .into_iter()
