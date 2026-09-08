@@ -2373,7 +2373,10 @@ fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
         .collect();
     let mut added = Vec::new();
     if auto_category() {
-        for cat in model::CATEGORIES {
+        // 动态分类表(2026-09-08):按可编辑表补建;表里新增的空分类因无
+        // 文件不会在此建栏(由面板"新增"显式建),已删分类不再迭代=不复活
+        for cat_def in model::category_table() {
+            let cat: &str = &cat_def.name;
             if have.contains(cat) {
                 continue;
             }

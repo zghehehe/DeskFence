@@ -842,18 +842,10 @@ pub struct FileItem {
 }
 
 // ---------- 分类 ----------
-/// 栅栏分类顺序（默认布局从左到右）：软件 → 文件夹 → 文档 → 图片 → 媒体 → 代码 → 压缩包 → 其他。
-/// 回收站虚拟图标固定在"软件"栅栏第一位（见 RECYCLE_BIN_PATH）。
-pub const CATEGORIES: [&str; 8] = [
-    "软件",
-    "文件夹",
-    "文档",
-    "图片",
-    "媒体",
-    "代码",
-    "压缩包",
-    "其他",
-];
+/// 栅栏分类顺序（默认布局从左到右）见 default_categories():
+/// 软件 → 文件夹 → 文档 → 图片 → 媒体 → 代码 → 压缩包 → 其他(兜底,不可删)。
+/// 回收站虚拟图标固定在第一类栅栏第一位（见 RECYCLE_BIN_PATH）。
+/// (2026-09-08 起顺序与映射由可编辑分类表承载,本常量已删)
 
 pub const CATEGORY_COLORS: [[f32; 3]; 8] = [
     [0.51, 0.46, 0.86], // 软件 紫
@@ -866,6 +858,42 @@ pub const CATEGORY_COLORS: [[f32; 3]; 8] = [
     [0.55, 0.56, 0.60], // 其他 灰
 ];
 
+/// 兜底分类:分类表里名为"其他"的条目不可删除、不可改名(面板强制)。
+/// 删除分类/扩展名未匹配/目录类缺失的文件全部归它——不变式:任何时刻
+/// 所有文件都在某个栅栏可见,不隐身(2026-09-08 用户定案)。
+pub const FALLBACK_CATEGORY: &str = "其他";
+
+/// 可编辑分类表条目(2026-09-08 起存 settings.json,面板可增删改名):
+/// name=分类名(与栅栏 category/title 同名关联);exts=内部扩展名映射
+/// (小写无点,暂不提供编辑入口,表结构预留);dirs=是否收纳文件夹
+/// (默认表里只有"文件夹"类为 true,改名跟随、删除则目录落兜底)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryDef {
+    pub name: String,
+    #[serde(default)]
+    pub exts: Vec<String>,
+    #[serde(default)]
+    pub dirs: bool,
+}
+
+fn svec(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+/// 内置 8 类(与历史 categorize 硬编码逐字节一致,老配置无缝迁移)
+pub fn default_categories() -> Vec<CategoryDef> {
+    vec![
+        CategoryDef { name: "软件".into(), exts: svec(&["exe", "msi", "lnk", "bat", "cmd", "com"]), dirs: false },
+        CategoryDef { name: "文件夹".into(), exts: vec![], dirs: true },
+        CategoryDef { name: "文档".into(), exts: svec(&["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "rtf", "log"]), dirs: false },
+        CategoryDef { name: "图片".into(), exts: svec(&["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico"]), dirs: false },
+        CategoryDef { name: "媒体".into(), exts: svec(&["mp3", "wav", "flac", "aac", "ogg", "mp4", "avi", "mkv", "mov", "wmv", "flv"]), dirs: false },
+        CategoryDef { name: "代码".into(), exts: svec(&["js", "ts", "py", "rs", "go", "c", "cpp", "h", "hpp", "java", "cs", "rb", "php", "html", "css", "json", "xml", "yaml", "yml", "toml", "sh", "md"]), dirs: false },
+        CategoryDef { name: "压缩包".into(), exts: svec(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "part"]), dirs: false },
+        CategoryDef { name: FALLBACK_CATEGORY.into(), exts: vec![], dirs: false },
+    ]
+}
+
 /// 回收站虚拟条目的路径（Shell 命名空间 CLSID 解析名）。
 /// 该条目不对应磁盘文件，由 ui 层注入到扫描结果，固定显示在"软件"栅栏第一位。
 pub const RECYCLE_BIN_PATH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
@@ -874,14 +902,19 @@ pub fn is_recycle_bin(path: &str) -> bool {
     path == RECYCLE_BIN_PATH
 }
 
-/// 回收站虚拟条目（归类为"软件"，使无配置时也落在软件栅栏）
+/// 回收站虚拟条目（归入分类表第一类,使无配置时也落在第一个栅栏;
+/// 用户改名首类后回收站跟随,不因硬编码"软件"失配而隐身）
 pub fn recycle_bin_item() -> FileItem {
+    let cat = category_table()
+        .first()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "软件".into());
     FileItem {
         name: "回收站".into(),
         path: RECYCLE_BIN_PATH.into(),
         is_dir: true,
         ext: String::new(),
-        category: "软件".into(),
+        category: cat,
         mtime_ms: 0,
     }
 }
@@ -894,31 +927,52 @@ fn ext_of(name: &str) -> &str {
     }
 }
 
+/// 分类表运行时缓存:惰性从 settings.json 加载一次,面板修改后经
+/// set_category_table 同步(进程级 Mutex——categorize 在扫描线程也会被调)
+static CATEGORY_TABLE: std::sync::Mutex<Option<Vec<CategoryDef>>> =
+    std::sync::Mutex::new(None);
+
+/// 当前生效的分类表(惰性加载;未加载前与 load_settings().categories 一致)
+pub fn category_table() -> Vec<CategoryDef> {
+    let mut g = CATEGORY_TABLE.lock().unwrap();
+    if g.is_none() {
+        *g = Some(load_settings().categories);
+    }
+    g.as_ref().unwrap().clone()
+}
+/// 更新分类表缓存(持久化由 ui 层 update_stored_settings 负责)
+#[allow(dead_code)] // 分类管理面板(下一提交)接入;模型层先行落位
+pub fn set_category_table(t: Vec<CategoryDef>) {
+    *CATEGORY_TABLE.lock().unwrap() = Some(t);
+}
+
 pub fn categorize(name: &str, is_dir: bool) -> String {
+    categorize_with(&category_table(), name, is_dir)
+}
+
+/// 纯函数版归类(可注入表,单测用):目录归 dirs 标记类(已删则落兜底),
+/// 扩展名按表序首个匹配,无匹配落兜底——任何文件都有归类,不隐身。
+pub fn categorize_with(table: &[CategoryDef], name: &str, is_dir: bool) -> String {
     if is_dir {
-        return "文件夹".into();
+        if let Some(c) = table.iter().find(|c| c.dirs) {
+            return c.name.clone();
+        }
+        return FALLBACK_CATEGORY.into();
     }
     let ext = ext_of(name).to_lowercase();
-    let cat = match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" => "图片",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "csv" | "rtf"
-        | "log" => "文档",
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" => {
-            "媒体"
-        }
-        "exe" | "msi" | "lnk" | "bat" | "cmd" | "com" => "软件",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "part" => "压缩包",
-        "js" | "ts" | "py" | "rs" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "cs" | "rb"
-        | "php" | "html" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" | "md" => {
-            "代码"
-        }
-        _ => "其他",
-    };
-    cat.to_string()
+    if let Some(c) = table.iter().find(|c| c.exts.iter().any(|e| *e == ext)) {
+        return c.name.clone();
+    }
+    FALLBACK_CATEGORY.into()
 }
 
 pub fn category_index(cat: &str) -> usize {
-    CATEGORIES.iter().position(|c| *c == cat).unwrap_or(7)
+    let table = category_table();
+    table
+        .iter()
+        .position(|c| c.name == cat)
+        .or_else(|| table.iter().position(|c| c.name == FALLBACK_CATEGORY))
+        .unwrap_or(0)
 }
 
 // ---------- 栅栏 ----------
@@ -1021,7 +1075,8 @@ pub fn usage_of(path: &str) -> (u32, u64) {
 
 impl Fence {
     pub fn color(&self) -> [f32; 3] {
-        CATEGORY_COLORS[category_index(&self.category)]
+        // 分类可超过调色板数(用户新增):取模循环取色,绝不越界 panic
+        CATEGORY_COLORS[category_index(&self.category) % CATEGORY_COLORS.len()]
     }
 }
 
@@ -1366,6 +1421,12 @@ pub struct Settings {
     /// 媒体类恒有文件,旧的缺类补建逻辑必然复活它们)。
     #[serde(default)]
     pub deleted_category_at: std::collections::HashMap<String, u64>,
+    /// 可编辑分类表(2026-09-08):分类名+扩展名映射+是否收纳目录。
+    /// 缺省=内置 8 类,老 settings.json 无此字段时无缝迁移。托盘"自动
+    /// 分类→管理分类"面板增删改名后落盘,categorize/缺类补建/配色索引
+    /// 全部改查此表;删除分类的文件落"其他"(兜底,不可删)。
+    #[serde(default = "default_categories")]
+    pub categories: Vec<CategoryDef>,
 }
 
 pub fn default_desktop_state() -> String {
@@ -1441,6 +1502,7 @@ impl Default for Settings {
             z_guard: default_z_guard(),
             show_chrome: false,
             deleted_category_at: Default::default(),
+            categories: default_categories(),
         }
     }
 }
@@ -1475,6 +1537,7 @@ pub fn load_settings_from(path: &std::path::Path) -> Settings {
                 z_guard: default_z_guard(),
             show_chrome: false,
             deleted_category_at: Default::default(),
+            categories: default_categories(),
             }
         }
     }
@@ -1718,7 +1781,9 @@ pub fn build_global_config(files: &[FileItem]) -> Vec<Fence> {
     }
     let mut out = Vec::new();
     let mut id = 1u32;
-    for cat in CATEGORIES {
+    // 动态分类表(2026-09-08):默认布局跟随可编辑表,不再限定内置 8 类
+    for cat_def in category_table() {
+        let cat: &str = &cat_def.name;
         let list = map.get(cat).cloned().unwrap_or_default();
         if list.is_empty() {
             continue;
@@ -2174,11 +2239,77 @@ mod tests {
 
     #[test]
     fn categorize_works() {
-        assert_eq!(categorize("a.png", false), "图片");
-        assert_eq!(categorize("b.exe", false), "软件");
-        assert_eq!(categorize("c", false), "其他");
-        assert_eq!(categorize("d", true), "文件夹");
-        assert_eq!(categorize("e.LNK", false), "软件");
+        // 注入默认表(不读真实 settings.json,测试保持确定性)
+        let t = default_categories();
+        assert_eq!(categorize_with(&t, "a.png", false), "图片");
+        assert_eq!(categorize_with(&t, "b.exe", false), "软件");
+        assert_eq!(categorize_with(&t, "c", false), "其他");
+        assert_eq!(categorize_with(&t, "d", true), "文件夹");
+        assert_eq!(categorize_with(&t, "e.LNK", false), "软件");
+        assert_eq!(categorize_with(&t, "F.TXT", false), "文档"); // 扩展名大小写不敏感
+    }
+
+    #[test]
+    fn category_delete_falls_back_to_other() {
+        // 删除"文档"分类后,原属文档的文件落兜底"其他",不隐身(2026-09-08 定案)
+        let t: Vec<CategoryDef> = default_categories()
+            .into_iter()
+            .filter(|c| c.name != "文档")
+            .collect();
+        assert_eq!(categorize_with(&t, "a.txt", false), "其他");
+        assert_eq!(categorize_with(&t, "a.pdf", false), "其他");
+        assert_eq!(categorize_with(&t, "a.png", false), "图片");
+    }
+
+    #[test]
+    fn category_rename_follows() {
+        // 改名后扩展名跟随新名(文件与栅栏由 ui 层同步改名)
+        let mut t = default_categories();
+        for c in t.iter_mut() {
+            if c.name == "文档" {
+                c.name = "资料".into();
+            }
+        }
+        assert_eq!(categorize_with(&t, "a.txt", false), "资料");
+    }
+
+    #[test]
+    fn dir_category_rename_and_delete() {
+        // 目录类的 dirs 标记随改名跟随;删除该类后目录落兜底
+        let mut t = default_categories();
+        for c in t.iter_mut() {
+            if c.name == "文件夹" {
+                c.name = "目录".into();
+            }
+        }
+        assert_eq!(categorize_with(&t, "any", true), "目录");
+        let t2: Vec<CategoryDef> = t.into_iter().filter(|c| !c.dirs).collect();
+        assert_eq!(categorize_with(&t2, "any", true), "其他");
+    }
+
+    #[test]
+    fn new_empty_category_receives_nothing() {
+        // 面板新增的空分类(无扩展名)不吸走任何现有文件;面板建栏后靠拖入(pin)
+        let mut t = default_categories();
+        t.push(CategoryDef {
+            name: "设计".into(),
+            exts: vec![],
+            dirs: false,
+        });
+        assert_eq!(categorize_with(&t, "a.txt", false), "文档");
+        assert_eq!(categorize_with(&t, "b.png", false), "图片");
+    }
+
+    #[test]
+    fn legacy_settings_without_categories_get_default_table() {
+        // 旧版 settings.json 无 categories 字段 → 无缝迁移为内置 8 类
+        let dir = std::env::temp_dir().join(format!("df_settings_legacy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        std::fs::write(&p, r#"{"align_mode":"auto"}"#).unwrap();
+        let s = load_settings_from(&p);
+        assert_eq!(s.categories, default_categories());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
