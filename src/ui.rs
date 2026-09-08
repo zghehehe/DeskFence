@@ -2509,7 +2509,7 @@ fn remove_empty_category_fences() {
 pub fn rescan() {
     let mut files = with_recycle_bin(shell::scan_desktop());
     let (added_paths, removed_any, recat_any, gained_cats) = {
-        let mut s = state().lock().unwrap();
+        let s = state().lock().unwrap();
         // 扫描宽恕:上一轮在册、本轮扫不到的路径,连续 SCAN_MISS_DROP 轮
         // 才真正移除(未达阈值时从上一轮找回,保持文件可见)——元数据瞬态
         // 读取失败不再引发"文件消失/栅栏重排"(用户实测"文档自动移位")
@@ -2687,7 +2687,7 @@ fn new_fence_rect(s: &UiState, w: f32, h: f32) -> Rect {
             (vx, vy)
         }
     };
-    let mut r = Rect { x, y, w, h };
+    let r = Rect { x, y, w, h };
     let (vx, vy, vw, vh) = work_area_for_rect(&r);
     let mut tmp = [r];
     model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
@@ -4212,7 +4212,7 @@ pub fn env_health_report() -> (bool, String) {
     }
     // 3) 孤儿 DeskFence 窗口(死去实例的遗留)
     let me = std::process::id();
-    let mut orphans = 0usize;
+    let orphans;
     unsafe {
         unsafe extern "system" fn enum_orphan(h: HWND, l: LPARAM) -> BOOL {
             let (me, count) = unsafe {
@@ -4351,7 +4351,7 @@ fn env_repair_internal(reason: &str) {
     log(&format!(
         "env-repair({reason}): restarting explorer to rebuild desktop band"
     ));
-    std::thread::spawn(|| unsafe {
+    std::thread::spawn(|| {
         // 让 UI 先消化掉调用上下文(消息框/自检),再动 Explorer
         std::thread::sleep(std::time::Duration::from_millis(400));
         let remain = shell::terminate_by_name("explorer.exe", 5000);
@@ -5678,9 +5678,9 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
         // 前台权诊断:TrackPopupMenu 无前台会立即返回 0(zombie 菜单)。正常应
         // 打印 host match=true;出现其他类名即可定位是谁抢的前台。
         {
-            let fg = unsafe { GetForegroundWindow() };
+            let fg = GetForegroundWindow();
             let mut fb = [0u16; 32];
-            let fn_ = unsafe { GetClassNameW(fg, &mut fb) };
+            let fn_ = GetClassNameW(fg, &mut fb);
             log(&format!(
                 "menu open: foreground={} (host match={})",
                 String::from_utf16_lossy(&fb[..fn_.max(0) as usize]),
@@ -7213,20 +7213,6 @@ fn adjust_rename_edit_height(edit: HWND) {
             .unwrap_or_else(model::DpiMetrics::system);
         // Match the EDIT's own formatting rectangle instead of estimating its
         // wrapping width from the outer window alone.
-        let mut format = RECT::default();
-        let _ = SendMessageW(
-            edit,
-            EM_GETRECT,
-            WPARAM(0),
-            LPARAM((&mut format as *mut RECT) as isize),
-        );
-        let format_ok = format.right > format.left && format.bottom > format.top;
-        let client_w = (rc.right - rc.left).max(1);
-        let format_w = if format_ok {
-            (format.right - format.left).max(1)
-        } else {
-            client_w.saturating_sub(14).max(1)
-        };
         // 换行宽 = 名字宽×0.55,夹 [66, 格宽-2*scale](2026-09-04 用 GDI
         // TextRenderer 精确实测后修正:原生有效换行宽窗口 [60,72)——
         // "v4flash测"(60)留在首行、"+试"(72)换行;32字长名 6字/行(≥108);
@@ -7253,8 +7239,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         // —— 高度:实际换行行数×行高+贴身边距(原生单行框≈行高+8) ——
         // 旧的 行数+1 余量槽在单行名时多出整整一行空白(用户对照反馈),
         // 余量槽退役;防裁切由 EM_GETLINECOUNT 实时准确(editprobe 实测)
-        // + 显示器封顶兜底承担。
-        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
+        // + 显示器封顶兜底承担。(行数在宽度 SetWindowPos 后取:换行已同步)
         let mut tm = TEXTMETRICW::default();
         let line_h = if GetTextMetricsW(hdc, &mut tm).as_bool() {
             (tm.tmHeight + tm.tmExternalLeading) as f32
@@ -7266,7 +7251,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         }
         ReleaseDC(edit, hdc);
         let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形(换行已同步)
-        format = RECT::default();
+        let mut format = RECT::default();
         let _ = SendMessageW(
             edit,
             EM_GETRECT,
@@ -10131,12 +10116,5 @@ mod rename_geom_tests {
             );
             let _ = DestroyWindow(edit);
         }
-    }
-
-    fn pcw(s: &str) -> PCWSTR {
-        let mut v: Vec<u16> = s.encode_utf16().collect();
-        v.push(0);
-        let mut leak = v.leak();
-        PCWSTR::from_raw(unsafe { leak.as_mut_ptr() })
     }
 }

@@ -170,31 +170,6 @@ pub fn snap_fence_size(w: f32, h: f32) -> (f32, f32) {
     )
 }
 
-/// 插入式重排:按给定顺序从 (x0,y0) 起依次排放,同排累积宽度,放不下换行
-/// (下一行 y = 本行最深底边 + GAP)。纯函数,宽度高度逐项给定。
-/// 用于"插入线松手后整链紧凑":[1,2,3] 把 1 插到 2/3 之间 → 2,1,3 依次占位。
-pub fn chain_positions(sizes: &[(f32, f32)], x0: f32, y0: f32, row_right: f32) -> Vec<(f32, f32)> {
-    let mut out = Vec::with_capacity(sizes.len());
-    let mut x = x0;
-    let mut y = y0;
-    let mut row_bottom = y0;
-    let mut row_first = true;
-    for &(w, h) in sizes {
-        // 换行以工作区绝对右缘为准(x0 起步时行宽只剩 row_right-x0),
-        // 否则链会排到屏幕外,后续夹回又引发推挤
-        if !row_first && x + w > row_right {
-            x = x0;
-            y = row_bottom + GAP;
-            row_bottom = y;
-        }
-        out.push((x, y));
-        row_bottom = row_bottom.max(y + h);
-        x += w + GAP;
-        row_first = false;
-    }
-    out
-}
-
 /// 两个矩形是否相交
 pub fn intersects(a: &Rect, b: &Rect) -> bool {
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
@@ -1326,10 +1301,6 @@ pub fn apply_resize(r: &Rect, edges: &[char], dx: f32, dy: f32) -> Rect {
 }
 
 /// 图标在栅栏内的绘制位置（相对左上角）
-pub fn cell_pos(la: &Layout, index: usize) -> (f32, f32) {
-    cell_pos_with_metrics(la, index, &DpiMetrics::system())
-}
-
 pub fn cell_pos_with_metrics(la: &Layout, index: usize, metrics: &DpiMetrics) -> (f32, f32) {
     let rel = index - la.first_index;
     let row = rel / la.cols;
@@ -2828,39 +2799,6 @@ mod tests {
     }
 
     #[test]
-    fn chain_positions_compact_and_wrap() {
-        // [A,B,C] 等宽从 x=0 排:间距 GAP 累积
-        let slots = chain_positions(
-            &[(100.0, 50.0), (100.0, 50.0), (100.0, 50.0)],
-            0.0,
-            0.0,
-            1000.0,
-        );
-        assert_eq!(slots[0], (0.0, 0.0));
-        assert_eq!(slots[1], (112.0, 0.0));
-        assert_eq!(slots[2], (224.0, 0.0));
-        // 宽度不够换行:第三项 224+100 > 250 → 换到 y=50+GAP
-        let slots = chain_positions(
-            &[(100.0, 50.0), (100.0, 50.0), (100.0, 50.0)],
-            0.0,
-            0.0,
-            250.0,
-        );
-        assert_eq!(slots[2], (0.0, 62.0));
-        // 不等高换行:行底取最深者
-        let slots = chain_positions(
-            &[(100.0, 80.0), (100.0, 30.0), (100.0, 30.0)],
-            0.0,
-            0.0,
-            250.0,
-        );
-        assert_eq!(slots[2], (0.0, 92.0));
-        // 换行以绝对右缘为准:x0=100 时行宽只剩 150,第二项就换行
-        let slots = chain_positions(&[(100.0, 50.0), (100.0, 50.0)], 100.0, 0.0, 250.0);
-        assert_eq!(slots[0], (100.0, 0.0));
-        assert_eq!(slots[1], (100.0, 62.0));
-    }
-
     fn fit_to_screen_clamps_without_scaling() {
         // 整体超出屏幕时：不再缩放尺寸，平移+夹回即可
         let mut rects = vec![
