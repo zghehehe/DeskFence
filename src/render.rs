@@ -705,7 +705,7 @@ pub fn draw_fence(
                 let rr = rounded(rect(0.0, 0.0, w, h), 7.0);
                 rt.FillRoundedRectangle(&rr, as_brush(&bg));
             }
-            draw_title(rt, r, fence, w, h, true);
+            draw_title(rt, r, fence, w, h);
         }
 
         if !fence.collapsed {
@@ -1109,14 +1109,7 @@ pub fn gdi_draw_labels_transparent(s: &Surface, jobs: &[GdiLabelJob]) {
     }
 }
 
-fn draw_title(
-    rt: &ID2D1DCRenderTarget,
-    r: &Renderer,
-    fence: &Fence,
-    w: f32,
-    _h: f32,
-    show_chrome: bool,
-) {
+fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h: f32) {
     unsafe {
         let accent = fence.color();
         // A thin category rail is easier to scan than a large colored card.
@@ -1126,16 +1119,16 @@ fn draw_title(
                 accent[0],
                 accent[1],
                 accent[2],
-                if show_chrome { 0.95 } else { 0.72 },
+                0.95,
             ),
         ) {
             let rr = rounded(rect(7.0, 7.0, 10.0, model::TITLE_H - 7.0), 1.5);
             rt.FillRoundedRectangle(&rr, as_brush(&a));
         }
         let main_c = if r.light {
-            color(0.10, 0.11, 0.14, if show_chrome { 0.96 } else { 0.78 })
+            color(0.10, 0.11, 0.14, 0.96)
         } else {
-            color(0.95, 0.96, 0.98, if show_chrome { 0.97 } else { 0.82 })
+            color(0.95, 0.96, 0.98, 0.97)
         };
         let shadow_c = if r.light {
             color(1.0, 1.0, 1.0, 0.72)
@@ -1152,7 +1145,8 @@ fn draw_title(
                 rect(18.0, 4.0, w - model::COLLAPSE_W - 6.0, model::TITLE_H - 2.0),
             );
             {
-                // 箭头始终可见(未悬停时其余 chrome 仍隐藏)。
+                // 折叠箭头随标题栏一起、仅在悬停/拖拽(chrome)时绘制;
+                // 平时栅栏完全无边框(无边框常显基线,2026-08-26)。
                 // 可点击提示:半透明深色圆角小条(与壁纸底都搭),
                 // 内画宽扁三角(宽:高=2:1),垂直中心与左侧栅栏名同水平线。
                 // 展开态三角向下,折叠态向右。
@@ -1163,13 +1157,13 @@ fn draw_title(
                 // 底色浅灰:肉眼可见即可(不抢图标名的视觉)
                 if let Some(bb) = brush(
                     rt,
-                    &color(0.05, 0.06, 0.09, if show_chrome { 0.26 } else { 0.16 }),
+                    &color(0.05, 0.06, 0.09, 0.26),
                 ) {
                     rt.FillRoundedRectangle(&zone_rr, as_brush(&bb));
                 }
                 if let Some(sb) = brush(
                     rt,
-                    &color(1.0, 1.0, 1.0, if show_chrome { 0.42 } else { 0.30 }),
+                        &color(1.0, 1.0, 1.0, 0.42),
                 ) {
                     rt.DrawRoundedRectangle(&zone_rr, as_brush(&sb), 1.0, None);
                 }
