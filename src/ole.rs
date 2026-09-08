@@ -371,5 +371,5 @@ pub fn register_drop_target(hwnd: HWND, fence_id: u32) -> bool {
 }
 
 fn on_fence_drop(fence_id: u32, paths: Vec<String>, screen_x: i32, screen_y: i32) {
-    crate::ui::on_fence_drop_cb(fence_id, paths, screen_x, screen_y);
+    crate::drag::on_fence_drop_cb(fence_id, paths, screen_x, screen_y);
 }

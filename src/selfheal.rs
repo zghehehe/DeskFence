@@ -14,6 +14,7 @@ const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::render;
+use crate::drag::*;
 use crate::ui::*;
 
 /// 一次走查失位的故障签名。防抖只在"同一签名连续出现"时累计拍数:

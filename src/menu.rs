@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::render;
 use crate::model::{self, Fence, Rect};
 use crate::shell;
+use crate::drag::*;
 use crate::ui::*;
 
 const MENU_ADD_FENCE: u32 = 0x5101;
