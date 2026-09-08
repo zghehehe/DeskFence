@@ -1445,11 +1445,14 @@ impl Default for Settings {
     }
 }
 pub fn load_settings() -> Settings {
-    let p = settings_path();
-    if !p.exists() {
+    load_settings_from(&settings_path())
+}
+/// 可注入路径版本(单测用),其余行为与 load_settings 完全一致
+pub fn load_settings_from(path: &std::path::Path) -> Settings {
+    if !path.exists() {
         return Settings::default();
     }
-    let raw = match std::fs::read_to_string(&p) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
         Err(_) => return Settings::default(),
     };
@@ -1511,8 +1514,12 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 }
 
 pub fn save_settings(s: &Settings) {
+    save_settings_to(&settings_path(), s)
+}
+/// 可注入路径版本(单测用),其余行为与 save_settings 完全一致
+pub fn save_settings_to(path: &std::path::Path, s: &Settings) {
     let json = serde_json::to_string_pretty(s).unwrap_or_default();
-    let _ = atomic_write(&settings_path(), &json);
+    let _ = atomic_write(path, &json);
 }
 
 /// DeskFence 接管会话标记。它只表示本程序曾临时隐藏过原生桌面图标，
@@ -3346,5 +3353,30 @@ mod tests {
     fn align_first_row_left_noop_when_already_at_edge() {
         let mut rects = vec![rr(0.0, 0.0, 200.0, 100.0)];
         assert!(!align_first_row_left(&mut rects, 0.0));
+    }
+
+    #[test]
+    fn partial_settings_update_preserves_other_fields() {
+        // 回归(2026-09-08):旧的 set_*_stored 手工重建 Settings,任何一次
+        // 托盘开关都会把 deleted_category_at 墓碑表清空(已删分类随后被
+        // 缺类补建复活)。收敛为 load→改一个字段→save 后,无关字段必须
+        // 原样保留。
+        let dir = std::env::temp_dir().join(format!("df_settings_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        let mut s = Settings::default();
+        s.deleted_category_at.insert("文档".into(), 1_726_400_000_000);
+        save_settings_to(&p, &s);
+        // 部分更新:只改对齐档位
+        let mut cur = load_settings_from(&p);
+        cur.align_mode = "grid".into();
+        save_settings_to(&p, &cur);
+        let reread = load_settings_from(&p);
+        assert_eq!(reread.align_mode, "grid");
+        assert_eq!(
+            reread.deleted_category_at.get("文档"),
+            Some(&1_726_400_000_000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

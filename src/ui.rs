@@ -96,18 +96,21 @@ pub fn align_mode() -> String {
     *ALIGN_MODE.lock().unwrap() = m.clone();
     m
 }
+/// 统一的设置落盘入口:读 settings.json → 就地改一个字段 → 原子写回。
+/// 旧实现是 5 处 set_*_stored 各自手工重建 Settings 逐字段拷贝,新增字段
+/// 漏改任意一处=静默把该字段写回默认值(实锤:每次开关托盘设置都会把
+/// deleted_category_at 墓碑表整个清空,已删的分类栅栏随后被缺类补建复活)。
+/// 收敛后新增 Settings 字段无需改这里,任何部分更新天然保留其余字段。
+fn update_stored_settings(f: impl FnOnce(&mut model::Settings)) {
+    let mut s = model::load_settings();
+    f(&mut s);
+    model::save_settings(&s);
+}
+
 /// 写入对齐档位并立即持久化到设置文件
 fn set_align_mode_stored(mode: &str) {
     *ALIGN_MODE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: mode.to_string(),
-        render_mode: render_mode(),
-        auto_category: auto_category(),
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-        show_chrome: chrome_always_on(),
-        deleted_category_at: Default::default(),
-    });
+    update_stored_settings(|s| s.align_mode = mode.to_string());
 }
 pub fn auto_align_on() -> bool {
     align_mode() == "auto"
@@ -134,15 +137,7 @@ pub fn render_mode() -> String {
 }
 fn set_render_mode_stored(mode: &str) {
     *RENDER_MODE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: mode.to_string(),
-        auto_category: auto_category(),
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-        show_chrome: chrome_always_on(),
-        deleted_category_at: Default::default(),
-    });
+    update_stored_settings(|s| s.render_mode = mode.to_string());
 }
 
 /// 桌面状态(持久化):normal=栅栏显示 / zen=纯净(只剩壁纸) / native=原生图标。
@@ -161,15 +156,7 @@ pub fn desktop_state() -> String {
 }
 fn set_desktop_state_stored(mode: &str) {
     *DESKTOP_STATE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: render_mode(),
-        auto_category: auto_category(),
-        desktop_state: mode.to_string(),
-        z_guard: z_guard_setting(),
-        show_chrome: chrome_always_on(),
-        deleted_category_at: Default::default(),
-    });
+    update_stored_settings(|s| s.desktop_state = mode.to_string());
 }
 
 /// 自动分类开关:默认 true=按固定 8 类自动归类;false=自定义分类模式
@@ -188,15 +175,7 @@ pub fn auto_category() -> bool {
 fn set_auto_category_stored(v: bool) {
     model::set_auto_category(v);
     *AUTO_CATEGORY.lock().unwrap() = Some(v);
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: render_mode(),
-        auto_category: v,
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-        show_chrome: chrome_always_on(),
-        deleted_category_at: Default::default(),
-    });
+    update_stored_settings(|s| s.auto_category = v);
 }
 
 /// z 守卫设置(缓存读取,模式同上):菜单落盘点需要带上当前值。
@@ -214,15 +193,7 @@ pub fn chrome_always_on() -> bool {
 }
 fn set_show_chrome_stored(on: bool) {
     SHOW_CHROME.store(on, Ordering::Relaxed);
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: render_mode(),
-        auto_category: auto_category(),
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-        show_chrome: on,
-        deleted_category_at: Default::default(),
-    });
+    update_stored_settings(|s| s.show_chrome = on);
 }
 
 /// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
