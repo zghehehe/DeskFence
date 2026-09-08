@@ -2,6 +2,7 @@
 
 mod cats_panel;
 mod iconcache;
+mod menu;
 mod model;
 mod ole;
 mod render;

@@ -2,7 +2,7 @@
 //! 每行 = 分类名(EDIT 点击就地改,失焦/关窗即提交) + 行尾 ×(删除);
 //! 兜底"其他"行只读且无 ×;底部"＋ 新增分类"。Win32 菜单做不了行内
 //! 编辑和行内按钮,故用本面板承载(用户定案的交互形态)。
-//! 所有修改经 ui::apply_category_* 即时生效:分类表(settings.json)、
+//! 所有修改经 crate::menu::apply_category_* 即时生效:分类表(settings.json)、
 //! 桌面栅栏(改名/删除/新建)与文件归属(改名跟随/删除落"其他")同步,
 //! 不变量:任何时刻所有文件都在某个栅栏可见。
 //! 本模块属于 ui.rs 拆分的增量部分:窗口/控件代码独立成模块,不进 ui.rs。
@@ -376,7 +376,7 @@ fn do_delete(panel: &mut Panel, i: usize) {
     if name == model::FALLBACK_CATEGORY {
         return; // 兜底不可删(按钮未渲染,双保险)
     }
-    if !ui::apply_category_delete(&name) {
+    if !crate::menu::apply_category_delete(&name) {
         return;
     }
     unsafe {
@@ -395,7 +395,7 @@ fn do_add(hwnd: HWND, panel: &mut Panel) {
     if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
         commit_row(panel, i);
     }
-    if let Some(name) = ui::apply_category_add("新分类") {
+    if let Some(name) = crate::menu::apply_category_add("新分类") {
         append_row(hwnd, panel, &name, false);
         layout_all(hwnd, panel);
         if let Some(r) = panel.rows.last() {
@@ -407,7 +407,7 @@ fn do_add(hwnd: HWND, panel: &mut Panel) {
     }
 }
 
-/// 失焦/关窗提交:空名或重名回滚显示;成功经 ui::apply_category_rename 同步全部状态
+/// 失焦/关窗提交:空名或重名回滚显示;成功经 crate::menu::apply_category_rename 同步全部状态
 fn commit_row(panel: &mut Panel, i: usize) {
     let (text, old) = {
         let r = &panel.rows[i];
@@ -417,7 +417,7 @@ fn commit_row(panel: &mut Panel, i: usize) {
     if text == old {
         return;
     }
-    if text.is_empty() || !ui::apply_category_rename(&old, &text) {
+    if text.is_empty() || !crate::menu::apply_category_rename(&old, &text) {
         let r = &panel.rows[i];
         set_text(r.edit, &old);
         return;
