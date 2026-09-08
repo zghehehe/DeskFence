@@ -1029,9 +1029,11 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
         // 勿回退到"宿主正上方"——带底是菜单开合的扰动区,2026-08-29 闪屏
         // 根因)。取不到锚点时不动 z——初始位置由全局 tick 的自愈在宿主
         // 就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
-        let insert_after = match host.map(|h| band_attach_anchor(h.hwnd, HWND(0), false)).flatten() {
+        // 深位锚(2026-09-08):启动就位与其余三处(reanchor/走查修复/晋升)
+        // 统一;浅位回退在桌面态会把栅栏放进菜单静默沉底的扰动区(大闪根因)
+        let insert_after = match host.map(|h| band_attach_anchor(h.hwnd, HWND(0), true)).flatten() {
             Some(a) => Some(a),
-            None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), false)),
+            None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), true)),
         };
         let mut attached = false;
         if let Some(after) = insert_after {

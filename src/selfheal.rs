@@ -185,13 +185,18 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
         }
         return Some(w);
     }
-    // 深位回退(deep=true):主规则无"可见且非 topmost"外来窗时,锚到"最低
-    // 可见或 topmost 外来窗"之下、紧贴它的最高**非 topmost 隐形**外来窗。
+    // 深位回退(2026-09-08 起无条件执行,deep 参数保留兼容):主规则无
+    // "可见且非 topmost"外来窗时(典型:桌面态全部应用窗最小化),锚到
+    // "最低可见或 topmost 外来窗"之下、紧贴它的最高**非 topmost 隐形**外来
+    // 窗。此处 ~440 步深位远离菜单宿主的静默沉底块=菜单开合免疫(实测);
+    // 旧的兄弟归队/带底回退会把栅栏放回宿主正上方扰动区,菜单一关就被
+    // 整块压到宿主之下=用户可见的"桌面大闪"(bandwalk 实证)。
     // 锚必须自身非 topmost:插到 topmost 窗正下方会把栅栏并入 topmost band
     // (2026-08-29 实测 5 栅栏全变 topmost=True;且 SetWindowLongW 清不掉
     // 该位,HWND_NOTOPMOST 又会把窗口移到非 topmost 带顶部=位置不可控,
     // 此路不通,勿再试)。无可垫垃圾则继续兄弟归队/带底。
-    if deep {
+    {
+        let _ = deep; // 参数保留:历史上仅晋升路径选择深位,现统一启用
         let mut best: Option<HWND> = None;
         let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
         for _ in 0..1000 {
@@ -725,7 +730,10 @@ pub(crate) fn ensure_all_attached() {
                 let _z = z_scope(ZIntent::Repair);
                 let mut attached = false;
                 let mut first_err = None;
-                let mut anchor = band_attach_anchor(host.hwnd, h, false);
+                // 深位锚(2026-09-08):与晋升路径统一——桌面态(全部应用窗最小化)下
+                // 浅位回退会把栅栏留在菜单宿主 z 邻接的扰动区,菜单开合的静默
+                // 沉底会把整块压到宿主之下=用户可见的"桌面大闪后才出现栅栏"。
+                let mut anchor = band_attach_anchor(host.hwnd, h, true);
                 let mut tried = 0;
                 while let Some(after) = anchor {
                     if tried >= 3 {
@@ -912,7 +920,7 @@ fn fence_apply_shown_topmost(on: bool) -> usize {
             // 摘除=直接重归位到最低可见外来窗之下。HWND_NOTOPMOST 会先把
             // 栅栏抬到非 topmost 带顶部=浮在应用窗上再等人压(用户实测
             // "回应用偶现栅栏浮在应用上"的根源),只留作锚解析失败的兜底。
-            match desktop_shell_window().and_then(|host| band_attach_anchor(host, h, false)) {
+            match desktop_shell_window().and_then(|host| band_attach_anchor(host, h, true)) {
                 Some(a) if a != h => a,
                 _ => HWND_NOTOPMOST,
             }
@@ -1047,7 +1055,8 @@ pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
             }
             // 锚点=最低可见外来窗正下方(带内绝缘位,2026-08-29;带底=菜单
             // 关闭静默沉底的扰动区,勿回退,详见 band_attach_anchor)。
-            let Some(after) = band_attach_anchor(shell, hwnd, false) else { return };
+            // 深位锚(2026-09-08):reanchor 与晋升统一,浅位=菜单静默沉底的扰动区
+            let Some(after) = band_attach_anchor(shell, hwnd, true) else { return };
             let _z = z_scope(ZIntent::Repair);
             let attempt = unsafe {
                 SetWindowPos(
