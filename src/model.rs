@@ -941,7 +941,6 @@ pub fn category_table() -> Vec<CategoryDef> {
     g.as_ref().unwrap().clone()
 }
 /// 更新分类表缓存(持久化由 ui 层 update_stored_settings 负责)
-#[allow(dead_code)] // 分类管理面板(下一提交)接入;模型层先行落位
 pub fn set_category_table(t: Vec<CategoryDef>) {
     *CATEGORY_TABLE.lock().unwrap() = Some(t);
 }

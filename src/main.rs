@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cats_panel;
 mod model;
 mod ole;
 mod render;

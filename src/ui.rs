@@ -68,7 +68,7 @@ fn menu_host_class_name() -> PCWSTR {
     PCWSTR::from_raw(v.as_ptr())
 }
 
-fn hinstance() -> HINSTANCE {
+pub(crate) fn hinstance() -> HINSTANCE {
     unsafe {
         HINSTANCE(
             windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -101,7 +101,7 @@ pub fn align_mode() -> String {
 /// 漏改任意一处=静默把该字段写回默认值(实锤:每次开关托盘设置都会把
 /// deleted_category_at 墓碑表整个清空,已删的分类栅栏随后被缺类补建复活)。
 /// 收敛后新增 Settings 字段无需改这里,任何部分更新天然保留其余字段。
-fn update_stored_settings(f: impl FnOnce(&mut model::Settings)) {
+pub(crate) fn update_stored_settings(f: impl FnOnce(&mut model::Settings)) {
     let mut s = model::load_settings();
     f(&mut s);
     model::save_settings(&s);
@@ -208,14 +208,14 @@ fn set_category_tombstone(cat: &str) {
         .insert(cat.to_string(), model::epoch_ms());
     model::save_settings(&s);
 }
-fn clear_category_tombstone(cat: &str) {
+pub(crate) fn clear_category_tombstone(cat: &str) {
     let mut s = model::load_settings();
     if s.deleted_category_at.remove(cat).is_some() {
         model::save_settings(&s);
     }
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
-fn rebuild_pins() {
+pub(crate) fn rebuild_pins() {
     let s = state().lock().unwrap();
     model::rebuild_pinned_registry(&s.fences);
 }
@@ -271,6 +271,9 @@ const MENU_RENDER_PRECISE: u32 = 0x5117;
 const MENU_AUTO_CATEGORY: u32 = 0x5118;
 const MENU_HELP: u32 = 0x5119;
 const MENU_TOGGLE_CHROME: u32 = 0x511A;
+// 管理分类子菜单(2026-09-08 分类面板):表项=base+表内下标,上限 16 项
+const MENU_CATS_BASE: u32 = 0x5120;
+const MENU_CATS_ADD: u32 = 0x5130;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -329,7 +332,7 @@ struct InsertPlan {
 }
 
 #[derive(Clone)]
-struct Drag {
+pub(crate) struct Drag {
     fence_id: u32,
     mode: DragMode,
     start_x: f32,
@@ -350,7 +353,7 @@ struct Drag {
 
 /// 拖拽实时预览状态:拖动中即时重排显示,松手才生效;取消/拖出释放则回滚
 #[derive(Clone)]
-struct GhostPreview {
+pub(crate) struct GhostPreview {
     fence_id: u32,
     /// 按下时的完整显示顺序(回滚与重排的基准)
     original: Vec<String>,
@@ -363,7 +366,7 @@ struct GhostPreview {
 }
 
 #[derive(Clone)]
-struct ArrivalAnimation {
+pub(crate) struct ArrivalAnimation {
     fence_id: u32,
     path: String,
     name: String,
@@ -373,7 +376,7 @@ struct ArrivalAnimation {
     duration_ms: u64,
 }
 
-struct UiState {
+pub(crate) struct UiState {
     pub renderer: Option<Renderer>,
     pub fences: Vec<Fence>,
     pub files: Vec<FileItem>,
@@ -478,7 +481,7 @@ enum WalkFault {
     NotFoundBudget,
 }
 
-struct WalkStrike {
+pub(crate) struct WalkStrike {
     fault: WalkFault,
     count: u32,
 }
@@ -492,7 +495,7 @@ fn class_hash(cls: &[u16]) -> u64 {
     h
 }
 
-fn state() -> &'static Mutex<UiState> {
+pub(crate) fn state() -> &'static Mutex<UiState> {
     static S: OnceLock<Mutex<UiState>> = OnceLock::new();
     S.get_or_init(|| {        Mutex::new(UiState {
             renderer: None,
@@ -1268,7 +1271,7 @@ fn screen_cursor() -> (f32, f32) {
 }
 
 /// 刷新所有栅栏窗口（位置/尺寸/内容），用于自动对齐重排后
-fn refresh_all_fences() {
+pub(crate) fn refresh_all_fences() {
     let ids: Vec<u32> = state()
         .lock()
         .unwrap()
@@ -2364,7 +2367,7 @@ pub fn show_all_fences() {
 /// 返回新建的类别名。rescan 与 boot 共用——只改分类规则(如 md 文档→代码)
 /// 不动文件集合,rescan 的"无变化早退"永远等不到补建,boot 也必须跑一遍,
 /// 否则受影响文件无栅栏可归=隐身(2026-09-01)。
-fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
+pub(crate) fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
     let mut have: std::collections::HashSet<String> = s
         .fences
         .iter()
@@ -2614,7 +2617,7 @@ pub fn rescan() {
 }
 
 /// 默认栅栏尺寸:2 列宽 × 5 行高(用户指定;内容超出自动滚动)
-fn default_fence_size() -> (f32, f32) {
+pub(crate) fn default_fence_size() -> (f32, f32) {
     let (title_h, pad) = model::chrome(model::dpi_scale());
     (
         model::cell_w() * 2.0 + pad * 2.0 + 2.0,
@@ -2636,7 +2639,7 @@ fn default_size_for_items(n: usize) -> (f32, f32) {
 /// 新栅栏落位(2026-09-02 统一规则,手动/自动新建共用):第一行最后一个
 /// 栅栏右侧,与其靠顶对齐、保持默认间隔;无栅栏时放工作区左上角;
 /// 行尾放不下夹回屏内(残余重叠由随后的 settle 推开兜底)。
-fn new_fence_rect(s: &UiState, w: f32, h: f32) -> Rect {
+pub(crate) fn new_fence_rect(s: &UiState, w: f32, h: f32) -> Rect {
     let visible: Vec<Rect> = s
         .fences
         .iter()
@@ -4785,6 +4788,23 @@ fn show_tray_menu(x: i32, y: i32) {
     shell::append_submenu(menu, "渲染模式", render);
     if auto_category() {
         shell::append_menu_checked(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
+        // 管理分类子菜单(2026-09-08):展开即见当前分类(点击进面板就地改名),
+        // 底部"新增分类…"直接建空分类;删除用面板行内 ×。菜单做不了行内
+        // 编辑/×按钮,承载面板见 cats_panel.rs。
+        let table = model::category_table();
+        let cats = unsafe { CreatePopupMenu().unwrap_or_default() };
+        let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
+        for (i, c) in table.iter().take(shown).enumerate() {
+            let label = if c.name == model::FALLBACK_CATEGORY {
+                format!("{}(兜底)", c.name)
+            } else {
+                c.name.clone()
+            };
+            shell::append_menu(cats, MENU_CATS_BASE + i as u32, &label);
+        }
+        shell::append_separator(cats);
+        shell::append_menu(cats, MENU_CATS_ADD, "新增分类…");
+        shell::append_submenu(menu, "管理分类", cats);
     } else {
         shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     }
@@ -4839,6 +4859,12 @@ fn dispatch_tray_command(id: u32) {
         MENU_RENDER_TRANSPARENT => set_render_mode("transparent"),
         MENU_RENDER_PRECISE => set_render_mode("precise"),
         MENU_AUTO_CATEGORY => toggle_auto_category(),
+        MENU_CATS_ADD => crate::cats_panel::open_panel(None, true),
+        id if (MENU_CATS_BASE..MENU_CATS_ADD).contains(&id) => {
+            // 点击分类名:打开面板并把该行置为编辑焦点(超出表长视为陈旧菜单)
+            let idx = (id - MENU_CATS_BASE) as usize;
+            crate::cats_panel::open_panel(Some(idx), false);
+        }
         MENU_TOGGLE_CHROME => {
             let on = !chrome_always_on();
             set_show_chrome_stored(on);
@@ -4944,6 +4970,153 @@ fn toggle_auto_category() {
     rebuild_pins();
     settle_preserve_positions();
     refresh_all_fences();
+}
+
+/// 分类改名(管理面板回调):同步分类表(缓存+落盘)、栅栏(category+title)、
+/// 文件归属。重名/空名拒绝;不改布局几何,仅全量重渲染。
+pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
+    let new = new.trim();
+    if new.is_empty() || new == old {
+        return false;
+    }
+    if model::category_table().iter().any(|c| c.name == new) {
+        log(&format!("category rename rejected, '{new}' already exists"));
+        return false;
+    }
+    let mut table = model::category_table();
+    for c in table.iter_mut() {
+        if c.name == old {
+            c.name = new.to_string();
+        }
+    }
+    model::set_category_table(table.clone());
+    update_stored_settings(|s| s.categories = table);
+    {
+        let mut s = state().lock().unwrap();
+        for f in s.files.iter_mut() {
+            if f.category == old {
+                f.category = new.to_string();
+            }
+        }
+        for f in s.fences.iter_mut() {
+            if f.category == old {
+                f.category = new.to_string();
+                f.title = new.to_string();
+            }
+        }
+        let cfg = s.fences.clone();
+        let _ = model::save_config(&cfg);
+    }
+    rebuild_pins();
+    refresh_all_fences();
+    log(&format!("category renamed '{old}' -> '{new}'"));
+    true
+}
+
+/// 分类删除(管理面板回调,兜底"其他"不可删):分类移出表(之后缺类补建
+/// 不再迭代=不复活),其文件全部重归兜底"其他"——不变式:任何文件不隐身。
+/// 栅栏走 delete_fence_ex(含撤销点/窗口销毁/行补洞);兜底栅栏若缺则补建
+/// (先清其历史墓碑,防止重归文件无栏可归)。
+pub(crate) fn apply_category_delete(name: &str) -> bool {
+    if name == model::FALLBACK_CATEGORY {
+        log("category delete rejected: fallback is not deletable");
+        return false;
+    }
+    let fid = state()
+        .lock()
+        .unwrap()
+        .fences
+        .iter()
+        .find(|f| f.category == name)
+        .map(|f| f.id);
+    if let Some(id) = fid {
+        // 不记墓碑:分类已从表删除,墓碑无意义;面板"新增"同名时也会清墓碑
+        delete_fence_ex(id, false);
+    }
+    {
+        let mut s = state().lock().unwrap();
+        for f in s.files.iter_mut() {
+            if f.category == name {
+                f.category = model::FALLBACK_CATEGORY.to_string();
+            }
+        }
+    }
+    let mut table = model::category_table();
+    table.retain(|c| c.name != name);
+    model::set_category_table(table.clone());
+    update_stored_settings(|s| s.categories = table);
+    clear_category_tombstone(model::FALLBACK_CATEGORY);
+    {
+        let mut s = state().lock().unwrap();
+        let new_cats = ensure_missing_category_fences(&mut s);
+        if !new_cats.is_empty() {
+            settle_preserve_positions();
+        }
+        let cfg = s.fences.clone();
+        let _ = model::save_config(&cfg);
+    }
+    rebuild_pins();
+    refresh_all_fences();
+    log(&format!("category deleted '{name}', members refiled to {}", model::FALLBACK_CATEGORY));
+    true
+}
+
+/// 分类新增(管理面板回调):空扩展名+非目录类,不吸走任何现有文件;
+/// 同名自动加序号;建同名栅栏(清历史墓碑=明确意图),文件靠拖入(pin)。
+pub(crate) fn apply_category_add(base: &str) -> Option<String> {
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let mut table = model::category_table();
+    let mut name = base.to_string();
+    let mut n = 2;
+    while table.iter().any(|c| c.name == name) {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    table.push(model::CategoryDef {
+        name: name.clone(),
+        exts: vec![],
+        dirs: false,
+    });
+    model::set_category_table(table.clone());
+    update_stored_settings(|s| s.categories = table);
+    clear_category_tombstone(&name);
+    {
+        let mut s = state().lock().unwrap();
+        let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+        let (dw, dh) = default_fence_size();
+        s.fences.push(Fence {
+            id: max_id,
+            title: name.clone(),
+            category: name.clone(),
+            pinned: Vec::new(),
+            item_order: Vec::new(),
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: dw,
+                h: dh,
+            },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: model::default_sort_mode(),
+        });
+        let rect = new_fence_rect(&s, dw, dh);
+        if let Some(f) = s.fences.iter_mut().find(|f| f.id == max_id) {
+            f.rect = rect;
+        }
+        let cfg = s.fences.clone();
+        let _ = model::save_config(&cfg);
+    }
+    rebuild_pins();
+    refresh_all_fences();
+    log(&format!("category added '{name}'"));
+    Some(name)
 }
 
 /// 切换开机自启(HKCU Run)
@@ -5822,7 +5995,7 @@ fn delete_fence(fence_id: u32) {
 
 /// tombstone=false:空栏自动移除用——不记墓碑,该类之后再来文件时缺类
 /// 补建照常重建(空栏移除≠用户拒绝该分类)。
-fn delete_fence_ex(fence_id: u32, tombstone: bool) {
+pub(crate) fn delete_fence_ex(fence_id: u32, tombstone: bool) {
     if !state()
         .lock()
         .unwrap()
