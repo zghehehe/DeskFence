@@ -118,17 +118,15 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         }
     }
     shell::append_submenu(menu, "渲染模式", render);
-    // 自动分类子菜单(2026-09-08 用户定案,与管理分类合而为一):悬停展开
-    // 即见开关+当前全部分类;点击分类名进面板就地改名,底部"新增分类…"直接
-    // 建空分类;删除用面板行内 ×。菜单做不了行内编辑/×按钮,承载面板见
-    // cats_panel.rs。
-    let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
+    // 自动分类(2026-09-08 用户定案):顶层勾选项保持原样——点击即切换,
+    // 对钩直观可见;紧随其后的"分类"子菜单只放分类清单与新增入口(点击
+    // 分类名进面板就地改名,删除用面板行内 ×,承载面板见 cats_panel.rs)。
     if auto_category() {
-        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "启用自动分类");
+        shell::append_menu_checked(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     } else {
-        shell::append_menu(auto, MENU_AUTO_CATEGORY, "启用自动分类");
+        shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
     }
-    shell::append_separator(auto);
+    let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
     let table = model::category_table();
     let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
     for (i, c) in table.iter().take(shown).enumerate() {
@@ -141,7 +139,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     }
     shell::append_separator(auto);
     shell::append_menu(auto, MENU_CATS_ADD, "新增分类…");
-    shell::append_submenu(menu, "自动分类", auto);
+    shell::append_submenu(menu, "分类", auto);
     if chrome_always_on() {
         shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
     } else {
@@ -381,7 +379,9 @@ pub(crate) fn apply_category_add(base: &str) -> Option<String> {
     {
         let mut s = state().lock().unwrap();
         let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-        let (dw, dh) = default_fence_size();
+        // 新建分类=空内容:按 2026-09-02 规则不足 5 项宽 1 列(用户 2026-09-08
+        // 重申),高固定 4 行;default_fence_size 是 2 列的通用默认,不适用
+        let (dw, dh) = default_size_for_items(0);
         s.fences.push(Fence {
             id: max_id,
             title: name.clone(),
