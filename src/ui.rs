@@ -7863,9 +7863,8 @@ fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
     areas
 }
 
-/// 拖动/缩放目标吸附：自动对齐开启时，先把目标矩形磁吸到其它栅栏的边
-/// 与屏幕边缘（保持 GAP），再吸附到网格；关闭时原样返回（纯自由拖动）。
-/// 返回 (吸附后矩形, 竖参考线坐标, 横参考线坐标)。
+/// 自动档缩放后的邻居整理：锚(被缩放栅栏)同一行右侧的成员从锚右缘
+/// 起按 GAP 依次右排,正下方同列的成员按 GAP 依次下排;越界夹回工作区。
 fn compact_neighbors_after_resize(fences: &mut [Fence], anchor_id: u32) {
     let Some(anchor) = fences.iter().find(|f| f.id == anchor_id).map(|f| f.rect) else {
         return;
@@ -8004,6 +8003,7 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
 
 /// 邻居等距吸附(上下左右对称):左右贴齐/紧邻保持 GAP,上下同理。
 /// 只在对应方向有重叠时生效,取距离最近的候选一次应用。
+/// 用于自动档自由区与自由档;网格档(棋盘模式)不调用。
 fn snap_rect_to_neighbors(nr: &mut Rect, others: &[Rect]) {
     const SNAP: f32 = 16.0;
     let mut best: Option<(f32, f32, f32)> = None; // (总距离, dx, dy)
@@ -8034,36 +8034,37 @@ fn snap_rect_to_neighbors(nr: &mut Rect, others: &[Rect]) {
     }
 }
 
-fn snap_drag(s: &UiState, fence_id: u32, nr: Rect) -> (Rect, Option<f32>, Option<f32>) {
+fn snap_drag(s: &UiState, fence_id: u32, nr: Rect) -> Rect {
     // 三档对齐的拖动吸附:
-    // 网格档 = 图标格整数倍 + 靠近邻居磁吸到固定间距;
+    // 网格档 = 只吸附图标格整数倍(棋盘模式,不磁吸邻居,2026-09-08);
     // 自由档 = 完全跟手,仅靠近邻居时磁吸到固定间距;
     // 自动档 = 不吸附(链式对齐实时保证间距)。
     if auto_align_on() {
-        return (nr, None, None);
+        return nr;
     }
-    let others: Vec<Rect> = s
-        .fences
-        .iter()
-        .filter(|f| f.id != fence_id)
-        .map(|f| f.rect)
-        .collect();
     let mut x = nr.x;
     let mut y = nr.y;
     if grid_align_on() {
         let (vx, vy, _, _) = work_area_for_rect(&nr);
         x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
         y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
+    } else {
+        // 靠近邻居 -> 磁吸到恰好 GAP 间距(优先于网格格点;仅自由档)
+        let others: Vec<Rect> = s
+            .fences
+            .iter()
+            .filter(|f| f.id != fence_id)
+            .map(|f| f.rect)
+            .collect();
+        let probe = Rect { x, y, ..nr };
+        let ((sx, sy), snapped) =
+            model::snap_gap_to_neighbors(&probe, &others, model::SNAP_THRESHOLD * 1.5);
+        if snapped {
+            x = sx;
+            y = sy;
+        }
     }
-    // 靠近邻居 -> 磁吸到恰好 GAP 间距(优先于网格格点;x/y 双轴,2026-09-07 P2)
-    let probe = Rect { x, y, ..nr };
-    let ((sx, sy), snapped) =
-        model::snap_gap_to_neighbors(&probe, &others, model::SNAP_THRESHOLD * 1.5);
-    if snapped {
-        x = sx;
-        y = sy;
-    }
-    (Rect { x, y, ..nr }, None, None)
+    Rect { x, y, ..nr }
 }
 
 /// 虚拟桌面(所有显示器的包围盒,屏幕坐标)
@@ -8501,30 +8502,32 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         w: drag.start_rect.w,
                         h: drag.start_rect.h,
                     };
-                    // 自由/网格档保留原吸附手感;自动/网格档同时启用插入线
+                    // 网格档=只对齐最近格线(不吸附栅栏,2026-09-08 棋盘模式);
+                    // 自由档=跟手+靠近邻居磁吸;自动档=原始跟手(插入线接管)
                     if !auto_align_on() {
-                        let others: Vec<Rect> = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| f.id != fence_id)
-                            .map(|f| f.rect)
-                            .collect();
                         let mut x = nr.x;
                         let mut y = nr.y;
                         if grid_align_on() {
                             let (vx, vy, _, _) = work_area_for_rect(&nr);
                             x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
                             y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
-                        }
-                        let probe = Rect { x, y, ..nr };
-                        let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
-                            &probe,
-                            &others,
-                            model::SNAP_THRESHOLD * 1.5,
-                        );
-                        if snapped {
-                            x = sx;
-                            y = sy;
+                        } else {
+                            let others: Vec<Rect> = drag
+                                .start_layout
+                                .iter()
+                                .filter(|f| f.id != fence_id)
+                                .map(|f| f.rect)
+                                .collect();
+                            let probe = Rect { x, y, ..nr };
+                            let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
+                                &probe,
+                                &others,
+                                model::SNAP_THRESHOLD * 1.5,
+                            );
+                            if snapped {
+                                x = sx;
+                                y = sy;
+                            }
                         }
                         nr = Rect { x, y, ..nr };
                     }
@@ -8532,7 +8535,8 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     let mut tmp = [nr];
                     model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
                     nr = tmp[0];
-                    let chain = auto_align_on() || grid_align_on();
+                    // 插入线/行槽落位=自动档专属(网格档棋盘化,2026-09-08)
+                    let chain = auto_align_on();
                     let insert = if chain {
                         fence_insertion_plan(&drag, cx, cy)
                     } else {
@@ -8552,14 +8556,15 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     if vy + vh - (nr.y + nr.h) < EDGE {
                         nr.y = vy + vh - nr.h;
                     }
-                    // 无插入线:只做 ≤16px 的轻磁吸贴齐,不做抗重叠推挤。
+                    // 无插入线:只做 ≤16px 的轻磁吸贴齐,不做抗重叠推挤;
+                    // 网格档(棋盘模式)连轻磁吸也不做——格线是唯一对齐。
                     // (2026-09-08 修"向左拖吃力":P1 归一后布局恰为 GAP 紧排,
                     // 原位动 1px 就与邻居构成 GAP 冲突,预览被 avoid_overlap
                     // 按在原位不跟手;右向因槽位模型把自身按下位计入统计,
                     // 线立即出现走原始跟手,才显得"向右自然"。被拖者已提升
                     // 到兄弟之上,预览覆盖邻居无碍;解重叠由松手落位+settle
                     // 负责。)
-                    if insert.is_none() {
+                    if insert.is_none() && !grid_align_on() {
                         let others: Vec<Rect> = drag
                             .start_layout
                             .iter()
@@ -8656,7 +8661,7 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         cx - drag.start_sx,
                         cy - drag.start_sy,
                     );
-                    let (nr, gx, gy) = snap_drag(&s, fence_id, nr);
+                    let nr = snap_drag(&s, fence_id, nr);
                     let (vx, vy, vw, vh) = work_area_for_rect(&nr);
                     let mut tmp = [nr];
                     model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
@@ -8667,12 +8672,12 @@ fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                     if unchanged {
                         drop(s);
-                        update_guides(gx, gy);
+                        update_guides(None, None);
                         return;
                     }
                     drop(s);
                     refresh_fence(fence_id);
-                    update_guides(gx, gy);
+                    update_guides(None, None);
                     return;
                 }
                 DragMode::ScrollThumb { grab } => {
@@ -9535,7 +9540,9 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     let moved = (cx - drag.start_sx) * (cx - drag.start_sx)
                         + (cy - drag.start_sy) * (cy - drag.start_sy)
                         > 64.0;
-                    let plan = if moved && (auto_align_on() || grid_align_on()) {
+                    // 插入线/行槽落位=自动档专属;网格档(棋盘模式)松手按
+                    // 网格取整自由放置(走下面 else 分支)
+                    let plan = if moved && auto_align_on() {
                         match fence_insertion_plan(&drag, cx, cy) {
                             Some(p) => Some(p),
                             // 松手瞬间滑出容差但线还亮着:沿用最后一次方案,
@@ -9577,29 +9584,31 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             w: drag.start_rect.w,
                             h: drag.start_rect.h,
                         };
+                        // 网格档=只对齐最近格线;自由档=跟手+邻居磁吸(同预览)
                         if !auto_align_on() {
-                            let others: Vec<Rect> = drag
-                                .start_layout
-                                .iter()
-                                .filter(|f| f.id != fence_id)
-                                .map(|f| f.rect)
-                                .collect();
                             let mut x = nr.x;
                             let mut y = nr.y;
                             if grid_align_on() {
                                 let (vx, vy, _, _) = work_area_for_rect(&nr);
                                 x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
                                 y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
-                            }
-                            let probe = Rect { x, y, ..nr };
-                            let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
-                                &probe,
-                                &others,
-                                model::SNAP_THRESHOLD * 1.5,
-                            );
-                            if snapped {
-                                x = sx;
-                                y = sy;
+                            } else {
+                                let others: Vec<Rect> = drag
+                                    .start_layout
+                                    .iter()
+                                    .filter(|f| f.id != fence_id)
+                                    .map(|f| f.rect)
+                                    .collect();
+                                let probe = Rect { x, y, ..nr };
+                                let ((sx, sy), snapped) = model::snap_gap_to_neighbors(
+                                    &probe,
+                                    &others,
+                                    model::SNAP_THRESHOLD * 1.5,
+                                );
+                                if snapped {
+                                    x = sx;
+                                    y = sy;
+                                }
                             }
                             nr = Rect { x, y, ..nr };
                         }
@@ -9626,7 +9635,11 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             .filter(|f| f.id != fence_id && !f.hidden)
                             .map(|f| f.rect)
                             .collect();
-                        snap_rect_to_neighbors(&mut fr, &others);
+                        // 网格档(棋盘模式)不吸附栅栏,格线是唯一对齐;轻磁吸
+                        // 只属于自动档自由区/自由档
+                        if !grid_align_on() {
+                            snap_rect_to_neighbors(&mut fr, &others);
+                        }
                         fr = model::avoid_overlap(&fr, &others, vx, vy, vw, vh);
                         if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
                             f.rect = fr;
@@ -9643,7 +9656,7 @@ fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     }
                     let chars: Vec<char> = edges.iter().filter(|c| **c != '\0').copied().collect();
                     let nr0 = model::apply_resize(&drag.start_rect, &chars, dx, dy);
-                    let (nr0, _, _) = snap_drag(&s, fence_id, nr0);
+                    let nr0 = snap_drag(&s, fence_id, nr0);
                     let w_inv = chars.contains(&'w');
                     let n_inv = chars.contains(&'n');
                     // Snap the final content area to the icon-cell grid so the
