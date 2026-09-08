@@ -42,6 +42,7 @@ const MENU_TOGGLE_CHROME: u32 = 0x511A;
 const MENU_CATS_BASE: u32 = 0x5120;
 const MENU_CATS_ADD: u32 = 0x5130;
 const MENU_CHECK_UPDATE: u32 = 0x5131;
+const MENU_MODE_CUSTOM: u32 = 0x5133;
 
 pub(crate) fn show_tray_menu(x: i32, y: i32) {
     let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
@@ -118,12 +119,23 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         }
     }
     shell::append_submenu(menu, "渲染模式", render);
-    // 自动分类(2026-09-08 用户定案):与"渲染模式"同款单一入口——父项
-    // 对钩显示当前开关状态+右侧箭头,悬停展开即见当前全部分类;点击分类名
-    // 进面板就地改名,底部"新增分类…"直接建空分类;删除用面板行内 ×
-    // (承载面板见 cats_panel.rs)。注:Win32 子菜单父项点击只能展开,
-    // 对钩为状态显示;开关切换仍以 settings.json 为准。
+    // 自动分类(2026-09-08 用户定案):与"渲染模式"同款单一入口。子菜单
+    // 首段=模式二选一(与精确/透明同款交互,点击即切换生效);分隔线之下
+    // 类别清单归自动模式——点击分类名进面板就地改名,底部"新增分类…"直接
+    // 建空分类;删除用面板行内 ×(承载面板见 cats_panel.rs)。父项对钩
+    // 显示当前是否自动模式。
     let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
+    if auto_category() {
+        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+    } else {
+        shell::append_menu(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+    }
+    if auto_category() {
+        shell::append_menu(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
+    } else {
+        shell::append_menu_checked(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
+    }
+    shell::append_separator(auto);
     let table = model::category_table();
     let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
     for (i, c) in table.iter().take(shown).enumerate() {
@@ -194,7 +206,8 @@ fn dispatch_tray_command(id: u32) {
         MENU_ALIGN_FREE => set_align_mode("free"),
         MENU_RENDER_TRANSPARENT => set_render_mode("transparent"),
         MENU_RENDER_PRECISE => set_render_mode("precise"),
-        MENU_AUTO_CATEGORY => toggle_auto_category(),
+        MENU_AUTO_CATEGORY => set_category_mode(true),
+        MENU_MODE_CUSTOM => set_category_mode(false),
         MENU_CATS_ADD => crate::cats_panel::open_panel(None, true),
         id if (MENU_CATS_BASE..MENU_CATS_ADD).contains(&id) => {
             // 点击分类名:打开面板并把该行置为编辑焦点(超出表长视为陈旧菜单)
@@ -222,10 +235,13 @@ pub(crate) fn set_render_mode(mode: &str) {
     log(&format!("render_mode={mode}"));
 }
 
-/// 切换自动分类:开=固定8类自动归类;关=自定义分类(新建栅栏自由命名,
-/// 文件拖进哪个栅栏就属于它,未分配的集中在"未分类"栅栏)
-fn toggle_auto_category() {
-    let v = !auto_category();
+/// 设定分类模式:开=自动归类(按类型);关=自定义分类(新建栅栏自由命名,
+/// 文件拖进哪个栅栏就属于它,未分配的集中在"未分类"栅栏)。幂等:模式
+/// 已是目标值时不做任何事(菜单二选一可能点当前项)。
+fn set_category_mode(v: bool) {
+    if auto_category() == v {
+        return;
+    }
     set_auto_category_stored(v);
     log(&format!("auto_category={v}"));
     if !v {
