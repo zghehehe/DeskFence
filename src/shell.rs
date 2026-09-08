@@ -852,6 +852,20 @@ pub fn append_separator(menu: HMENU) {
     }
 }
 
+/// 追加一个带勾选标记的弹出式子菜单父项(对钩显示状态+右侧箭头,
+/// 如"✓ 自动分类 ▸"):父项点击只能展开子菜单,不承载命令(Win32 语义)
+pub fn append_submenu_checked(menu: HMENU, text: &str, submenu: HMENU) {
+    let w = wide(text);
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP | MF_CHECKED,
+            submenu.0 as usize,
+            PCWSTR::from_raw(w.as_ptr()),
+        );
+    }
+}
+
 /// 追加一个弹出式子菜单(如"排序 ▸")
 pub fn append_submenu(menu: HMENU, text: &str, submenu: HMENU) {
     let w = wide(text);

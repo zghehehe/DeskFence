@@ -118,14 +118,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         }
     }
     shell::append_submenu(menu, "渲染模式", render);
-    // 自动分类(2026-09-08 用户定案):顶层勾选项保持原样——点击即切换,
-    // 对钩直观可见;紧随其后的"分类"子菜单只放分类清单与新增入口(点击
-    // 分类名进面板就地改名,删除用面板行内 ×,承载面板见 cats_panel.rs)。
-    if auto_category() {
-        shell::append_menu_checked(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
-    } else {
-        shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
-    }
+    // 自动分类(2026-09-08 用户定案):与"渲染模式"同款单一入口——父项
+    // 对钩显示当前开关状态+右侧箭头,悬停展开即见当前全部分类;点击分类名
+    // 进面板就地改名,底部"新增分类…"直接建空分类;删除用面板行内 ×
+    // (承载面板见 cats_panel.rs)。注:Win32 子菜单父项点击只能展开,
+    // 对钩为状态显示;开关切换仍以 settings.json 为准。
     let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
     let table = model::category_table();
     let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
@@ -139,7 +136,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     }
     shell::append_separator(auto);
     shell::append_menu(auto, MENU_CATS_ADD, "新增分类…");
-    shell::append_submenu(menu, "分类", auto);
+    if auto_category() {
+        shell::append_submenu_checked(menu, "自动分类", auto);
+    } else {
+        shell::append_submenu(menu, "自动分类", auto);
+    }
     if chrome_always_on() {
         shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
     } else {
