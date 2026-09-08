@@ -1924,6 +1924,13 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             if let DragMode::Icon(_) = drag.mode {
                 let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
                 let moved = (dx * dx + dy * dy) > 64.0;
+                if moved || drag.dragged_out {
+                    // 拖动过=非打开意图:取消 DBLCLK 登记的待打开(2026-09-09
+                    // 用户实测"图标移动后还打开文件"——第二次点击判成双击
+                    // 登记待打开后按住拖动再松手,UP 出口的无条件执行会误开;
+                    // 9/7 重构(1d007b4"UP 出口无条件执行")留下的洞)
+                    *pending_open().lock().unwrap() = None;
+                }
                 let slow_rename = now_ms as i64 - prev_up_ms > unsafe { GetDoubleClickTime() } as i64;
                 if drag.icon_was_selected
                     && !ctrl
