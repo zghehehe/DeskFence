@@ -609,7 +609,7 @@ unsafe extern "system" fn file_rename_edit_proc(
             adjust_rename_edit_height(hwnd);
             return r;
         }
-        WM_TIMER if wparam.0 as usize == RENAME_FIT_TIMER => {
+        WM_TIMER if wparam.0 == RENAME_FIT_TIMER => {
             // 120ms 兜底:任何来源(IME/粘贴/程序性)的文本变化都收敛
             adjust_rename_edit_height(hwnd);
             return LRESULT(0);

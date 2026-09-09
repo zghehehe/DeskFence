@@ -1740,7 +1740,7 @@ static PENDING_POS: Mutex<Option<(f32, f32)>> = Mutex::new(None);
 pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     let now_ms = resize_now_ms();
     // 交换出"上一次图标 UP"的时间:本 UP 与它的间隔=双击/慢击判定依据
-    let prev_up_ms = last_icon_up_ms().swap(now_ms as u64, Ordering::Relaxed) as i64;
+    let prev_up_ms = last_icon_up_ms().swap(now_ms, Ordering::Relaxed) as i64;
     let mut s = match state().try_lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -2417,7 +2417,7 @@ pub(crate) fn handle_setcursor(hwnd: HWND, fence_id: u32) {
         _ => 32512,
     };
     unsafe {
-        if let Ok(hc) = LoadCursorW(None, PCWSTR::from_raw(cid as usize as *const u16)) {
+        if let Ok(hc) = LoadCursorW(None, PCWSTR::from_raw(cid as *const u16)) {
             SetCursor(hc);
         }
     }

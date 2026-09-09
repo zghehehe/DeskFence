@@ -551,7 +551,7 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
     let raw = sfi2.iIcon as u32;
     let image_index = (raw & 0x00FF_FFFF) as i32;
     let overlay_index = (raw >> 24) & 0xFF;
-    let draw_flags = ILD_TRANSPARENT.0 as u32 | (overlay_index << 8); // INDEXTOOVERLAYMASK
+    let draw_flags = ILD_TRANSPARENT.0 | (overlay_index << 8); // INDEXTOOVERLAYMASK
     const KINDS: [u32; 4] = [
         windows::Win32::UI::Shell::SHIL_LARGE,
         windows::Win32::UI::Shell::SHIL_EXTRALARGE,
@@ -589,7 +589,7 @@ pub fn icon_dump(path: &str, prefix: &str) {
 
     fn save_dump(stem: &str, bgra: &[u8], w: u32, h: u32) {
         use std::io::Write;
-        let data = (w * h * 4) as u32;
+        let data = w * h * 4;
         if let Ok(mut f) = std::fs::File::create(format!("{stem}.bmp")) {
             let _ = f.write_all(&[0x42u8, 0x4D]);
             let _ = f.write_all(&(14u32 + 40 + data).to_le_bytes());
@@ -695,14 +695,14 @@ pub fn icon_dump(path: &str, prefix: &str) {
             if cx.max(cy) as u32 != px {
                 continue; // 只 dump 与桌面图标同档位的结果
             }
-            let flags_overlay = ILD_TRANSPARENT.0 as u32 | (overlay << 8);
+            let flags_overlay = ILD_TRANSPARENT.0 | (overlay << 8);
             if let Ok(icon2) = list.GetIcon(image_index, flags_overlay) {
                 if let Some(b) = crate::render::icon_pixels(icon2, px) {
                     save_dump(&format!("{prefix}_v2_imglist_ovl"), &b, px, px);
                 }
                 let _ = DestroyIcon(icon2);
             }
-            if let Ok(icon3) = list.GetIcon(image_index, ILD_TRANSPARENT.0 as u32) {
+            if let Ok(icon3) = list.GetIcon(image_index, ILD_TRANSPARENT.0) {
                 if let Some(b) = crate::render::icon_pixels(icon3, px) {
                     save_dump(&format!("{prefix}_v3_imglist_base"), &b, px, px);
                 }
@@ -769,7 +769,7 @@ pub fn open_path(path: &str) {
         // SEE_MASK_INVOKEIDLIST(0x0C = DEFAULT|INVOKEIDLIST):用默认动词激活
         info.fMask = 0x000C;
         info.lpFile = PCWSTR::from_raw(w.as_ptr());
-        info.nShow = SW_SHOWNORMAL.0 as i32;
+        info.nShow = SW_SHOWNORMAL.0;
         let _ = ShellExecuteExW(&mut info);
     }
 }
@@ -911,7 +911,7 @@ fn inject_rename_item(menu: HMENU, ctx: &IContextMenu) {
             return;
         }
         for i in 0..count {
-            let id = GetMenuItemID(menu, i as i32);
+            let id = GetMenuItemID(menu, i);
             if id == DL_ITEM_RENAME_ID {
                 return;
             }
@@ -1161,7 +1161,7 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
         info.cbSize = size_of::<CMINVOKECOMMANDINFOEX>() as u32;
         info.fMask = CMIC_MASK_UNICODE;
         info.hwnd = hwnd;
-        info.nShow = SW_SHOWNORMAL.0 as i32;
+        info.nShow = SW_SHOWNORMAL.0;
         if has_str {
             info.lpVerbW = PCWSTR::from_raw(wverb.as_ptr());
         } else {
@@ -1710,7 +1710,7 @@ pub fn show_properties(path: &str) {
         sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
         sei.lpVerb = PCWSTR::from_raw(op.as_ptr());
         sei.lpFile = PCWSTR::from_raw(w.as_ptr());
-        sei.nShow = SW_SHOWNORMAL.0 as i32;
+        sei.nShow = SW_SHOWNORMAL.0;
         let _ = ShellExecuteExW(&mut sei);
     }
 }

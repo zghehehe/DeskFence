@@ -3559,11 +3559,11 @@ unsafe extern "system" fn tray_wndproc(
             show_all_fences();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_GLOBAL as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_GLOBAL {
             global_tick();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_DESKTOP_WATCH as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_DESKTOP_WATCH {
             // 桌面态快速自检:三指手势的窗口扫动不发任何 WinEvent(两轮
             // 实测零触发),恢复过渡只能靠 250ms 轮询兜住;band_quiet 由
             // 1s 走查维护,正常使用时这里什么都不做。
@@ -3572,19 +3572,19 @@ unsafe extern "system" fn tray_wndproc(
             }
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_ANIMATION as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_ANIMATION {
             tick_arrival_animations();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_CATCHUP as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_CATCHUP {
             wallpaper_catchup_tick(hwnd);
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_FOLLOW as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_FOLLOW {
             wallpaper_follow_tick(hwnd);
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_RENAME_WATCH as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_RENAME_WATCH {
             finish_rename_if_clicked_outside();
             let any_edit = state()
                 .lock()
