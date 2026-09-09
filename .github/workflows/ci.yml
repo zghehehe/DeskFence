@@ -17,3 +17,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      # clippy 先报告不阻断:现存 73 条风格类警告分批清零后,改为
+      # `cargo clippy --locked -- -D warnings` 严格门禁(2026-09-09)
+      - name: Clippy (report-only)
+        continue-on-error: true
+        run: cargo clippy --locked 2>&1 | tee clippy-report.txt
