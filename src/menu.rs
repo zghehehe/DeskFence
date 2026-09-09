@@ -164,7 +164,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     // z 序守卫不设菜单入口(2026-09-08 用户要求):降级开关走 settings.json
     // 的 z_guard 字段,默认开=实测验证过的正确状态。
     // 检查更新:浏览器打开 GitHub Releases 页(应用进程零联网)
-    shell::append_menu(menu, MENU_CHECK_UPDATE, "检查更新(打开发布页)");
+    shell::append_menu(
+        menu,
+        MENU_CHECK_UPDATE,
+        &format!("检查更新 v{}", env!("CARGO_PKG_VERSION")),
+    );
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
     if shell::get_autostart() {
@@ -238,9 +242,9 @@ pub(crate) fn set_render_mode(mode: &str) {
     log(&format!("render_mode={mode}"));
 }
 
-/// 设定分类模式:开=自动归类(按类型);关=自定义分类(新建栅栏自由命名,
-/// 文件拖进哪个栅栏就属于它,未分配的集中在"未分类"栅栏)。幂等:模式
-/// 已是目标值时不做任何事(菜单二选一可能点当前项)。
+/// 设定分类模式:开=自动归类(按类型);关=自定义分类(文件只进被拖入的
+/// 栅栏,未归位文件由 display_list 收进兜底"其他"或旧未分类栅栏)。幂等:
+/// 模式已是目标值时不做任何事(菜单二选一可能点当前项)。
 fn set_category_mode(v: bool) {
     if auto_category() == v {
         return;

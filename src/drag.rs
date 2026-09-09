@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -1734,6 +1734,9 @@ pub(crate) fn release_on_recycle_bin_screen(s: &UiState, sx: f32, sy: f32, sourc
     false
 }
 
+/// DBLCLK 登记待打开时的光标位(UP 出口位移判定用,见 handle_lbuttonup 出口)
+static PENDING_POS: Mutex<Option<(f32, f32)>> = Mutex::new(None);
+
 pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     let now_ms = resize_now_ms();
     // 交换出"上一次图标 UP"的时间:本 UP 与它的间隔=双击/慢击判定依据
@@ -2224,6 +2227,17 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     // 拖拽块内,快速双击的打开永远不会发生,直到后续点击才补开(用户实测
     // "打不开/很久才有反应")。打开走工作线程:ShellExecute 启动播放器
     // 会被安全软件扫描,同步执行会挂住 UI 线程(用户实测"卡死")。
+    // 出口执行前先做位移判定:登记时光标位与当前光标差超 8px=登记后
+    // 拖动过=移动意图,取消打开(不改判快/慢,只否决"拖动后误开")
+    if let Some((px, py)) = *PENDING_POS.lock().unwrap() {
+        let (cx, cy) = screen_cursor();
+        if (cx - px) * (cx - px) + (cy - py) * (cy - py) > 64.0 {
+            PENDING_POS.lock().unwrap().take();
+            pending_open().lock().unwrap().take();
+            return;
+        }
+    }
+    PENDING_POS.lock().unwrap().take();
     if let Some(p) = pending_open().lock().unwrap().take() {
         std::thread::spawn(move || open_item(&p));
     }
@@ -2251,7 +2265,11 @@ pub(crate) fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
             let p = it.path.clone();
             drop(s);
             // 延迟执行:是否真打开由随后的 UP 判定(快双击=执行打开;
-            // 慢双击=取消打开进入改名)。见 pending_open 注释。
+            // 慢双击=取消打开进入改名)。见 pending_open 注释。登记时光标
+            // 位一并记录:UP 时位移超阈值=登记后按住拖动过=移动意图,取消
+            // (2026-09-09 重写:按 drag 状态判定的旧取消不可达——DBLCLK
+            // 取代第二次 DOWN,末次 UP 无 drag 状态,审查项 E1)
+            *PENDING_POS.lock().unwrap() = Some(screen_cursor());
             *pending_open().lock().unwrap() = Some(p);
             return;
         }

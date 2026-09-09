@@ -159,22 +159,13 @@ pub(crate) fn set_desktop_state_stored(mode: &str) {
     update_stored_settings(|s| s.desktop_state = mode.to_string());
 }
 
-/// 自动分类开关:默认 true=按固定 8 类自动归类;false=自定义分类模式
-/// (不按扩展名,文件只进被拖入的栅栏,未分配的进"未分类"栅栏)
-static AUTO_CATEGORY: Mutex<Option<bool>> = Mutex::new(None);
+/// 自动分类开关(2026-09-09 起单一真相=model 的线程局部缓存,boot 预热;
+/// false=自定义分类模式:文件只进被拖入的栅栏,未归位文件进兜底"其他")
 pub fn auto_category() -> bool {
-    let mut g = AUTO_CATEGORY.lock().unwrap();
-    if let Some(v) = *g {
-        return v;
-    }
-    let v = model::load_settings().auto_category;
-    model::set_auto_category(v);
-    *g = Some(v);
-    v
+    model::auto_category()
 }
 pub(crate) fn set_auto_category_stored(v: bool) {
     model::set_auto_category(v);
-    *AUTO_CATEGORY.lock().unwrap() = Some(v);
     update_stored_settings(|s| s.auto_category = v);
 }
 
@@ -2036,7 +2027,10 @@ pub fn rescan() {
         // 缓存键还包含像素尺寸，因此扫描时统一失效可避免保留陈旧图标。
         let keep: std::collections::HashSet<String> =
             s.files.iter().map(|f| f.path.clone()).collect();
-        s.icon_cache.clear();
+        // 只清已消失文件的图标缓存(2026-09-09:原实现全清,桌面一有变化
+        // 全部图标重新 SHGFI 提取=可感知的卡顿)
+        s.icon_cache
+            .retain(|k, _| k.split(' ').next().map(|p| keep.contains(p)).unwrap_or(false));
         // 已删文件的常用记录同步剔除(2026-09-03):usage.json 残留旧路径时,
         // 同名新建会继承旧次数直接顶到"常用"第一位(用户实测)
         let pruned = model::prune_usage(&keep);
@@ -2550,7 +2544,7 @@ pub fn startup() {
     };
     model::load_usage();
     {
-        let _ = auto_category(); // 预热开关(读设置文件)
+        model::set_auto_category(model::load_settings().auto_category); // 预热:开关单一真相
         SHOW_CHROME.store(model::load_settings().show_chrome, Ordering::Relaxed);
     }
     // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载

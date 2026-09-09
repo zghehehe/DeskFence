@@ -1394,9 +1394,9 @@ pub struct Settings {
     /// transparent(渲染模式菜单里能看到当前实际档位)。
     #[serde(default = "default_render_mode")]
     pub render_mode: String,
-    /// 自动分类:true=按固定 8 类(软件/文件夹/文档/图片/媒体/代码/压缩包/其他)
-    /// 自动归类(默认);false=自定义分类模式,不按扩展名归类,文件只进被拖入
-    /// 的栅栏,未分配的文件集中显示在"未分类"栅栏。
+    /// 自动分类:true=按分类表(默认 8 类)按类型自动归类(默认);false=
+    /// 自定义分类模式,文件只进被拖入的栅栏,未归位文件进兜底"其他"(或
+    /// 旧配置里尚存的"未分类"栅栏)。
     #[serde(default = "default_auto_category")]
     pub auto_category: bool,
     /// 桌面状态(2026-08-27 起持久化):"normal"=栅栏显示(默认) /
