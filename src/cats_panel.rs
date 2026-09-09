@@ -33,8 +33,12 @@ const ID_ADD: isize = 0x2FF;
 
 struct Row {
     edit: HWND,
-    del: HWND, // 兜底行为 HWND(0)
+    exts_edit: HWND, // 规则(扩展名清单,空格分隔)
+    del: HWND,       // 兜底行为 HWND(0)
     name: String,
+    exts: String,
+    locked_name: bool, // 兜底行名称只读
+    locked_exts: bool, // 兜底/目录行规则只读
 }
 struct Panel {
     rows: Vec<Row>,
@@ -143,7 +147,9 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 scale,
             });
             for c in model::category_table() {
-                append_row(hwnd, &mut panel, &c.name, c.name == model::FALLBACK_CATEGORY);
+                let locked_name = c.name == model::FALLBACK_CATEGORY;
+                let exts_text = if c.dirs { "(目录)".to_string() } else { c.exts.join(" ") };
+                append_row(hwnd, &mut panel, &c.name, &exts_text, locked_name, locked_name || c.dirs);
             }
             panel.add_btn = create_add_button(hwnd, &panel);
             layout_all(hwnd, &panel);
@@ -159,12 +165,14 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     // 失焦即提交(点击 × 前也会先失焦,顺序天然正确)
                     if let Some(i) = panel.rows.iter().position(|r| r.edit == src) {
                         commit_row(panel, i);
+                    } else if let Some(i) = panel.rows.iter().position(|r| r.exts_edit == src) {
+                        commit_exts(panel, i);
                     }
                 } else if code == BN_CLICKED {
                     if id == ID_ADD {
                         do_add(hwnd, panel);
-                    } else if id >= 0x101 && (id & 1) == 1 {
-                        let i = ((id - 0x101) / 2) as usize;
+                    } else if id >= 0x102 && (id - 0x102) % 3 == 0 {
+                        let i = ((id - 0x102) / 3) as usize;
                         if i < panel.rows.len() {
                             do_delete(panel, i);
                         }
@@ -185,6 +193,8 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 let focused = unsafe { GetFocus() };
                 if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
                     commit_row(panel, i);
+                } else if let Some(i) = panel.rows.iter().position(|r| r.exts_edit == focused) {
+                    commit_exts(panel, i);
                 }
             }
             unsafe {
@@ -218,25 +228,26 @@ unsafe fn panel_of(hwnd: HWND) -> Option<&'static mut Panel> {
     }
 }
 
-fn append_row(parent: HWND, panel: &mut Panel, name: &str, fallback: bool) {
+fn append_row(parent: HWND, panel: &mut Panel, name: &str, exts_text: &str, locked_name: bool, locked_exts: bool) {
     let i = panel.rows.len();
     let s = panel.scale;
     let row_h = row_h(s);
     let pad = pad(s);
     let del_w = del_w(s);
+    let name_w = name_w(s);
     let w = panel_w(s);
     let y = pad as i32 + (i as f32 * (row_h + row_gap(s))) as i32;
     let cls_edit = shell::wide("EDIT");
-    let name_w = shell::wide(name);
+    let name_t = shell::wide(name);
     let edit = unsafe {
         CreateWindowExW(
             WS_EX_CLIENTEDGE,
             PCWSTR::from_raw(cls_edit.as_ptr()),
-            PCWSTR::from_raw(name_w.as_ptr()),
+            PCWSTR::from_raw(name_t.as_ptr()),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32),
             pad as i32,
             y,
-            (w - pad * 2.0 - del_w) as i32,
+            name_w as i32,
             row_h as i32,
             parent,
             HMENU(0),
@@ -244,11 +255,31 @@ fn append_row(parent: HWND, panel: &mut Panel, name: &str, fallback: bool) {
             None,
         )
     };
-    let del = if fallback {
+    // 规则列:扩展名清单(空格分隔),目录/兜底行为只读占位
+    let exts_x = (pad + name_w) as i32 + 4;
+    let exts_w = (w - pad * 2.0 - del_w - name_w - 8.0) as i32;
+    let exts_t = shell::wide(exts_text);
+    let exts_edit = unsafe {
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            PCWSTR::from_raw(cls_edit.as_ptr()),
+            PCWSTR::from_raw(exts_t.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_LEFT | ES_AUTOHSCROLL) as u32),
+            exts_x,
+            y,
+            exts_w,
+            row_h as i32,
+            parent,
+            HMENU(0),
+            ui::hinstance(),
+            None,
+        )
+    };
+    let del = if locked_name {
         HWND(0) // 兜底行不可删:不渲染 ×
     } else {
         let cls_btn = shell::wide("BUTTON");
-        let xt = shell::wide("×");
+        let xt = shell::wide("\u{d7}");
         unsafe {
             CreateWindowExW(
                 WS_EX_NOPARENTNOTIFY,
@@ -267,23 +298,33 @@ fn append_row(parent: HWND, panel: &mut Panel, name: &str, fallback: bool) {
         }
     };
     unsafe {
-        let _ = SendMessageW(edit, WM_SETFONT, WPARAM(panel.font.0 as usize), LPARAM(1));
+        let f = WPARAM(panel.font.0 as usize);
+        let _ = SendMessageW(edit, WM_SETFONT, f, LPARAM(1));
+        let _ = SendMessageW(exts_edit, WM_SETFONT, f, LPARAM(1));
         if del.0 != 0 {
-            let _ = SendMessageW(del, WM_SETFONT, WPARAM(panel.font.0 as usize), LPARAM(1));
+            let _ = SendMessageW(del, WM_SETFONT, f, LPARAM(1));
         }
-        if fallback {
+        if locked_name {
             let _ = SendMessageW(edit, EM_SETREADONLY, WPARAM(1), LPARAM(0));
         }
-        // 控件 ID 承载行号:edit=0x100+2i,del=0x101+2i
-        let _ = SetWindowLongPtrW(edit, GWLP_ID, 0x100 + 2 * i as isize);
+        if locked_exts {
+            let _ = SendMessageW(exts_edit, EM_SETREADONLY, WPARAM(1), LPARAM(0));
+        }
+        // 控件 ID 承载行号:name=0x100+3i,exts=0x101+3i,del=0x102+3i
+        let _ = SetWindowLongPtrW(edit, GWLP_ID, 0x100 + 3 * i as isize);
+        let _ = SetWindowLongPtrW(exts_edit, GWLP_ID, 0x101 + 3 * i as isize);
         if del.0 != 0 {
-            let _ = SetWindowLongPtrW(del, GWLP_ID, 0x101 + 2 * i as isize);
+            let _ = SetWindowLongPtrW(del, GWLP_ID, 0x102 + 3 * i as isize);
         }
     }
     panel.rows.push(Row {
         edit,
+        exts_edit,
         del,
         name: name.to_string(),
+        exts: exts_text.to_string(),
+        locked_name,
+        locked_exts,
     });
 }
 
@@ -350,9 +391,18 @@ fn layout_rows(panel: &Panel) -> i32 {
     let w = panel_w(s) as i32;
     let n = panel.rows.len();
     unsafe {
+        let name_w = name_w(s) as i32;
         for (i, r) in panel.rows.iter().enumerate() {
             let y = pad + (i as i32) * (row_h + gap);
-            let _ = MoveWindow(r.edit, pad, y, w - pad * 2 - del_w, row_h, true);
+            let _ = MoveWindow(r.edit, pad, y, name_w, row_h, true);
+            let _ = MoveWindow(
+                r.exts_edit,
+                pad + name_w + 4,
+                y,
+                w - pad * 2 - del_w - name_w - 8,
+                row_h,
+                true,
+            );
             if r.del.0 != 0 {
                 let _ = MoveWindow(r.del, w - pad - del_w, y, del_w, row_h, true);
             }
@@ -381,6 +431,7 @@ fn do_delete(panel: &mut Panel, i: usize) {
     }
     unsafe {
         let _ = DestroyWindow(panel.rows[i].edit);
+        let _ = DestroyWindow(panel.rows[i].exts_edit);
         if panel.rows[i].del.0 != 0 {
             let _ = DestroyWindow(panel.rows[i].del);
         }
@@ -396,7 +447,7 @@ fn do_add(hwnd: HWND, panel: &mut Panel) {
         commit_row(panel, i);
     }
     if let Some(name) = crate::menu::apply_category_add("新分类") {
-        append_row(hwnd, panel, &name, false);
+        append_row(hwnd, panel, &name, "", false, false);
         layout_all(hwnd, panel);
         if let Some(r) = panel.rows.last() {
             unsafe {
@@ -423,6 +474,40 @@ fn commit_row(panel: &mut Panel, i: usize) {
         return;
     }
     panel.rows[i].name = text;
+}
+
+/// 规则提交:解析(逗号/空格/分号分隔,小写去点去重)后经
+/// menu::apply_category_exts 生效;冲突/非法则回滚显示
+fn commit_exts(panel: &mut Panel, i: usize) {
+    let (text, old) = {
+        let r = &panel.rows[i];
+        (get_text(r.exts_edit), r.exts.clone())
+    };
+    if text == old {
+        return;
+    }
+    if panel.rows[i].locked_exts {
+        set_text(panel.rows[i].exts_edit, &old);
+        return;
+    }
+    let list: Vec<String> = text
+        .split([',', '，', ' ', '；', ';'])
+        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut uniq: Vec<String> = Vec::new();
+    for e in list {
+        if !uniq.contains(&e) {
+            uniq.push(e);
+        }
+    }
+    if crate::menu::apply_category_exts(&panel.rows[i].name, uniq) {
+        let joined = panel.rows[i].exts.clone();
+        panel.rows[i].exts = joined.clone();
+        set_text(panel.rows[i].exts_edit, &joined);
+    } else {
+        set_text(panel.rows[i].exts_edit, &old);
+    }
 }
 
 fn send_focus_row(hwnd: HWND, idx: usize) {
@@ -485,7 +570,10 @@ fn del_w(s: f32) -> f32 {
     (26.0 * s).round().max(22.0)
 }
 fn panel_w(s: f32) -> f32 {
-    (250.0 * s).round().max(220.0)
+    (430.0 * s).round().max(380.0)
+}
+fn name_w(s: f32) -> f32 {
+    (110.0 * s).round().max(90.0)
 }
 fn panel_size_for(scale: f32, rows: usize) -> (i32, i32) {
     let client_h =

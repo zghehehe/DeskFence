@@ -299,6 +299,57 @@ pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
     true
 }
 
+/// 分类规则(扩展名映射)编辑(管理面板回调,兜底不可改):归一小写去点
+/// 去重;与其他分类冲突(同扩展名被占用)则整体拒绝;生效后全部文件归属
+/// 即时重算,新匹配出成员的分类自动补建栅栏。
+pub(crate) fn apply_category_exts(name: &str, exts: Vec<String>) -> bool {
+    if name == model::FALLBACK_CATEGORY {
+        return false;
+    }
+    let mut clean: Vec<String> = Vec::new();
+    for e in &exts {
+        let e = e.trim().trim_start_matches('.').to_lowercase();
+        if e.is_empty() || clean.contains(&e) {
+            continue;
+        }
+        if model::category_table()
+            .iter()
+            .any(|c| c.name != name && c.exts.contains(&e))
+        {
+            log(&format!("exts rejected: '{e}' already owned by another category"));
+            return false;
+        }
+        clean.push(e);
+    }
+    let mut table = model::category_table();
+    for c in table.iter_mut() {
+        if c.name == name {
+            c.exts = clean.clone();
+        }
+    }
+    model::set_category_table(table.clone());
+    update_stored_settings(|s| s.categories = table);
+    {
+        let mut s = state().lock().unwrap();
+        for f in s.files.iter_mut() {
+            f.category = model::categorize(&f.name, f.is_dir);
+        }
+    }
+    {
+        let mut s = state().lock().unwrap();
+        let new_cats = ensure_missing_category_fences(&mut s);
+        if !new_cats.is_empty() {
+            settle_preserve_positions();
+        }
+        let cfg = s.fences.clone();
+        let _ = model::save_config(&cfg);
+    }
+    rebuild_pins();
+    refresh_all_fences();
+    log(&format!("category '{name}' exts -> {:?}", clean));
+    true
+}
+
 /// 分类删除(管理面板回调,兜底"其他"不可删):分类移出表(之后缺类补建
 /// 不再迭代=不复活),其文件全部重归兜底"其他"——不变式:任何文件不隐身。
 /// 栅栏走 delete_fence_ex(含撤销点/窗口销毁/行补洞);兜底栅栏若缺则补建
