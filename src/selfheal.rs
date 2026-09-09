@@ -326,6 +326,11 @@ fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
         || (n == 18 && cls_buf[..18] == CATS_PANEL_CLASS)
 }
 
+/// band 自愈走查(global_tick 每 tick 调用):清理已销毁窗口→缺失窗口
+/// 延迟到宿主就绪后创建→逐栅栏从宿主向上核对带位(失位按 WalkFault
+/// 签名防抖:连续 3 拍才修、沉底首拍即修、预算耗尽只记日志不动)→
+/// 健康但滞留带底 churn 区的浅位栅栏一次性晋升到解析锚点(最低可见非
+/// topmost 外来窗)之下。修复动作纯 z(SWP_NOMOVE|SWP_NOSIZE),不碰位置。
 pub(crate) fn ensure_all_attached() {
     let hosts = desktop_hosts();
     let mut created: Vec<u32> = Vec::new();
