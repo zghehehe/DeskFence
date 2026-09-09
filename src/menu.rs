@@ -167,7 +167,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     shell::append_menu(
         menu,
         MENU_CHECK_UPDATE,
-        &format!("检查更新(v{})", env!("CARGO_PKG_VERSION")),
+        &format!("检查更新 (v{})", env!("CARGO_PKG_VERSION")),
     );
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
