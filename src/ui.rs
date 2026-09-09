@@ -2043,11 +2043,22 @@ fn apply_scan(mut files: Vec<FileItem>) {
             for f in s.files.iter() {
                 if present.contains(&f.path) {
                     miss.remove(&f.path);
+                } else if shell::path_gone_from_disk(&f.path) {
+                    // 磁盘上已确认不在(shell 菜单删除/外部进程删除):当轮移除,
+                    // 不进宽恕。宽恕只保护"元数据瞬态锁导致 read_dir 漏读"——
+                    // 那种情况属性查询依然成功。没有这层,外部删除的图标只能
+                    // 等宽恕轮数收敛,表现为"明明删了,栅栏里还在"。
+                    miss.remove(&f.path);
+                    log(&format!("scan: '{}' gone from disk, removed immediately", f.path));
                 } else {
                     let c = miss.entry(f.path.clone()).or_insert(0);
+                    // 计数递增(2026-09-09 修复):此前 c 从不递增,自然消失路径
+                    // 永远到不了阈值=删掉的文件图标永久滞留(拖拽删除不受影响,
+                    // 那条路 mark_scan_removed 直接写满阈值)
                     if *c < SCAN_MISS_DROP {
                         files.push(f.clone());
                     }
+                    *c += 1;
                 }
             }
             miss.retain(|k, _| present.contains(k) || s.files.iter().any(|f| f.path == *k));

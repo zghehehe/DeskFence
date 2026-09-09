@@ -16,7 +16,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
     FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, GetFileAttributesW,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
@@ -1143,7 +1143,8 @@ fn verb_is_rename(ctx: &IContextMenu, verb_idx: u32) -> bool {
 /// 用 Unicode 扩展结构执行菜单命令(兼容 Win10+ 现代 verb 与第三方扩展菜单项)。
 /// 优先取字符串 verb(GCS_VERBW,如 "open"/"delete"),跨 shell 版本比数字偏移稳;
 /// 取不到时回退 MAKEINTRESOURCEW(verb_idx)。HRESULT 落盘便于诊断。
-fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32) {
+/// 返回实际下发的 verb 字符串(取不到时 "#idx"),供调用方识别删除类动词。
+fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32) -> String {
     unsafe {
         // 取字符串 verb
         let mut wverb = [0u16; 64];
@@ -1181,6 +1182,7 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
             format!("#{}", verb_idx)
         };
         log(&format!("invoke verb '{}' -> hr={:?}", verb_desc, hr));
+        verb_desc
     }
 }
 
@@ -1392,7 +1394,15 @@ pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
                 request_rename(path);
             } else {
                 log(&format!("invoking verb_idx={} for {:?}", verb_idx, path));
-                invoke_command(hwnd, &ctx, verb_idx, x, y);
+                let verb = invoke_command(hwnd, &ctx, verb_idx, x, y);
+                // shell 动词在应用背后改动了桌面(典型 delete:文件已被 shell
+                // 移入回收站,2026-09-09 用户实测 hr=Ok 但栅栏图标滞留不散):
+                // 主动重扫让栅栏跟上;删除类再走"主动删除"标记,扫描宽恕当轮
+                // 放行。其余动词经 rescan 的无变化早退,不会引发无谓重绘。
+                if verb.eq_ignore_ascii_case("delete") {
+                    crate::rename::mark_scan_removed(&[path.to_string()]);
+                }
+                crate::ui::rescan();
             }
         }
         free_item_pidls(pidls);
@@ -1611,6 +1621,18 @@ fn fallback_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
         F_DELETE => delete_to_recycle_bin(hwnd, path),
         F_PROPERTIES => show_properties(path),
         _ => {}
+    }
+}
+
+/// 路径在磁盘上已确认不存在(删除/移走):GetFileAttributesW 返回 INVALID。
+/// 与"read_dir 瞬态漏读"互补——文件仍在盘上时属性查询依然成功,那才是
+/// 扫描宽恕要保护的情形。
+pub fn path_gone_from_disk(path: &str) -> bool {
+    // windows 0.52 未导出 FILE_ATTRIBUTE_INVALID,失败值即 u32::MAX
+    const FILE_ATTR_INVALID: u32 = u32::MAX;
+    let w = wide(path);
+    unsafe {
+        GetFileAttributesW(PCWSTR::from_raw(w.as_ptr())) == FILE_ATTR_INVALID
     }
 }
 
