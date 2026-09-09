@@ -297,6 +297,18 @@ const MSCTFIME_CLASS: [u16; 11] = [
 const DEFAULT_IME_CLASS: [u16; 11] = [
     0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
 ]; // "Default IME"
+// 搜狗输入法 TSF 基础设施窗组(2026-09-09):与 MSCTFIME UI / Default IME
+// 同法理——每个有焦点的应用进程头上挂一组(IME/SoImeBS_TSF_UI/SoBS_UI/
+// SoBS_Hint),空闲 0x0 隐形,可见性随输入焦点毫秒级闪现;闪现瞬间被
+// band_attach_anchor 主规则当成"最低可见外来窗"锚定(实抓 0x20488),
+// 栅栏被拉到 depth 11-15 的菜单沉底块邻域,菜单关闭即沉底拉回=可见闪
+// (当日 216 次 re-anchor 实证)。零像素/瞬态不可能遮挡桌面内容,容忍。
+const SOGOU_IME_CLASS: [u16; 3] = [0x49, 0x4D, 0x45]; // "IME"
+const SOIME_TSF_CLASS: [u16; 14] = [
+    0x53, 0x6F, 0x49, 0x6D, 0x65, 0x42, 0x53, 0x5F, 0x54, 0x53, 0x46, 0x5F, 0x55, 0x49,
+]; // "SoImeBS_TSF_UI"
+const SOBS_UI_CLASS: [u16; 7] = [0x53, 0x6F, 0x42, 0x53, 0x5F, 0x55, 0x49]; // "SoBS_UI"
+const SOBS_HINT_CLASS: [u16; 9] = [0x53, 0x6F, 0x42, 0x53, 0x5F, 0x48, 0x69, 0x6E, 0x74]; // "SoBS_Hint"
 
 const CATS_PANEL_CLASS: [u16; 18] = [
     0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x43, 0x61, 0x74,
@@ -334,6 +346,10 @@ fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
         || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
         || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
         || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
+        || (n == 3 && cls_buf[..3] == SOGOU_IME_CLASS)
+        || (n == 14 && cls_buf[..14] == SOIME_TSF_CLASS)
+        || (n == 7 && cls_buf[..7] == SOBS_UI_CLASS)
+        || (n == 9 && cls_buf[..9] == SOBS_HINT_CLASS)
         // 分类管理面板(2026-09-08):自有辅助窗,可见时可压在栅栏区域上,
         // 不容忍的话面板一开=全栅栏 walk-break→3 拍后 z-chain repair
         // 整面重排=用户可见闪(run.log 17:36:48 实锤,与菜单宿主同款待遇)
