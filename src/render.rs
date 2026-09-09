@@ -1189,24 +1189,24 @@ fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h:
                 if tri.len() == 3 {
                     if let Ok(geo) = r.factory.CreatePathGeometry() {
                         if let Ok(sink) = geo.Open() {
-                            let _ = sink.BeginFigure(
+                            sink.BeginFigure(
                                 D2D_POINT_2F { x: tri[0].0, y: tri[0].1 },
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_FILLED,
                             );
-                            let _ = sink.AddLine(D2D_POINT_2F {
+                            sink.AddLine(D2D_POINT_2F {
                                 x: tri[1].0,
                                 y: tri[1].1,
                             });
-                            let _ = sink.AddLine(D2D_POINT_2F {
+                            sink.AddLine(D2D_POINT_2F {
                                 x: tri[2].0,
                                 y: tri[2].1,
                             });
-                            let _ = sink.EndFigure(
+                            sink.EndFigure(
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED,
                             );
                             let _ = sink.Close();
                             if let Some(ab) = brush(rt, &color(0.95, 0.96, 0.98, 0.95)) {
-                                let _ = rt.FillGeometry(&geo, as_brush(&ab), None);
+                                rt.FillGeometry(&geo, as_brush(&ab), None);
                             }
                         }
                     }

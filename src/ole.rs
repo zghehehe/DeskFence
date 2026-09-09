@@ -338,7 +338,7 @@ pub fn drag_out_files(paths: &[String], _on_dropped_into_fence: impl Fn(&[String
                 Ok(d) => d,
                 Err(_) => {
                     for pidl in &pidls {
-                        let _ = windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
+                        windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
                     }
                     return;
                 }
@@ -352,7 +352,7 @@ pub fn drag_out_files(paths: &[String], _on_dropped_into_fence: impl Fn(&[String
             &mut effect,
         );
         for pidl in &pidls {
-            let _ = windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
+            windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
         }
         drop(_keep);
     }
