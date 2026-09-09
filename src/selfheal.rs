@@ -5,8 +5,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    HMODULE, HWND, LPARAM, RECT, WPARAM,
+    HMODULE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 // windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
@@ -239,8 +240,9 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
             }
             if band_invisible(w, &vs) {
                 // 浅位(沉底块内)的隐形窗不作垫窗:锚它=栅栏仍进块(2026-09-09,
-                // 当日 216 次 re-anchor 锚 0x20488/0x20552 实证)。
-                if !is_topmost_window(w) && depth > CHURN_BLOCK_DEPTH {
+                // 当日 216 次 re-anchor 锚 0x20488/0x20552 实证)。sep 绝不作
+                // 锚:锚它=栅栏插到 sep 与宿主之间,隔离失败。
+                if !is_topmost_window(w) && depth > CHURN_BLOCK_DEPTH && !is_sep_window(w) {
                     best = Some(w);
                 }
                 w = unsafe { GetWindow(w, GW_HWNDPREV) };
@@ -902,6 +904,112 @@ pub(crate) fn ensure_all_attached() {
     }
     // 显示桌面态 topmost 免疫管理(锁已释放,见 shown_topmost_tick)
     shown_topmost_tick();
+    // 沉底段分隔窗定位维护(见 spawn_separator_thread 注释)
+    ensure_separator_position();
+}
+
+// ---------------- 沉底段分隔窗(2026-09-09,勿回退) ----------------
+// 机制(sinkwatch 实锤):菜单关闭的系统静默重排把"菜单宿主所在线程的
+// z 连续段"整块压到宿主之下——段=z 序连续且同线程,遇到外部线程窗截断
+// (实测段=自家 UI 线程的 IME 组+菜单宿主+贴脸栅栏,紧邻的外部 WorkerW
+// 纹丝不动)。栅栏与菜单宿主同线程,显示桌面态带内窗少(15~34 层波动)
+// 时两者 z 相邻=必进同一段=菜单一关整段沉底再 60ms 拉回=用户可见闪;
+// 深度门槛(297eca7)对"带 ≤20 层"无解,方向1(免疫)又压应用,均废弃。
+// 对策:专用线程(T2)创建 0x0 隐形分隔窗,走查把它钉在"带内最低栅栏正
+// 下方"(宿主与栅栏群之间)——线程段在 sep 处截断,菜单关闭只压菜单宿主
+// (+其线程 IME 组,均 1px 隐形,零视觉),栅栏段纹丝不动=不闪。sep 零
+// 像素不吃点击、band_invisible 自动容忍、失效时退回旧行为(闪),无新症状。
+const SEP_CLASS: [u16; 13] = [
+    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x53, 0x65, 0x70, 0x00,
+]; // "DeskFenceSep\0"
+pub(crate) static SEP_HWND: std::sync::OnceLock<HWND> = std::sync::OnceLock::new();
+
+fn is_sep_window(w: HWND) -> bool {
+    let mut cls_buf = [0u16; 16];
+    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
+    n as usize == SEP_CLASS.len() - 1 && cls_buf[..SEP_CLASS.len() - 1] == SEP_CLASS[..12]
+}
+
+/// sep 无自有消息需求,全权交给 DefWindowProc(跨线程 SetWindowPos 的
+/// WM_WINDOWPOSCHANGING/CHANGED 由此默认处理)。
+unsafe extern "system" fn sep_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// T2 线程:注册类+创建 0x0 工具窗+消息循环保活。sep 全程不参与前台/
+/// 渲染/命中(0x0),唯一职责是占住一个异线程 z 序槽位隔断沉底段。
+pub(crate) fn spawn_separator_thread() {
+    let _ = std::thread::Builder::new()
+        .name("df-sep".into())
+        .spawn(|| unsafe {
+            let wc = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(sep_wndproc),
+                lpszClassName: PCWSTR::from_raw(SEP_CLASS.as_ptr()),
+                hInstance: hinstance(),
+                ..Default::default()
+            };
+            if RegisterClassExW(&wc) == 0 {
+                log("sep class register failed");
+                return;
+            }
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                PCWSTR::from_raw(SEP_CLASS.as_ptr()),
+                PCWSTR::null(),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND(0),
+                HMENU(0),
+                hinstance(),
+                None,
+            );
+            if hwnd.0 == 0 {
+                log("sep window create failed");
+                return;
+            }
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SEP_HWND.set(hwnd);
+            log("separator window ready (dedicated thread)");
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, HWND(0), 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        });
+}
+
+/// 走查尾部维护:sep 必须贴在菜单宿主正上方(紧邻),隔断菜单宿主与其
+/// 上方栅栏群的线程连续段。带内窗少时栅栏群会下沉到与 Tray/MenuHost
+/// z 相邻(18:00 实测整群被沉),钉在 MenuHost 处才能保证无论带怎么收
+/// 缩,沉底段都只有 MenuHost/Tray 等零像素窗。失位即修(纯 z)。
+fn ensure_separator_position() {
+    let Some(sep) = SEP_HWND.get().copied() else { return };
+    let Some(menu) = MENU_HOST_HWND.get().copied() else { return };
+    // 已就位:sep 紧贴 MenuHost 正下方(GW_HWNDNEXT 恰为 menu)
+    if unsafe { GetWindow(sep, GW_HWNDNEXT) } == menu {
+        return;
+    }
+    let _z = z_scope(ZIntent::Repair);
+    let _ = unsafe {
+        SetWindowPos(
+            sep,
+            menu,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
 }
 
 // ---------------- 显示桌面态 topmost 免疫(2026-08-29 终修,勿回退) ----------------
