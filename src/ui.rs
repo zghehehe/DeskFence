@@ -2030,7 +2030,7 @@ pub fn rescan() {
         // 只清已消失文件的图标缓存(2026-09-09:原实现全清,桌面一有变化
         // 全部图标重新 SHGFI 提取=可感知的卡顿)
         s.icon_cache
-            .retain(|k, _| k.split(' ').next().map(|p| keep.contains(p)).unwrap_or(false));
+            .retain(|k, _| k.split('\0').next().map(|p| keep.contains(p)).unwrap_or(false));
         // 已删文件的常用记录同步剔除(2026-09-03):usage.json 残留旧路径时,
         // 同名新建会继承旧次数直接顶到"常用"第一位(用户实测)
         let pruned = model::prune_usage(&keep);
@@ -3612,6 +3612,10 @@ pub fn run_message_loop() -> i32 {
             if r.0 == -1 {
                 log("getmessage error");
                 break;
+            }
+            // 分类面板的键盘拦截(Esc=关闭,Enter=提交),命中则跳过默认分发
+            if crate::cats_panel::panel_message(&msg) {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);

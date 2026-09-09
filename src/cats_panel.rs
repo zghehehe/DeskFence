@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, CreateFontIndirectW, HBRUSH, HFONT, HGDIOBJ, COLOR_BTNFACE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{model, shell, ui};
@@ -48,6 +48,42 @@ struct Panel {
 }
 
 /// 托盘入口:打开面板。focus=置为编辑焦点的表内下标;create_new=打开即新增。
+/// 主消息循环调用:面板获得键盘时拦截 Esc(关闭)/Enter(提交当前编辑)。
+/// 返回 true=消息已处理,调用方跳过默认分发。
+pub fn panel_message(msg: &MSG) -> bool {
+    let Some(h) = *PANEL_HWND.lock().unwrap() else {
+        return false;
+    };
+    if msg.message != WM_KEYDOWN || msg.hwnd.0 == 0 {
+        return false;
+    }
+    if !unsafe { IsChild(h, msg.hwnd) }.as_bool() {
+        return false;
+    }
+    let vk = msg.wParam.0 as u32;
+    if vk == VK_ESCAPE.0 as u32 {
+        let _ = unsafe { PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        true
+    } else if vk == VK_RETURN.0 as u32 {
+        unsafe { commit_focused_panel(h) };
+        true
+    } else {
+        false
+    }
+}
+
+/// 提交当前获得焦点的编辑(名称或规则);WM_CLOSE 复用同一入口
+unsafe fn commit_focused_panel(hwnd: HWND) {
+    if let Some(panel) = panel_of(hwnd) {
+        let focused = unsafe { GetFocus() };
+        if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
+            commit_row(panel, i);
+        } else if let Some(i) = panel.rows.iter().position(|r| r.exts_edit == focused) {
+            commit_exts(panel, i);
+        }
+    }
+}
+
 pub fn open_panel(focus: Option<usize>, create_new: bool) {
     let mut guard = PANEL_HWND.lock().unwrap();
     if let Some(h) = *guard {
@@ -148,7 +184,7 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             });
             for c in model::category_table() {
                 let locked_name = c.name == model::FALLBACK_CATEGORY;
-                let exts_text = if c.dirs { "(目录)".to_string() } else { c.exts.join(" ") };
+                let exts_text = if c.dirs { "(目录)".to_string() } else { c.exts.join(";") };
                 append_row(hwnd, &mut panel, &c.name, &exts_text, locked_name, locked_name || c.dirs);
             }
             panel.add_btn = create_add_button(hwnd, &panel);
@@ -189,16 +225,33 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
         }
         WM_CLOSE => {
             // 关窗前提交在编辑中的行
-            if let Some(panel) = panel_of(hwnd) {
-                let focused = unsafe { GetFocus() };
-                if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
-                    commit_row(panel, i);
-                } else if let Some(i) = panel.rows.iter().position(|r| r.exts_edit == focused) {
-                    commit_exts(panel, i);
-                }
-            }
+            commit_focused_panel(hwnd);
             unsafe {
                 let _ = DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // 跨屏拖动面板:重算缩放与字体,行内容原样保留
+            if let Some(panel) = panel_of(hwnd) {
+                let s = model::dpi_scale();
+                if (s - panel.scale).abs() > 0.01 {
+                    panel.scale = s;
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(panel.font.0));
+                    }
+                    panel.font = create_dialog_font();
+                    let f = WPARAM(panel.font.0 as usize);
+                    for r in &panel.rows {
+                        let _ = SendMessageW(r.edit, WM_SETFONT, f, LPARAM(1));
+                        let _ = SendMessageW(r.exts_edit, WM_SETFONT, f, LPARAM(1));
+                        if r.del.0 != 0 {
+                            let _ = SendMessageW(r.del, WM_SETFONT, f, LPARAM(1));
+                        }
+                    }
+                    let _ = SendMessageW(panel.add_btn, WM_SETFONT, f, LPARAM(1));
+                    layout_all(hwnd, panel);
+                }
             }
             LRESULT(0)
         }
@@ -441,6 +494,12 @@ fn do_delete(panel: &mut Panel, i: usize) {
 }
 
 fn do_add(hwnd: HWND, panel: &mut Panel) {
+    // 控件 ID 方案上限(0x100+3i,add=0x2FF):约 136 行,实际分类远少于此;
+    // 到顶拒绝并留痕,防 ID 相撞
+    if panel.rows.len() >= 130 {
+        ui::log("cats panel: row limit reached, add refused");
+        return;
+    }
     // 先提交在编辑的行,避免新增与悬挂改名竞争
     let focused = unsafe { GetFocus() };
     if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {

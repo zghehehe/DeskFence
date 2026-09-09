@@ -167,7 +167,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     shell::append_menu(
         menu,
         MENU_CHECK_UPDATE,
-        &format!("检查更新 v{}", env!("CARGO_PKG_VERSION")),
+        &format!("检查更新(v{})", env!("CARGO_PKG_VERSION")),
     );
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
@@ -276,7 +276,10 @@ pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
         }
     }
     model::set_category_table(table.clone());
-    update_stored_settings(|s| s.categories = table);
+    update_stored_settings(|s| {
+        s.categories = table;
+        s.deleted_category_at.remove(old); // 改名后旧墓碑键无意义,顺带清理
+    });
     {
         let mut s = state().lock().unwrap();
         for f in s.files.iter_mut() {
@@ -287,7 +290,11 @@ pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
         for f in s.fences.iter_mut() {
             if f.category == old {
                 f.category = new.to_string();
-                f.title = new.to_string();
+                // 标题跟随仅当与旧分类名相同(用户自定义过的标题不覆盖,
+                // 2026-09-09 体检 E7.1:两个方向行为对称)
+                if f.title == old {
+                    f.title = new.to_string();
+                }
             }
         }
         let cfg = s.fences.clone();
@@ -367,8 +374,9 @@ pub(crate) fn apply_category_delete(name: &str) -> bool {
         .find(|f| f.category == name)
         .map(|f| f.id);
     if let Some(id) = fid {
-        // 不记墓碑:分类已从表删除,墓碑无意义;面板"新增"同名时也会清墓碑
-        delete_fence_ex(id, false);
+        // 记墓碑(2026-09-09 与栅栏菜单删除路径语义对齐:"用户明确删除");
+        // 面板"新增"同名时同样会清墓碑,不会阻碍恢复
+        delete_fence_ex(id, true);
     }
     {
         let mut s = state().lock().unwrap();
