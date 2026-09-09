@@ -76,6 +76,9 @@ pub(crate) fn hinstance() -> HINSTANCE {
 }
 
 fn deskfence_icon() -> HICON {
+    // PCWSTR(1) = MakeIntResourceW(1),即 DeskFence.rc 里 ID=1 的图标资源。
+    // 不能按 clippy 建议换成 ptr::dangling()(地址=对齐值 2,会查错资源)
+    #[allow(clippy::manual_dangling_ptr)]
     unsafe { LoadIconW(hinstance(), PCWSTR(1usize as *const u16)).unwrap_or_default() }
 }
 
@@ -569,7 +572,9 @@ fn metrics_for_window(hwnd: HWND) -> model::DpiMetrics {
 /// 键不变就永不重发探测,把对宿主的骚扰从每 10s 一次降到"配置变化时一次"。
 /// sync_icon_size 的跟随能力不受影响:用户 Ctrl+滚轮 → 注册表变化 → 键失配
 /// → 恰好探测一次并重算格距。
-static ITEM_SPACING_CACHE: Mutex<Option<((f32, u32), (f32, f32))>> = Mutex::new(None);
+/// 图标格距探测缓存:键=(注册表 IconSize, 系统 DPI),值=(格距, 残余偏移)
+type SpacingCache = Option<((f32, u32), (f32, f32))>;
+static ITEM_SPACING_CACHE: Mutex<SpacingCache> = Mutex::new(None);
 
 fn probe_desktop_item_spacing() -> Option<(f32, f32)> {
     let key = (shell::desktop_icon_size(), unsafe {
@@ -1018,7 +1023,7 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
         // 就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
         // 深位锚(2026-09-08):启动就位与其余三处(reanchor/走查修复/晋升)
         // 统一;浅位回退在桌面态会把栅栏放进菜单静默沉底的扰动区(大闪根因)
-        let insert_after = match host.map(|h| band_attach_anchor(h.hwnd, HWND(0), true)).flatten() {
+        let insert_after = match host.and_then(|h| band_attach_anchor(h.hwnd, HWND(0), true)) {
             Some(a) => Some(a),
             None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), true)),
         };

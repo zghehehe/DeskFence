@@ -85,7 +85,7 @@ fn rounded(r: D2D_RECT_F, rad: f32) -> D2D1_ROUNDED_RECT {
     }
 }
 
-pub fn as_brush<'a>(s: &'a ID2D1SolidColorBrush) -> &'a ID2D1Brush {
+pub fn as_brush(s: &ID2D1SolidColorBrush) -> &ID2D1Brush {
     unsafe { &*(s as *const ID2D1SolidColorBrush as *const ID2D1Brush) }
 }
 
@@ -366,7 +366,7 @@ fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
         use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         let name = shell::wide("comctl32.dll");
         let dll = LoadLibraryW(PCWSTR::from_raw(name.as_ptr())).ok()?;
-        let proc = GetProcAddress(dll, PCSTR(b"DrawShadowText\0".as_ptr()))?;
+        let proc = GetProcAddress(dll, PCSTR(c"DrawShadowText".as_ptr().cast()))?;
         Some(std::mem::transmute::<
             unsafe extern "system" fn() -> isize,
             DrawShadowTextProc,
@@ -790,9 +790,10 @@ fn draw_text_shadow(
 
 /// 标签截断缓存:名字+宽度+盒高+行数上限 -> 实际显示文本(含省略号)。
 /// 盒高随 DPI 缩放,键里带上它可避免改缩放后残留旧截断。
-static LABEL_TRIM_CACHE: OnceLock<Mutex<HashMap<(String, u32, u32, u32), String>>> =
-    OnceLock::new();
-fn label_cache() -> &'static Mutex<HashMap<(String, u32, u32, u32), String>> {
+/// 标签截断缓存键:名字+宽度+盒高+行数上限
+type LabelTrimCache = HashMap<(String, u32, u32, u32), String>;
+static LABEL_TRIM_CACHE: OnceLock<Mutex<LabelTrimCache>> = OnceLock::new();
+fn label_cache() -> &'static Mutex<LabelTrimCache> {
     LABEL_TRIM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

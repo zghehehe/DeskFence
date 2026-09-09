@@ -25,6 +25,9 @@ extern "system" {
 pub const DRAGDROP_S_CANCEL: i32 = 0x00040101;
 pub const DRAGDROP_S_DROP: i32 = 0x00040100;
 pub const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x00040102;
+// 手写 IDropSource vtable 的返回码别名:沿用 Win32 的 HRESULT 拼写,
+// 与官方文档/签名一致(不允许大写缩写改名,反而伤可读性)
+#[allow(clippy::upper_case_acronyms)]
 pub type HRESULT = i32;
 
 // ---------------- IDropSource ----------------

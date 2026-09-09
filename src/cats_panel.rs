@@ -150,7 +150,7 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
 }
 
 fn ensure_class() {
-    *CLASS_REGISTERED.get_or_init(|| {
+    CLASS_REGISTERED.get_or_init(|| {
         let cls = shell::wide("DeskFenceCatsPanel");
         let wc = WNDCLASSW {
             style: WNDCLASS_STYLES(0),
@@ -603,8 +603,10 @@ fn set_text(h: HWND, s: &str) {
 
 fn create_dialog_font() -> HFONT {
     unsafe {
-        let mut ncm = NONCLIENTMETRICSW::default();
-        ncm.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+        let mut ncm = NONCLIENTMETRICSW {
+            cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+            ..Default::default()
+        };
         if SystemParametersInfoW(
             SPI_GETNONCLIENTMETRICS,
             ncm.cbSize,
