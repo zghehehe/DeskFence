@@ -1611,6 +1611,7 @@ pub(crate) fn edges_of(h: Hit) -> [char; 2] {
 /// - 槽位=悬停格在当前预览顺序中的序号(块落点=鼠标所在格),
 ///   左右对称、无"慢一拍"滞后;
 /// - 始终从 original 快照删除拖动块再插入,幂等可逆。
+///
 /// 返回是否发生了变化(调用方据此重绘);悬停在回收站上时不重排(松手即删除)。
 pub(crate) fn update_ghost_preview(s: &mut UiState, fence_id: u32, x: f32, y: f32) -> bool {
     let Some(prev) = s.ghost_preview.clone() else {

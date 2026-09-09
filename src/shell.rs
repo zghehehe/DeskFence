@@ -277,6 +277,7 @@ fn shell_display_name(path: &std::path::Path, fallback: &str) -> String {
 /// 1) 永远排除 desktop.ini 与 Office 锁文件(~$ 开头,仅在文档打开期间存在);
 /// 2) 按用户设置排除隐藏/受保护的系统文件;
 /// 3) 用户桌面与公共桌面同名冲突时只显示用户桌面的那份(Explorer 同名只显一条)。
+///
 /// 显示名解析(SHGFI_DISPLAYNAME)是逐文件 shell 调用(每个 ~15-25ms),
 /// 54 个文件串行要 ~1.3s,这里按 4 线程并行缩到 ~300ms;各线程独立 STA COM。
 pub fn scan_desktop() -> Vec<FileItem> {
@@ -1189,7 +1190,6 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
 /// 构建与原生桌面一致的"项目"菜单源。优先走桌面 DefView 选中项路线(与
 /// Explorer 右键桌面图标 100% 同源,含视图层"重命名");不可用时退回桌面文件
 /// 夹 GetUIObjectOf(此时补注入"重命名"保持条目一致)。
-
 fn build_item_menu(hwnd: HWND, paths: &[String]) -> Option<(IContextMenu, Vec<*mut ITEMIDLIST>)> {
     // 注:Explorer 的 WM_GETOBJECT 跨进程不回 IShellView,无法直接取 DefView
     // 选中项菜单;走桌面文件夹 GetUIObjectOf 路线 + 注入"重命名"对齐原生。

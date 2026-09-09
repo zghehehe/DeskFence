@@ -964,7 +964,6 @@ pub(crate) fn delete_fence_ex(fence_id: u32, tombstone: bool) {
 
 /// 离开 DeskFence 桌面模式：先恢复 Explorer 原生图标，再隐藏本程序窗口。
 /// 不修改原始图标位置、文件或 Explorer 布局；用户可通过“显示全部栅栏”再次接管。
-
 pub(crate) fn dispatch_desktop_command(id: u32) {
     match id {
         shell::DL_CMD_ADD_FENCE => {

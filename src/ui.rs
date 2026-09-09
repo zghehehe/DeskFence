@@ -267,8 +267,6 @@ pub fn menu_host_or(fallback: HWND) -> HWND {
 }
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 static TICK_COUNT: AtomicU32 = AtomicU32::new(0);
-/// 箭头悬停自动弹菜单的防重触发时间戳(毫秒)
-
 fn taskbar_created_msg() -> u32 {
     *TASKBAR_CREATED_MSG.get_or_init(|| unsafe {
         let name = shell::wide("TaskbarCreated");
@@ -2790,9 +2788,6 @@ pub fn startup() {
     }
 }
 
-/// 全局自愈:定时器与显示变化时调用。
-/// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
-/// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
 /// IDesktopWallpaper 签名的最近值(幻灯片轮换检测)
 static WALLPAPER_SIG: Mutex<String> = Mutex::new(String::new());
 static WALLPAPER_SIG_WARN: std::sync::atomic::AtomicBool =
@@ -2832,6 +2827,9 @@ fn finish_rename_if_clicked_outside() {
     }
 }
 
+/// 全局自愈:定时器与显示变化时调用。
+/// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
+/// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
 fn global_tick() {
     finish_rename_if_clicked_outside();
 

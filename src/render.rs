@@ -382,6 +382,7 @@ fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
 /// 2) 用同一 DrawShadowText/ClearType 对种子画字(边缘色与原生同源);
 /// 3) RGB 与种子有差异的像素=墨水,置 alpha=255;其余像素恢复垫种子前
 ///    的原状(透明底+覆盖层)——背景透出实时壁纸。
+///
 /// 壁纸切换期间种子暂为旧快照(墨水边缘色停在旧底色版本),与原生过渡
 /// 期行为一致;快照重捕获完成后 refresh 即换新种子。
 /// fence_x/fence_y 为栅栏呈现位置(与 present 的取整一致),用于把
