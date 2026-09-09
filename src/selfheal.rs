@@ -358,10 +358,8 @@ pub(crate) fn ensure_all_attached() {
         // 2) 创建缺失窗口(宿主已就绪)
         let ids: Vec<u32> = s.fences.iter().map(|f| f.id).collect();
         for id in ids {
-            if !s.windows.contains_key(&id) {
-                if create_fence_window(&mut s, id, &hosts) {
-                    created.push(id);
-                }
+            if !s.windows.contains_key(&id) && create_fence_window(&mut s, id, &hosts) {
+                created.push(id);
             }
         }
         // 3) z 序重申:每个存活窗口重新插到其宿主之后(防漂移/Explorer 重建自愈)。

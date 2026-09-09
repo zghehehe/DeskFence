@@ -662,7 +662,7 @@ pub(crate) fn refresh_guide(s: &mut UiState) {
         ));
     }
     let mut frames = Vec::with_capacity(animation_meta.len());
-    for (animation, icon) in animation_meta.iter().zip(animation_icons.into_iter()) {
+    for (animation, icon) in animation_meta.iter().zip(animation_icons) {
         let elapsed = now.saturating_sub(animation.started_ms);
         let progress = (elapsed as f32 / animation.duration_ms.max(1) as f32).clamp(0.0, 1.0);
         let point = model::interpolate_point(animation.from, animation.to, progress);
@@ -1341,7 +1341,6 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     None,
                 );
             }
-            return;
         }
     } else {
         // 回到已提交的图标：取消未到期的延迟提交
@@ -1436,7 +1435,6 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             let ay = fence.rect.y + metrics.title_h + 6.0;
             drop(s);
             fence_menu(hwnd_menu, fence_id, ax as i32, ay as i32);
-            return;
         }
         Hit::Icon(i) => {
             let mut icon_was_selected = false;
@@ -1717,7 +1715,7 @@ pub(crate) fn release_on_recycle_bin_screen(s: &UiState, sx: f32, sy: f32, sourc
             .unwrap_or_else(model::DpiMetrics::system);
         let lay = model::layout_with_metrics(fence, items.len(), &metrics);
         if let Hit::Icon(j) =
-            model::hit_test_with_metrics(&fence, &lay, cx, cy, items.len(), &metrics)
+            model::hit_test_with_metrics(fence, &lay, cx, cy, items.len(), &metrics)
         {
             let hit_bin = items
                 .get(j)
@@ -2271,7 +2269,6 @@ pub(crate) fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
             // 取代第二次 DOWN,末次 UP 无 drag 状态,审查项 E1)
             *PENDING_POS.lock().unwrap() = Some(screen_cursor());
             *pending_open().lock().unwrap() = Some(p);
-            return;
         }
     }
 }

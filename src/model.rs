@@ -235,13 +235,13 @@ pub fn push_chain(rects: &mut [Rect], anchor: usize) {
     for _ in 0..32 {
         let mut moved = false;
         let a = rects[anchor];
-        for i in 0..rects.len() {
+        for (i, slot) in rects.iter_mut().enumerate() {
             if i == anchor {
                 continue;
             }
-            let old = rects[i];
-            rects[i] = push_away(&a, &old);
-            if rects[i] != old {
+            let old = *slot;
+            *slot = push_away(&a, &old);
+            if *slot != old {
                 moved = true;
             }
         }
@@ -959,7 +959,7 @@ pub fn categorize_with(table: &[CategoryDef], name: &str, is_dir: bool) -> Strin
         return FALLBACK_CATEGORY.into();
     }
     let ext = ext_of(name).to_lowercase();
-    if let Some(c) = table.iter().find(|c| c.exts.iter().any(|e| *e == ext)) {
+    if let Some(c) = table.iter().find(|c| c.exts.contains(&ext)) {
         return c.name.clone();
     }
     FALLBACK_CATEGORY.into()
@@ -1120,7 +1120,7 @@ pub fn layout_with_metrics(fence: &Fence, n_items: usize, metrics: &DpiMetrics) 
     let total_rows = if n_items == 0 {
         0
     } else {
-        (n_items + cols - 1) / cols
+        n_items.div_ceil(cols)
     };
     let max_scroll = total_rows.saturating_sub(rows);
     let mut scroll = fence.scroll_rows.min(max_scroll);
@@ -1565,7 +1565,7 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
                 windows::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
                     | windows::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         Ok(())
     }
@@ -1694,13 +1694,13 @@ pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> ((f32
             // 放在 o 右侧: x = o.x + o.w + GAP
             let cand_r = o.x + o.w + GAP;
             let d_r = (r.x - cand_r).abs();
-            if d_r < threshold && best.map_or(true, |(_, _, d)| d_r < d) {
+            if d_r < threshold && best.is_none_or(|(_, _, d)| d_r < d) {
                 best = Some((cand_r, r.y, d_r));
             }
             // 放在 o 左侧: x = o.x - GAP - r.w
             let cand_l = o.x - GAP - r.w;
             let d_l = (r.x - cand_l).abs();
-            if d_l < threshold && best.map_or(true, |(_, _, d)| d_l < d) {
+            if d_l < threshold && best.is_none_or(|(_, _, d)| d_l < d) {
                 best = Some((cand_l, r.y, d_l));
             }
         }
@@ -1708,19 +1708,19 @@ pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> ((f32
             // 行顶对齐: y = o.y
             let cand_t = o.y;
             let d_t = (r.y - cand_t).abs();
-            if d_t < threshold && best.map_or(true, |(_, _, d)| d_t < d) {
+            if d_t < threshold && best.is_none_or(|(_, _, d)| d_t < d) {
                 best = Some((r.x, cand_t, d_t));
             }
             // 紧贴下方: y = o.y + o.h + GAP
             let cand_d = o.y + o.h + GAP;
             let d_d = (r.y - cand_d).abs();
-            if d_d < threshold && best.map_or(true, |(_, _, d)| d_d < d) {
+            if d_d < threshold && best.is_none_or(|(_, _, d)| d_d < d) {
                 best = Some((r.x, cand_d, d_d));
             }
             // 紧贴上方: y = o.y - GAP - r.h
             let cand_u = o.y - GAP - r.h;
             let d_u = (r.y - cand_u).abs();
-            if d_u < threshold && best.map_or(true, |(_, _, d)| d_u < d) {
+            if d_u < threshold && best.is_none_or(|(_, _, d)| d_u < d) {
                 best = Some((r.x, cand_u, d_u));
             }
         }

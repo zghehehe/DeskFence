@@ -37,7 +37,7 @@ pub(crate) fn load_icon_cache_file(
     }
     let px = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
     // px 由调用方条目键的后缀再核一次;这里只挡住荒谬值
-    if px < 16 || px > 256 {
+    if !(16..=256).contains(&px) {
         return Default::default();
     }
     let expected_len = (px as usize) * (px as usize) * 4;

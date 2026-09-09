@@ -877,7 +877,7 @@ fn refresh_hosts() -> Vec<HostInfo> {
             visible: unsafe { IsWindowVisible(primary).as_bool() },
         });
     }
-    hosts.sort_by(|a, b| b.primary.cmp(&a.primary));
+    hosts.sort_by_key(|h| !h.primary);
     hosts
 }
 
@@ -1149,7 +1149,7 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
         if !fail_dbg.is_empty() {
             s.wallpaper_fails = s.wallpaper_fails.saturating_add(1);
             let n = s.wallpaper_fails;
-            if n <= 2 || n % 25 == 0 {
+            if n <= 2 || n.is_multiple_of(25) {
                 log(&format!(
                     "wallpaper capture empty (fails={}): visible_hosts={} [{}]",
                     n,
@@ -2091,15 +2091,18 @@ fn apply_scan(mut files: Vec<FileItem>) {
         }
         (added, removed, recat, gained)
     };
-    if added_paths.is_empty() && !removed_any && !recat_any {
-        if !RENAME_RESCAN_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
-            // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
-            // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
-            // 表现为点桌面/关菜单后栅栏区域闪一下。
-            return;
-        }
-        // 改名提交强制走一遍:补建缺类栅栏+收敛,尽管 diff 为空
+    // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
+    // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
+    // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
+    // 表现为点桌面/关菜单后栅栏区域闪一下。
+    // 改名提交置位 RENAME_RESCAN_PENDING 强制走一遍:补建缺类栅栏+收敛
+    // (swap 副作用仅在 diff 为空时求值,与原嵌套 if 语义一致)。
+    if added_paths.is_empty()
+        && !removed_any
+        && !recat_any
+        && !RENAME_RESCAN_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
     }
     let new_cats: Vec<String> = {
         let mut s = state().lock().unwrap();
@@ -2854,7 +2857,7 @@ fn global_tick() {
             ICON_SAVE_DIRTY_MS.store(resize_now_ms(), Ordering::Relaxed);
         }
         let dirty = ICON_SAVE_DIRTY_MS.load(Ordering::Relaxed);
-        if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t % 4 == 0 {
+        if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t.is_multiple_of(4) {
             ICON_SAVE_DIRTY_MS.store(0, Ordering::Relaxed);
             let px = model::DpiMetrics::system().icon_px.round().clamp(16.0, 256.0) as u32;
             save_icon_cache_file_now(px);
@@ -2927,7 +2930,7 @@ fn global_tick() {
     // 壁纸跟随(两模式共用,2026-08-26 起透明模式同样需要快照作文字种子)。
     // 快照到期时重捕获,内容有变(带容差:捕获亮度有 ~4% 时序波动,严格比较
     // 会引发无谓全量重绘=闪)才刷新栅栏。
-    if t % 3 == 0 {
+    if t.is_multiple_of(3) {
         let changed = {
             let mut s = state().lock().unwrap();
             if s.wallpapers.is_empty() {
@@ -2968,7 +2971,7 @@ fn global_tick() {
             }
         }
     }
-    if t % 10 == 0 {
+    if t.is_multiple_of(10) {
         let changed = {
             let mut s = state().lock().unwrap();
             match s.renderer.as_mut() {
@@ -2984,7 +2987,7 @@ fn global_tick() {
             refresh_all_fences();
         }
     }
-    if shell::take_desktop_dirty() || t % 30 == 0 {
+    if shell::take_desktop_dirty() || t.is_multiple_of(30) {
         rescan();
     }
 }

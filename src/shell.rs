@@ -405,7 +405,7 @@ pub fn resolve_display_names(
         return;
     }
     let threads = THREADS.min(n);
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     std::thread::scope(|scope| {
         let mut rest = files;
         let mut handles = Vec::new();
@@ -462,7 +462,7 @@ pub fn prewarm_icon_cache(
         return merged;
     }
     let threads = THREADS.min(n);
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for t in 0..threads {
