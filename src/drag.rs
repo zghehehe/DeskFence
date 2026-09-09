@@ -2,7 +2,6 @@
 //! 鼠标按下/移动/松开、残影与插入线预览、缩放、框选、滚轮、双击、
 //! 键盘微调、OLE 拖出/落入回调、settle 归一与邻居整理。
 //! 本模块属于 ui.rs 拆分增量;与 ui.rs 双向依赖(同 crate 内合法)。
-//! 窗口管理与交互：栅栏窗口、命中测试、移动/缩放/滚动、右键菜单、重命名、刷新
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -28,6 +27,7 @@ use crate::shell;
 use crate::selfheal::*;
 use crate::menu::{dispatch_desktop_command, fence_menu};
 
+use crate::rename::*;
 use crate::ui::*;
 
 

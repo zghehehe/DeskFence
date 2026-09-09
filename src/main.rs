@@ -6,6 +6,7 @@ mod iconcache;
 mod menu;
 mod model;
 mod ole;
+mod rename;
 mod render;
 mod selfheal;
 mod shell;
