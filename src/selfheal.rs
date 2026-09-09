@@ -142,15 +142,29 @@ fn bad_anchor_recent(h: HWND) -> bool {
 /// UIPI 坏锚降级(2026-08-31):主规则候选若在坏锚缓存(被 0x80070005
 /// 拒过,elevated 进程窗口)→改插它 GW_HWNDNEXT 下方窗口之下=栅栏落到
 /// 坏锚之下,绝不遮挡;下方无可垫窗才走兄弟归队/带底。
+/// 带内"沉底块"深度门槛(2026-09-09,勿回退):宿主正上方该步数以内的窗口
+/// 一律不作就位锚点。依据:菜单关闭的系统静默重排把"菜单宿主所在线程的
+/// z 连续段"整块压到宿主之下(sinkwatch 实锤,块=线程连续段而非任意 z 邻
+/// 居),实测块深——显示桌面态 0-11 步(菜单宿主+自家 IME 组+托盘 12 窗)、
+/// 应用态波及至 ~16 步(栅栏锚 depth 11-15 时仍被沉底拉回,当日 216 次
+/// re-anchor)。锚在块内=每次菜单一关栅栏跟着整段沉底再 60ms 拉回=用户
+/// 可见闪。20=实测块深上限+余量。显示桌面态整个非 topmost 带只有 ~34
+/// 层,门槛后仍有 20-34 步的窗可作锚(实测);应用态锚点本在数百步,不受
+/// 影响。fail-safe:门槛导致无锚可用时走兄弟归队/带底=退回旧行为(闪),
+/// 绝不产生"栅栏浮到应用上"的新症状。
+const CHURN_BLOCK_DEPTH: usize = 20;
+
 pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<HWND> {
     let vs = virtual_screen_rect();
     let menu_host = MENU_HOST_HWND.get().copied();
     let tray = TRAY_HWND.get().copied();
     let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    let mut depth = 0usize;
     for _ in 0..1000 {
         if w.0 == 0 {
             break;
         }
+        depth += 1;
         if w == skip
             || is_own_fence_window(w)
             || is_topmost_window(w)
@@ -183,6 +197,12 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
             }
             break; // 坏锚下方无可垫窗:走兄弟归队/带底(栅栏在宿主正上方=坏锚之下)
         }
+        // 沉底块门槛(见 CHURN_BLOCK_DEPTH):浅位可见窗(显示态的语言栏/
+        // 状态条/IME 组周边等)不作锚,继续向上找块外的窗。
+        if depth <= CHURN_BLOCK_DEPTH {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
         return Some(w);
     }
     // 深位回退(2026-09-08 起无条件执行,deep 参数保留兼容):主规则无
@@ -207,16 +227,20 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
         let _ = deep; // 参数保留:历史上仅晋升路径选择深位,现统一启用
         let mut best: Option<HWND> = None;
         let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+        let mut depth = 0usize;
         for _ in 0..1000 {
             if w.0 == 0 {
                 break;
             }
+            depth += 1;
             if w == skip || is_own_fence_window(w) || band_aux(w, menu_host, tray) {
                 w = unsafe { GetWindow(w, GW_HWNDPREV) };
                 continue;
             }
             if band_invisible(w, &vs) {
-                if !is_topmost_window(w) {
+                // 浅位(沉底块内)的隐形窗不作垫窗:锚它=栅栏仍进块(2026-09-09,
+                // 当日 216 次 re-anchor 锚 0x20488/0x20552 实证)。
+                if !is_topmost_window(w) && depth > CHURN_BLOCK_DEPTH {
                     best = Some(w);
                 }
                 w = unsafe { GetWindow(w, GW_HWNDPREV) };
@@ -235,13 +259,15 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
         }
     }
     // 走完预算仍无可用外来窗:优先归队到带内最低的兄弟栅栏之下,保持
-    // 集群;没有兄弟才回退带底。
+    // 集群;兄弟也全在沉底块内或没有兄弟才回退带底(fail-safe=旧行为)。
     let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    let mut depth = 0usize;
     for _ in 0..1000 {
         if w.0 == 0 {
             break;
         }
-        if w != skip && is_own_fence_window(w) {
+        depth += 1;
+        if w != skip && is_own_fence_window(w) && depth > CHURN_BLOCK_DEPTH {
             return Some(w);
         }
         w = unsafe { GetWindow(w, GW_HWNDPREV) };
