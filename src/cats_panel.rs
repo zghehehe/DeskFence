@@ -468,6 +468,10 @@ fn commit_row(panel: &mut Panel, i: usize) {
     if text == old {
         return;
     }
+    if panel.rows[i].locked_name {
+        set_text(panel.rows[i].edit, &old);
+        return;
+    }
     if text.is_empty() || !crate::menu::apply_category_rename(&old, &text) {
         let r = &panel.rows[i];
         set_text(r.edit, &old);
