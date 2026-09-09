@@ -1972,30 +1972,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore]
-    fn debug_display_order_real_scan() {
-        let files = crate::shell::scan_desktop();
-        let fence = Fence {
-            id: 3,
-            title: "文档".into(),
-            category: "文档".into(),
-            pinned: vec![],
-            item_order: vec![],
-            rect: Rect { x: 0.0, y: 0.0, w: 244.0, h: 575.0 },
-            collapsed: false,
-            scroll_rows: 0,
-            locked: false,
-            hidden: false,
-            manual_size: false,
-            sort_mode: "常用".into(),
-        };
-        let out = display_list(&fence, &files);
-        for (i, f) in out.iter().enumerate() {
-            println!("{:2}. {} mtime={}", i, f.name, f.mtime_ms);
-        }
-    }
-
-    #[test]
     fn usage_sort_appends_new_files_to_the_right() {
         // "常用"排序:两个都从未打开过的文件,先建的(mtime 早)在左,
         // 后建的追加靠右——不吃名称码点(旧实现 latin 文件名会插到中文前)
