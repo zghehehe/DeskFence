@@ -187,10 +187,18 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
     }
     // 深位回退(2026-09-08 起无条件执行,deep 参数保留兼容):主规则无
     // "可见且非 topmost"外来窗时(典型:桌面态全部应用窗最小化),锚到
-    // "最低可见或 topmost 外来窗"之下、紧贴它的最高**非 topmost 隐形**外来
-    // 窗。此处 ~440 步深位远离菜单宿主的静默沉底块=菜单开合免疫(实测);
-    // 旧的兄弟归队/带底回退会把栅栏放回宿主正上方扰动区,菜单一关就被
-    // 整块压到宿主之下=用户可见的"桌面大闪"(bandwalk 实证)。
+    // 非 topmost 带深处"最高的非 topmost 隐形外来窗"(紧贴首个可见非
+    // topmost 窗或垃圾带顶)。此处 ~440 步深位远离菜单宿主的静默沉底
+    // 块=菜单开合免疫(实测);旧的兄弟归队/带底回退会把栅栏放回宿主
+    // 正上方扰动区,菜单一关就被整块压到宿主之下=用户可见的"桌面大闪"
+    // (bandwalk 实证)。
+    // 可见 topmost 外来窗不终结搜索(2026-09-09,勿回退):SPES epc_pxs
+    // 的 ScW 全屏截屏钩子层会短暂漂进宿主正上方浅位,旧版在"首个可见
+    // 窗(含 topmost)"处 break,ScW 浅位值班时锚被短路到 depth 11-15 的
+    // 沉底块边缘隐形窗(SoBS_Hint 实抓),栅栏被锚进菜单宿主静默沉底块,
+    // 菜单关闭即整块沉底+60ms 拉回=可见闪(当日 216 次 re-anchor 实证)。
+    // 跳过它们后锚点与钩子层位置彻底无关;主规则已保证走到本回退时
+    // 无"可见非 topmost"外来窗,跳过无遮挡风险。
     // 锚必须自身非 topmost:插到 topmost 窗正下方会把栅栏并入 topmost band
     // (2026-08-29 实测 5 栅栏全变 topmost=True;且 SetWindowLongW 清不掉
     // 该位,HWND_NOTOPMOST 又会把窗口移到非 topmost 带顶部=位置不可控,
@@ -214,7 +222,13 @@ pub(crate) fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<H
                 w = unsafe { GetWindow(w, GW_HWNDPREV) };
                 continue;
             }
-            break; // 首个可见外来窗(含 topmost)到顶
+            if is_topmost_window(w) {
+                // 可见 topmost 外来窗(ScW 截屏钩子层类)跳过,不终结搜索:
+                // 见函数头注释(2026-09-09 浅位短路闪屏修复)。
+                w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                continue;
+            }
+            break; // 首个可见非 topmost 外来窗到顶:锚其下方垫窗,绝不遮挡
         }
         if best.is_some() {
             return best;
