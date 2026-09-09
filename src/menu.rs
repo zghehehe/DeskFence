@@ -281,6 +281,8 @@ pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
         s.categories = table;
         s.deleted_category_at.remove(old); // 改名后旧墓碑键无意义,顺带清理
     });
+    // 直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
         for f in s.files.iter_mut() {
@@ -337,6 +339,8 @@ pub(crate) fn apply_category_exts(name: &str, exts: Vec<String>) -> bool {
     }
     model::set_category_table(table.clone());
     update_stored_settings(|s| s.categories = table);
+    // 下面直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
         for f in s.files.iter_mut() {
@@ -379,6 +383,8 @@ pub(crate) fn apply_category_delete(name: &str) -> bool {
         // 面板"新增"同名时同样会清墓碑,不会阻碍恢复
         delete_fence_ex(id, true);
     }
+    // 直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
         for f in s.files.iter_mut() {

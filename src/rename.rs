@@ -345,6 +345,9 @@ pub(crate) fn scan_miss_map() -> &'static Mutex<std::collections::HashMap<String
 }
 
 pub(crate) fn mark_scan_removed(paths: &[String]) {
+    // 应用主动删除=内存状态在扫描器背后变了:作废在途异步快照,防止它把
+    // 已删路径当"新增"混回内存列表(见 ui.rs SCAN_EPOCH)
+    crate::ui::invalidate_pending_scans();
     let mut miss = scan_miss_map().lock().unwrap();
     for p in paths {
         miss.insert(p.clone(), SCAN_MISS_DROP);
@@ -973,12 +976,14 @@ fn commit_file_rename(edit: HWND) {
         let _ = DestroyWindow(edit);
     }
     if renamed {
-        // 内存已同步,磁盘扫描与内存一致,rescan 的 diff 必为空——
+        // 内存已同步,磁盘扫描与内存一致,rescan_now 的 diff 必为空——
         // 置强制位让缺类补建跑一遍(改名成 mp4 要能冒出媒体栅栏)
         RENAME_RESCAN_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    rescan();
-    // 跨栏迁移动画必须在 rescan 之后排队:目标分类栅栏(可能新建)已就位、
+    // 同步版 rescan:调用返回即应用完毕(异步版无法保证下面迁移动画的
+    // 排队顺序:目标分类栅栏必须已就位)
+    rescan_now();
+    // 跨栏迁移动画必须在扫描应用之后排队:目标分类栅栏(可能新建)已就位、
     // 新栏帧已渲染,这里排队并刷新新栏把成员藏到落地显形
     if let Some((new_path, old_fid, fx, fy)) = migration {
         queue_migration_animations(&[(new_path, old_fid, fx, fy)]);

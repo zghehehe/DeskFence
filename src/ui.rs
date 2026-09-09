@@ -251,6 +251,8 @@ const WM_DL3_CLEAR_SEL: u32 = WM_APP + 5;
 /// 壁纸缓存目录(Themes\TranscodedWallpaper)有变化:幻灯片轮换/换壁纸的
 /// 毫秒级事件信号,由目录 watcher 线程投递,UI 侧防抖后重捕获
 const WM_DL3_WALLPAPER_DIRTY: u32 = WM_APP + 6;
+/// 后台扫描完成:扫描线程投递,UI 线程在托盘消息里应用结果(apply_pending_scan)
+const WM_DL3_SCAN_APPLY: u32 = WM_APP + 8;
 /// 全局 z 序事件触发的高速自检请求(WinEvent 回调合并投递)
 pub(crate) const WM_DL3_ZCHECK: u32 = WM_APP + 7;
 /// windows 0.52 crate 未导出,按 Win32 头文件补定义
@@ -1955,8 +1957,80 @@ fn remove_empty_category_fences() {
     }
 }
 
+/// 重扫进行中标记:同一时刻至多一个后台扫描线程(重复请求合并进 REQUEUED)
+static SCAN_INFLIGHT: AtomicBool = AtomicBool::new(false);
+/// 扫描期间又来了重扫请求:本轮应用完再补一轮,收敛到最新状态
+static SCAN_REQUEUED: AtomicBool = AtomicBool::new(false);
+/// 扫描快照代际:内存文件列表被 rescan 之外的路径同步改写(改名提交/分类
+/// 规则应用)时 +1,使在途快照作废——否则陈旧结果会把改名前的旧路径/旧
+/// 分类写回内存(同步时代不存在此窗口,扫描与改写同线程串行)
+static SCAN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 后台线程产出的扫描结果(带取值时的代际),等 UI 线程取走应用(单槽)
+static SCAN_RESULT: Mutex<Option<(u64, Vec<FileItem>)>> = Mutex::new(None);
+
+/// 使在途扫描快照作废(内存文件列表被绕过 rescan 直接改写时必须调用:
+/// 改名提交、分类规则应用;拖拽删除走 mark_scan_removed 已内置)。
+pub(crate) fn invalidate_pending_scans() {
+    SCAN_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 异步重扫入口:文件系统枚举+显示名解析(~百 ms 级 shell 调用,4 线程并行)
+/// 全部搬到后台线程,结果经 WM_DL3_SCAN_APPLY 回 UI 线程应用——UI 线程不再
+/// 被 watcher 事件/手动"刷新"卡住(2026-09-09,遗留#5;此前扫描在 UI 线程,
+/// 54 文件冷缓存时栅栏交互可感知卡顿)。后台线程只做纯数据扫描,不碰任何
+/// 窗口(自愈体系线程不变式);应用段(原 rescan 的 diff+重绘)全在 UI 线程。
+/// 需要同步语义的调用方(改名提交:跨栏迁移动画必须排在扫描应用之后)
+/// 用 rescan_now()。
 pub fn rescan() {
-    let mut files = with_recycle_bin(shell::scan_desktop());
+    if SCAN_INFLIGHT.swap(true, Ordering::Relaxed) {
+        SCAN_REQUEUED.store(true, Ordering::Relaxed);
+        return;
+    }
+    let epoch = SCAN_EPOCH.load(Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let files = with_recycle_bin(shell::scan_desktop());
+        *SCAN_RESULT.lock().unwrap() = Some((epoch, files));
+        // TRAY_HWND 在托盘初始化时创建,rescan 的全部调用方都在其后;万一
+        // 未就绪,结果留在槽里由 global_tick 兜底应用
+        if let Some(tray) = TRAY_HWND.get().copied() {
+            unsafe {
+                let _ = PostMessageW(tray, WM_DL3_SCAN_APPLY, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+}
+
+/// 同步重扫(rescan 拆分前的原行为):扫描+应用一次完成,调用返回即生效。
+/// 仅供改名提交使用——它已把内存文件列表同步到新路径,rescan 只为缺类
+/// 补建+收敛,且迁移动画必须在应用之后排队(异步版做不到这个顺序)。
+pub fn rescan_now() {
+    invalidate_pending_scans(); // 在途异步快照已过时,丢弃(见 SCAN_EPOCH)
+    apply_scan(with_recycle_bin(shell::scan_desktop()));
+}
+
+/// 取走后台扫描结果并应用(托盘 WM_DL3_SCAN_APPLY / global_tick 兜底)。
+/// 代际失配的陈旧快照直接丢弃;应用完毕清 INFLIGHT,期间有新请求
+/// (REQUEUED)则再起一轮。
+fn apply_pending_scan() {
+    let cur = SCAN_EPOCH.load(Ordering::Relaxed);
+    let pending = SCAN_RESULT.lock().unwrap().take();
+    if let Some((epoch, files)) = pending {
+        if epoch == cur {
+            apply_scan(files);
+        } else {
+            log("stale scan snapshot dropped (memory synced behind scanner)");
+        }
+    }
+    if SCAN_INFLIGHT.swap(false, Ordering::Relaxed)
+        && SCAN_REQUEUED.swap(false, Ordering::Relaxed)
+    {
+        rescan();
+    }
+}
+
+/// 应用一批扫描结果(必须 UI 线程):扫描宽恕合并、diff 判定、状态更新、
+/// 缺类补建、重绘收敛。
+fn apply_scan(mut files: Vec<FileItem>) {
     let (added_paths, removed_any, recat_any, gained_cats) = {
         let s = state().lock().unwrap();
         // 扫描宽恕:上一轮在册、本轮扫不到的路径,连续 SCAN_MISS_DROP 轮
@@ -2747,6 +2821,11 @@ fn finish_rename_if_clicked_outside() {
 fn global_tick() {
     finish_rename_if_clicked_outside();
 
+    // 兜底:后台扫描结果因 TRAY_HWND 未就绪而没被消息路径取走时,这里补应用
+    if SCAN_RESULT.lock().is_ok_and(|r| r.is_some()) {
+        apply_pending_scan();
+    }
+
     let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     // 环境自稳:30s 节拍体检,持续异常超宽限期自动重建桌面层(见
     // env_watchdog_tick)。这是"运行期间保证环境正常"的默认机制。
@@ -3458,6 +3537,11 @@ unsafe extern "system" fn tray_wndproc(
             // 合并后的高速自检:栅栏在宿主之下(显示桌面批次)立即重挂
             ZCHECK_PENDING.store(false, Ordering::Relaxed);
             zcheck_fences_now();
+            return LRESULT(0);
+        }
+        if msg == WM_DL3_SCAN_APPLY {
+            // 后台扫描完成:UI 线程应用结果(扫描线程只产数据不碰窗口)
+            apply_pending_scan();
             return LRESULT(0);
         }
         if msg == WM_SETTINGCHANGE {
