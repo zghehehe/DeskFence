@@ -881,12 +881,13 @@ pub(crate) fn ensure_all_attached() {
 // ---------------- 显示桌面态 topmost 免疫(2026-08-29 终修,勿回退) ----------------
 // 机制:ToggleDesktop/三指把栅栏纳入"停泊批"(静默沉底,无法否决),此后
 // 每次菜单关闭系统都把批内成员重新停泊=栅栏被拖下再拉回=菜单后点空白
-// 闪屏(60ms zwatch 实测:沉底块=栅栏簇+菜单宿主,parked 窗不被波及)。
-// 逐个最小化回桌面的路径不碰停泊批→栅栏不动→不闪(用户 Case B 实测)。
-// topmost 窗口不参与停泊(SPW ScW 钩子层与隐形垃圾丛林在每次切换中
-// 纹丝不动)→显示桌面态(无任何可见非 topmost 外来窗=应用全部停泊/
-// 最小化)给栅栏上 HWND_TOPMOST 获得同款豁免;出现可见应用窗(回应用)
-// 立即 HWND_NOTOPMOST,由既有走查/下压机制送回最低应用窗之下的深位。
+// 闪屏(60ms zwatch 实测:沉底块=栅栏簇+菜单宿主,parked 窗不被波及;
+// 2026-09-09 sinkwatch 实锤:块按**线程连续段**分组,被压窗全部 tid=自家
+// UI 线程,紧邻外部窗不动)。逐个最小化回桌面的路径不碰停泊批→栅栏不
+// 动→不闪(用户 Case B 实测)。topmost 窗口不参与停泊(SPW ScW 钩子层与
+// 隐形垃圾丛林在每次切换中纹丝不动)→显示桌面态(无真实内容窗,见
+// band_has_live_foreign)给栅栏上 HWND_TOPMOST 获得同款豁免;出现真实
+// 内容窗(回应用)立即 HWND_NOTOPMOST,由既有走查/下压机制送回深位。
 /// 免疫模式当前是否生效
 static SHOWN_TOPMOST: AtomicBool = AtomicBool::new(false);
 /// 显示桌面态连续稳定拍数(防过渡期抖动)
@@ -898,17 +899,35 @@ static SHOWN_STABLE: AtomicU32 = AtomicU32::new(0);
 /// 一次性激活,五个栅栏同帧同现(逐栅栏激活会出现"一个比其他慢很多")。
 static SHOWN_PENDING_MS: AtomicU64 = AtomicU64::new(0);
 
-/// 全带是否存在"可见且非 topmost 的外来窗"(=有可见应用窗)。
-/// 与 band_attach_anchor 主规则同源判定。
-/// 大尺寸窗口判定(物理px):宽高均 ≥250 视为真实应用窗——topmost 且
-/// 大尺寸的可视窗口(腾讯会议被 SPES/系统翻成 topmost 的场景)必须让
-/// 免疫模式退出,栅栏不允许浮在应用上(2026-09-04 用户指令)。
+/// WS_EX_LAYERED = 0x8_0000:走分层合成的透明层。钩子层/悬浮提示层的
+/// 标志性组合(全屏可见的 epc_pxs ScW 与搜狗 SoBS_Hint 实测全部 layered;
+/// 真实内容窗——包括被翻成 topmost 的会议窗——不做 layered 透明合成)。
+fn is_layered_window(w: HWND) -> bool {
+    (unsafe { GetWindowLongW(w, GWL_EXSTYLE) } & 0x8_0000) != 0
+}
+
+/// 大尺寸窗口判定(物理px):宽高均 ≥250。
 fn is_large_window(w: HWND) -> bool {
     let mut r = RECT::default();
     let ok = unsafe { GetWindowRect(w, &mut r) }.is_ok();
     ok && (r.right - r.left) >= 250 && (r.bottom - r.top) >= 250
 }
 
+/// 真实内容窗判据(2026-09-09 方向1,勿回退):非 layered 且 ≥250×250。
+/// 免疫进入/退出只认它——显示桌面态的带内"可见窗"是一群小工具窗
+/// (搜狗 SoBS_Status/语言栏 CiceroUIWndFrame/硬件监控浮窗/tooltips)加
+/// layered 透明钩子层,逐类名容忍是打不完的地鼠;按几何+合成特征过滤
+/// 后它们统统不算"有应用窗",免疫才能在显示态正常激活。两个防护保留:
+/// 真实应用窗(≥250 非 layered,含被翻成 topmost 的会议窗,2026-09-04
+/// 用户指令"栅栏不允许浮在应用上")照常让免疫退出;小内容窗若真被
+/// 用户缩到 <250,免疫误激活期间由退出检查自纠。
+fn is_real_app_window(w: HWND) -> bool {
+    !is_layered_window(w) && is_large_window(w)
+}
+
+/// 全带是否存在"真实内容窗"(=有可见的真实应用窗)。免疫(shown-topmost)
+/// 的进入/退出判据。注意与 band_attach_anchor 主规则**不再同源**(2026-09-09):
+/// 主规则锚点仍把小可见窗当锚候选(有锚总比无锚好),免疫只认真实内容窗。
 fn band_has_live_foreign() -> bool {
     let Some(host) = desktop_shell_window() else {
         return true; // 宿主未知时保守视为有(不开免疫)
@@ -928,11 +947,12 @@ fn band_has_live_foreign() -> bool {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
             continue;
         }
-        // topmost 且可见:仅小尺寸杂层容忍(宽高均 <250 物理px 的 SPES 钩子
-        // 层等);大尺寸可视 topmost 窗是真实应用窗(会议/应用窗被翻成
-        // topmost 的场景),必须视为"有可见应用窗"让免疫退出,否则栅栏
-        // 浮在应用上(2026-09-04 用户指令:栅栏不允许浮在应用上)
-        if is_topmost_window(w) && !is_large_window(w) {
+        // 只有真实内容窗(非 layered+≥250×250)才算"有应用窗":topmost 小
+        // 杂层、layered 透明钩子层(ScW/SoBS_Hint 实测)、非 topmost 小工具
+        // 窗(搜狗状态条/语言栏/监控浮窗)一律不算(2026-09-09 方向1)。
+        // 非 layered 大窗(含被翻成 topmost 的会议窗)照常算 live,免疫退出
+        // 防护保留(2026-09-04 用户指令:栅栏不允许浮在应用上)。
+        if !is_real_app_window(w) {
             w = unsafe { GetWindow(w, GW_HWNDPREV) };
             continue;
         }
