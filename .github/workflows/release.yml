@@ -13,8 +13,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract release notes from tag message
+        shell: bash
+        run: git tag -l --format='%(contents)' "${{ github.ref_name }}" > release_notes.md
 
       - name: Test
         run: cargo test --release --locked
@@ -41,11 +48,9 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          # Release 正文 = 同步提交信息:main 上每个发布提交的 message
-          # 就是该版本的全量更新日志,发版那一刻随 Release 一起创建,
-          # 不再依赖 generate_release_notes(无 PR 的直推仓库只会生成
-          # 一行 Full Changelog 链接)。
-          body: ${{ github.event.head_commit.message }}
+          # Release 正文 = annotated tag 注释(全量版本说明),发版那一刻
+          # 随 Release 一起创建;同步提交只留一行短标题,二者解耦。
+          body_path: release_notes.md
           files: |
             target/release/deskfence.exe
             deskfence.exe.sha256
