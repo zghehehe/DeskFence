@@ -324,9 +324,12 @@
        属功能必需保留）。
      - 载体分工：公开 main = 每版本**一个孤儿提交**、标题一行短句
        （如 "DeskFence v0.1.2"）；全量说明放 annotated tag 注释，
-       workflow 用 `git tag -l --format='%(contents)'` 提取为 Release
-       body（checkout 需 fetch-depth:0 + fetch-tags:true）。不用 commit
-       message 当说明——否则 commits 页与 Release 页双份长文。
+       workflow 提取为 Release body。**提取坑（2026-09-10 实锤）**：
+       actions/checkout 会把 tag 简化成指向提交的轻量引用，
+       `git tag -l --format='%(contents)'` 只返回一行 commit message；
+       必须显式 `git fetch --force origin refs/tags/<tag>:refs/tags/<tag>`
+       重取 tag 对象后 `git cat-file tag <tag> | sed '1,/^$/d'` 剥头。
+       不用 commit message 当说明——否则 commits 页与 Release 页双份长文。
      - 公开 main 重建 = 组装孤儿根 + `git push --force origin main`
        覆盖（先例 2026-08-28、2026-09-10）；旧版本 v0.1.x tag 锚定
        各自历史链，源码包与 Release 不受影响。
