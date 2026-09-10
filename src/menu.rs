@@ -650,6 +650,9 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
             ));
         }
         let r = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, menu_host_or(hwnd), None);
+        // 菜单关闭时才发生宿主线程连续段沉底；刷新交互时间戳，让高速
+        // zcheck 在这段 DWM 瞬态内暂不把栅栏逐个拉回，避免整组闪屏。
+        mark_interaction();
         if r.0 == 0 {
             log("track: menu dismissed without selection");
         }

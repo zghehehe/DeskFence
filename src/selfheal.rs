@@ -1166,6 +1166,13 @@ pub(crate) fn z_intent_active() -> bool {
 /// 3 拍自愈。判据:从本窗口向上(GW_HWNDPREV)走能遇到宿主=自己在宿主
 /// 之下;正常在带内时向上走只会到栈顶。无状态锁,可在窗口过程直接调用。
 pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
+    // 菜单刚关闭时系统会把菜单宿主线程的连续 z 段短暂沉底；此时立即
+    // 对每个栅栏 SetWindowPos 会与 DWM 的沉底/恢复重合成撞车，表现为整组
+    // 栅栏闪一下。让这段瞬态先自然收敛，再由下一轮 zcheck/走查统一处理。
+    // 这只抑制菜单交互后的快速通道，不影响真实桌面切换的非交互路径。
+    if crate::ui::last_interaction_elapsed_ms() < 150 {
+        return;
+    }
     let Some(shell) = desktop_shell_window() else { return };
     if shell == hwnd {
         return;
