@@ -967,6 +967,63 @@ fn band_has_live_foreign() -> bool {
     false
 }
 
+/// 免疫激活瞬间的判定黑匣子:重新按 band_has_live_foreign 同源规则扫一遍
+/// 带,把每个"可见外来窗"的判定中间量(类名/topmost/尺寸/layered/为何不算
+/// live)写进日志。只解决一件事——2026-09-09 方向1 在会议窗场景误判 live=
+/// false 导致免疫误激活(栅栏压应用),误判瞬间的现场缺失,根因未明。
+fn diagnose_live_foreign(tag: &str) {
+    let Some(host) = desktop_shell_window() else { return };
+    let vs = virtual_screen_rect();
+    let mh = MENU_HOST_HWND.get().copied();
+    let tr = TRAY_HWND.get().copied();
+    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
+    let mut steps = 0usize;
+    let mut seen = 0usize;
+    while w.0 != 0 && steps < 1000 {
+        steps += 1;
+        if is_own_fence_window(w) || band_aux(w, mh, tr) || band_invisible(w, &vs) {
+            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            continue;
+        }
+        seen += 1;
+        let mut cb = [0u16; 32];
+        let cn = unsafe { GetClassNameW(w, &mut cb) };
+        let ex = unsafe { GetWindowLongW(w, GWL_EXSTYLE) };
+        let mut r = RECT::default();
+        let _ = unsafe { GetWindowRect(w, &mut r) };
+        let (ww, hh) = (r.right - r.left, r.bottom - r.top);
+        let tm = (ex & 0x8) != 0;
+        let ly = (ex & 0x8_0000) != 0;
+        let big = ww >= 250 && hh >= 250;
+        let why = if tm && !big {
+            "topmost-small"
+        } else if !big {
+            "small"
+        } else if is_large_window(w) {
+            "LIVE(real)"
+        } else {
+            "rect-unreliable"
+        };
+        log(&format!(
+            "{}: step {} 0x{:x} cls={} vis=1 topm={} layered={} {}x{} big={} -> {}",
+            tag,
+            steps,
+            w.0,
+            String::from_utf16_lossy(&cb[..cn.max(0) as usize]),
+            tm as u8,
+            ly as u8,
+            ww,
+            hh,
+            big as u8,
+            why
+        ));
+        w = unsafe { GetWindow(w, GW_HWNDPREV) };
+    }
+    if seen == 0 {
+        log(&format!("{}: no visible foreign window in {} steps", tag, steps));
+    }
+}
+
 /// 免疫模式切换:SetWindowPos(HWND_TOPMOST/NOTOPMOST) 是唯一可靠的
 /// topmost 位操作方式(SetWindowLongW 改不动,实测)。
 fn fence_apply_shown_topmost(on: bool) -> usize {
@@ -1029,6 +1086,11 @@ fn shown_topmost_tick() {
     if shown {
         let s = SHOWN_STABLE.fetch_add(1, Ordering::Relaxed) + 1;
         if !prev && s >= 2 {
+            // 黑匣子(2026-09-10):免疫激活瞬间 dump 一次带内"可见外来窗"判定
+            // 明细——2026-09-09 方向1 因会议窗场景 live 误判误激活(栅栏 topmost
+            // 压应用,任务栏切换失效)被 revert,误判瞬间的中间量缺失导致根因
+            // 未明。有此明细即可精确修判据(目标:fail-safe,存疑不激活)。
+            diagnose_live_foreign("shown-topmost ON");
             // 栅栏全部隐藏(zen 瞬态)时不切
             let any_visible = {
                 let st = state().lock().unwrap();
