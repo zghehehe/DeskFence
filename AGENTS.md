@@ -469,7 +469,9 @@
     - 机器判定（探针/探测器）通过≠用户体感通过，涉及闪屏/浮窗的
       改动必须等用户实测确认再提交。
 
-13. **菜单后点空白闪屏——带底 churn 区与就位锚点（2026-08-29 终修，勿回退）**：
+13. **菜单后点空白闪屏——带底 churn 区与就位锚点（2026-08-29 终修，勿回退）**
+    **【2026-09-10 机制已换代，见条目 14：churn/深度门槛/深位回退已删，
+    本节仅存史，勿按此恢复】**：
     症状=托盘/倒三角菜单关闭后点桌面空白，桌面快速小闪。机制：Win+D 后
     `fence_reanchor_if_below_host`/走查修复把栅栏拉回 `desktop_insert_after`
     （=宿主正上方=z 栈 1-5 步）——正是 2b51566 点名的 menu-churn 区；菜单
@@ -549,6 +551,11 @@
       一台机器上反复调用后会静默失灵(切换无效果、无日志),真实
       Win+D 或 envreset 可解——机器验证切换行为时 COM 调用控制在
       2-3 次内。
+      **【2026-09-10 已退役，勿按此节恢复】** topmost 免疫整套
+      （shown_topmost_tick/SHOWN_PENDING 快速通道/band_has_live_
+      foreign 判据链）已随所有权架构删除：它就是"会议窗场景误判
+      live=false → 栅栏 topmost 压在应用上、任务栏点不动"的根源。
+      沉底问题由条目 14 的 owned 窗口在结构上阻断，本节仅存史。
     - **快速通道(同日补,勿回退)**:①进入——`fence_reanchor_if_
       below_host` 沉底瞬间若 `band_has_live_foreign()==false` 直接
       HWND_TOPMOST(不等走查 2 拍;否则用户"刚到桌面就点菜单"仍在
@@ -559,6 +566,57 @@
       `band_attach_anchor` 解析的最低可见外来窗之下——**绝不用
       HWND_NOTOPMOST 做第一选择**(它会先把栅栏抬到非 topmost 带顶
       =浮在应用上再等人压,只留作锚解析失败兜底)。
+    - **【2026-09-10 判据已换代】**本节(含 13 条)的 churn 区/带底
+      扰动区/深度门槛(CHURN_BLOCK_DEPTH)/深位垫窗回退全部随条目 14
+      的所有权架构删除,勿再按"锚点要躲开带底"的旧语义改代码。
+      现行锚点语义只剩一条:`resolve_band_anchor` 单遍受限扫描,
+      不越过最低真实可见应用窗,topmost 只作终止边界,坏锚重试走
+      同一规则;栅栏沉不到宿主之下(owned),无需再躲任何带底区块。
+
+14. **沉底根治——栅栏所有权架构（2026-09-10 终修，勿回退）**：
+    旧架构的根本缺陷是栅栏为**无 owner 的顶层 WS_POPUP**，能否留在
+    桌面全靠自愈代码反复重排 z 序。菜单关闭/Win+D 时系统把"菜单宿主
+    所在线程的连续 z 段"整块静默压到宿主之下（发 CHANGING 但带
+    NOMOVE|NOSIZE 的 z 变更可被否决；纯静默路径不可），栅栏跟着沉底、
+    自愈再逐个拉回=整组闪。四轮失败（20 步深度门槛 297eca7、分隔窗
+    ee0ed92、放宽免疫 0754d03、延迟拉回 fac5531）都在治标，没有改变
+    "栅栏可以被压到壁纸下面"这个前提。终修（7858ab6）：
+    - **栅栏 = 桌面宿主持有的顶层 owned 窗口**：create_fence_window
+      的 CreateWindowExW 第 9 参从 HWND(0) 改为 desktop_shell_window()
+      （Win32 官方语义：owned 窗口必须永远在 owner 之上；注意不是
+      WS_CHILD/SetParent——分层子窗口挂 Progman 下不会绘制，历史已踩）。
+      效果：系统沉底动作从"静默发生、事后拉回"变成"CHANGING 消息
+      可达、z 守卫当场否决"。日志指纹从 `track dismissed` 后 6 条
+      `re-anchored` 变成 6 条无害的 `external z change vetoed
+      flags=0x217`（0x200 位=代码统一注入的 SWP_NOOWNERZORDER，
+      防 owned 调整带动 owner）。
+    - **锚点解析单遍化**：`resolve_band_anchor`（纯函数，可单测）+
+      `band_attach_anchor(host, skip)` 两参包装。规则：从宿主向上
+      一遍扫描；真实可见非 topmost 外来窗是硬上界（能锚它就锚，它是
+      坏锚才用此前扫过的隐形垫窗/兄弟栅栏）；topmost 一律终止搜索；
+      所有出口排除宿主/自身/topmost/坏锚；无合格候选返回 None 不动
+      （绝不回退宿主/HWND_TOP）。调用方：创建(ui.rs 传实际 hwnd)、
+      reanchor、走查 repair、lower（下压也走同一 resolver，修掉了
+      "紧贴 blocker 上方被 GW_HWNDNEXT 反向邻接误判为已归位"的 bug）。
+    - **删除两套互殴机制**：churn 区健康晋升（promote-*）、topmost
+      免疫全套。删晋升的依据：owned 关系已保证宿主下界，健康栅栏
+      不需要也不应该再被主动重排（重排本身=重合成闪）。删免疫的
+      依据：会议窗 live 误判压应用（任务栏点不动）已被用户实锤两次。
+    - **重呈现与 z 解耦**：global_tick 的恢复分支只对"缺 presented/
+      缺 surface"的栅栏 ULW 重提交（fence_needs_presentation），
+      三拍防抖期的纯 z 失位不再触发全组重呈现；present_fence_only
+      会回写 presented 位。
+    - **repair 防抖**：Blocked 的 attempt 现在受 advanced 门控，
+      计数未推进的同一拍不再重复消费第 3/13/23… 拍的修复机会。
+    - **已知残留（2026-09-10）**：菜单打开瞬间偶发 1 次单栅栏
+      re-anchor（11:29:08 实录，锚在深位，比旧版整组沉底轻一个量级）；
+      周期性 veto 记录（Explorer/IME 每几分钟试一次重排 owned 链，
+      全被否决）属正常噪声。
+    - **验收基准**：三轮菜单开合日志零 re-anchor/repair/walk-break；
+      sinkwatch 高频采样（tools/sinkwatch.ps1）数万帧 B 段（宿主下方）
+      零 DeskFenceFence；owner 快照六栅栏 owner=Progman、非 topmost、
+      全可见。回归工具：`powershell -File tools/sinkwatch.ps1 <ms> <out>`，
+      判据 `B[0-9]+,.*,DeskFenceFence,` 计数必须为 0。
 
 ## 代码位置备忘
 
