@@ -1197,10 +1197,6 @@ pub fn mark_interaction() {
     LAST_INTERACTION_MS.store(resize_now_ms(), Ordering::Relaxed);
 }
 
-pub fn last_interaction_elapsed_ms() -> u64 {
-    resize_now_ms().saturating_sub(LAST_INTERACTION_MS.load(Ordering::Relaxed))
-}
-
 /// 比较新旧快照内容。**带每通道 8 的容差**:PrintWindow 捕获的壁纸亮度
 /// 存在 ~4% 的时序波动(ICC/伽马路径),逐字节严格比较会把波动当成
 /// "壁纸变了",触发无谓的全量重绘——栅栏区域整面 4% 亮度先跳再回,
