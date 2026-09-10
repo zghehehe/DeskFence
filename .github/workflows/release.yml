@@ -41,7 +41,11 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          # Release 正文 = 同步提交信息:main 上每个发布提交的 message
+          # 就是该版本的全量更新日志,发版那一刻随 Release 一起创建,
+          # 不再依赖 generate_release_notes(无 PR 的直推仓库只会生成
+          # 一行 Full Changelog 链接)。
+          body: ${{ github.event.head_commit.message }}
           files: |
             target/release/deskfence.exe
             deskfence.exe.sha256
-          generate_release_notes: true
