@@ -2187,10 +2187,8 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         unsafe {
             let _ = ReleaseCapture();
         }
-        // 拖拽期间被拖栅栏被提升到兄弟栅栏之上(仅 band 内);拖拽结束立即
-        // 归位带内绝缘位(最低可见外来窗正下方,与整链同位;勿回退到宿主
-        // 正上方——带底扰动区)。若等自愈兜底,栅栏会在其他窗口上方漂移=
-        // 用户看到的"栅栏浮在别的窗口上方"。
+        // 拖拽结束使用与自愈相同的受限锚点归位,不得越过首个可见普通
+        // 外来窗。传入实际 HWND 排除自身;没有安全锚点则保持当前位置。
         {
             let s = state().lock().unwrap();
             let hosts = desktop_hosts();
@@ -2200,8 +2198,8 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             if let Some((hidden, rect)) = target {
                 if !hidden {
                     if let Some(host) = host_for_rect(&rect, &hosts) {
-                        if let Some(after) = band_attach_anchor(host.hwnd, HWND(0), false) {
-                            if let Some(fh) = s.windows.get(&fence_id) {
+                        if let Some(fh) = s.windows.get(&fence_id) {
+                            if let Some(after) = band_attach_anchor(host.hwnd, *fh) {
                                 let _z = z_scope(ZIntent::Drag);
                                 unsafe {
                                     let _ = SetWindowPos(

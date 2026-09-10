@@ -981,16 +981,15 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
     let hinstance = hinstance();
     let w = fence.rect.w.round() as i32;
     let h = fence.rect.h.round() as i32;
-    // 顶层分层窗口 + z 序插到桌面宿主(WorkerW/Progman)之后 ——
-    // 位于壁纸/桌面图标层之上、所有普通窗口之下,常驻桌面且不浮窗。
-    // 注意:绝不能做成桌面子窗口(分层子窗口挂在 Progman 下不会绘制),
-    // 也绝不能回退 HWND_TOP(会浮到应用之上);找不到宿主就延迟创建,
-    // 由全局定时器每秒重试自愈。
+    // 保持顶层分层 WS_POPUP,由桌面宿主持有,不是 WS_CHILD/SetParent。
+    // owned popup 必须在 owner 之上,避免显示桌面后被再次压到壁纸下面。
+    // 普通应用之下的上界仍由 band 就位维护;找不到宿主则延迟创建。
     let host = host_for_rect(&fence.rect, hosts);
     if host.is_none() {
         log(&format!("no desktop host yet, defer fence {}", fence_id));
         return false;
     }
+    let Some(owner) = desktop_shell_window() else { return false };
     let _zcreate = z_scope(ZIntent::Create);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1004,7 +1003,7 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
             0,
             w,
             h,
-            HWND(0),
+            owner,
             HMENU(0),
             hinstance,
             None,
@@ -1017,15 +1016,11 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, fence_id as isize);
         ole::register_drop_target(hwnd, fence_id);
-        // 就位目标:最低可见外来窗正下方(带内绝缘位,见 band_attach_anchor;
-        // 勿回退到"宿主正上方"——带底是菜单开合的扰动区,2026-08-29 闪屏
-        // 根因)。取不到锚点时不动 z——初始位置由全局 tick 的自愈在宿主
-        // 就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
-        // 深位锚(2026-09-08):启动就位与其余三处(reanchor/走查修复/晋升)
-        // 统一;浅位回退在桌面态会把栅栏放进菜单静默沉底的扰动区(大闪根因)
-        let insert_after = match host.and_then(|h| band_attach_anchor(h.hwnd, HWND(0), true)) {
+        // owned 关系约束宿主下界;锚点限制应用上界,不能跨过最低可见应用窗。
+        // 无安全锚点时不使用 HWND_TOP/topmost,留待下一轮就位。
+        let insert_after = match host.and_then(|h| band_attach_anchor(h.hwnd, hwnd)) {
             Some(a) => Some(a),
-            None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), true)),
+            None => band_attach_anchor(owner, hwnd),
         };
         let mut attached = false;
         if let Some(after) = insert_after {
@@ -1628,7 +1623,7 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
 
 /// 刷新单个栅栏
 pub fn present_fence_only(fence_id: u32) {
-    let s = state().lock().unwrap();
+    let mut s = state().lock().unwrap();
     let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
         return;
     };
@@ -1638,12 +1633,18 @@ pub fn present_fence_only(fence_id: u32) {
     let Some(surface) = s.surfaces.get(&fence_id) else {
         return;
     };
-    let _ = render::present_existing_surface(
+    let ok = render::present_existing_surface(
         surface,
         hwnd,
         fence.rect.x.round() as i32,
         fence.rect.y.round() as i32,
     );
+    if ok {
+        s.presented.insert(fence_id);
+    } else {
+        s.presented.remove(&fence_id);
+        log(&format!("present existing failed fence {fence_id}"));
+    }
 }
 
 pub(crate) fn refresh_fence(fence_id: u32) {
@@ -2832,6 +2833,10 @@ fn finish_rename_if_clicked_outside() {
     }
 }
 
+fn fence_needs_presentation(hidden: bool, presented: bool, has_surface: bool) -> bool {
+    !hidden && (!presented || !has_surface)
+}
+
 /// 全局自愈:定时器与显示变化时调用。
 /// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
 /// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
@@ -2870,25 +2875,21 @@ fn global_tick() {
     // 在 Progman/WorkerW 之间切换宿主,导致桌面反复重建(栅栏消失、桌面空白)。
     // 只用现有宿主,缺失时等待 Explorer 自然重建,由 ensure_all_attached 自愈。
     ensure_all_attached();
-    let needs_represent = {
+    // z 序暂时失位不代表 ULW 表面丢失。只恢复尚未呈现/缺失表面的
+    // 栅栏,不因 attached 的三拍防抖对全组重复提交画面。
+    let ids: Vec<u32> = {
         let s = state().lock().unwrap();
-        let expected = s.fences.iter().filter(|f| !f.hidden).count();
-        expected > 0 && (s.attached.len() < expected || s.presented.len() < expected)
+        s.fences
+            .iter()
+            .filter(|f| fence_needs_presentation(
+                f.hidden,
+                s.presented.contains(&f.id),
+                s.surfaces.contains_key(&f.id),
+            ))
+            .map(|f| f.id)
+            .collect()
     };
-    if needs_represent {
-        // Win+D/three-finger/desktop-host rebuilds can preserve HWNDs while discarding
-        // their layered presentation. 用现有表面立即重呈现(ULW 同一张位图,毫秒级)
-        // 代替全量重绘——精确模式全量重绘 5 个栅栏要 1-2 秒,用户会看到桌面空白。
-        invalidate_hosts_cache();
-        ensure_all_attached();
-        let ids: Vec<u32> = {
-            let s = state().lock().unwrap();
-            s.fences
-                .iter()
-                .filter(|f| !f.hidden)
-                .map(|f| f.id)
-                .collect()
-        };
+    if !ids.is_empty() {
         let mut full = Vec::new();
         {
             let s = state().lock().unwrap();
@@ -3063,8 +3064,8 @@ fn desktop_listview() -> Option<HWND> {
     }
 }
 
-/// 桌面壳窗口（WorkerW 或 Progman）：栅栏 SetWindowPos 插到它之后，
-/// 即 z-order 位于桌面图标层之上、普通窗口之下（常驻桌面且不遮挡窗口）。
+/// 桌面壳窗口(WorkerW 或 Progman),用作顶层栅栏的 owner 和 z 序下界。
+/// SetWindowPos 的锚点必须在其上方;直接锚此窗口表示放在它下面。
 pub(crate) fn desktop_shell_window() -> Option<HWND> {
     let lv = desktop_listview()?;
     unsafe {
@@ -4284,6 +4285,11 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_WINDOWPOSCHANGING => {
+            // 调整 owned 栅栏不能带动 Explorer owner 的层级。
+            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0 {
+                let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+                wp.flags |= SWP_NOOWNERZORDER;
+            }
             // 阻止 Win+D / Win+M 对栅栏的摆布:栅栏常驻桌面,不参与窗口管理。
             // 我们自己主动隐藏(隐藏全部栅栏)时 INTENTIONAL_HIDE 为真,放行;
             // 自家定位操作(创建/拖拽/修复/呈现)以 Z_INTENT 标记放行。
@@ -4441,5 +4447,31 @@ pub(crate) fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
         areas.push(work_area());
     }
     areas
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::fence_needs_presentation;
+
+    #[test]
+    fn healthy_surface_does_not_depend_on_z_attachment() {
+        assert!(!fence_needs_presentation(false, true, true));
+    }
+
+    #[test]
+    fn missing_presentation_or_surface_is_recovered() {
+        assert!(fence_needs_presentation(false, false, true));
+        assert!(fence_needs_presentation(false, true, false));
+        assert!(fence_needs_presentation(false, false, false));
+    }
+
+    #[test]
+    fn hidden_fences_are_not_represented() {
+        for presented in [false, true] {
+            for has_surface in [false, true] {
+                assert!(!fence_needs_presentation(true, presented, has_surface));
+            }
+        }
+    }
 }
 
