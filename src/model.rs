@@ -170,31 +170,6 @@ pub fn snap_fence_size(w: f32, h: f32) -> (f32, f32) {
     )
 }
 
-/// 插入式重排:按给定顺序从 (x0,y0) 起依次排放,同排累积宽度,放不下换行
-/// (下一行 y = 本行最深底边 + GAP)。纯函数,宽度高度逐项给定。
-/// 用于"插入线松手后整链紧凑":[1,2,3] 把 1 插到 2/3 之间 → 2,1,3 依次占位。
-pub fn chain_positions(sizes: &[(f32, f32)], x0: f32, y0: f32, row_right: f32) -> Vec<(f32, f32)> {
-    let mut out = Vec::with_capacity(sizes.len());
-    let mut x = x0;
-    let mut y = y0;
-    let mut row_bottom = y0;
-    let mut row_first = true;
-    for &(w, h) in sizes {
-        // 换行以工作区绝对右缘为准(x0 起步时行宽只剩 row_right-x0),
-        // 否则链会排到屏幕外,后续夹回又引发推挤
-        if !row_first && x + w > row_right {
-            x = x0;
-            y = row_bottom + GAP;
-            row_bottom = y;
-        }
-        out.push((x, y));
-        row_bottom = row_bottom.max(y + h);
-        x += w + GAP;
-        row_first = false;
-    }
-    out
-}
-
 /// 两个矩形是否相交
 pub fn intersects(a: &Rect, b: &Rect) -> bool {
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
@@ -260,13 +235,13 @@ pub fn push_chain(rects: &mut [Rect], anchor: usize) {
     for _ in 0..32 {
         let mut moved = false;
         let a = rects[anchor];
-        for i in 0..rects.len() {
+        for (i, slot) in rects.iter_mut().enumerate() {
             if i == anchor {
                 continue;
             }
-            let old = rects[i];
-            rects[i] = push_away(&a, &old);
-            if rects[i] != old {
+            let old = *slot;
+            *slot = push_away(&a, &old);
+            if *slot != old {
                 moved = true;
             }
         }
@@ -290,6 +265,228 @@ pub fn push_chain(rects: &mut [Rect], anchor: usize) {
             break;
         }
     }
+}
+
+// ---------- settle 行贴顶归一(P1 布局规范化第一步) ----------
+
+/// 同一行所有栅栏的 y 归一到该行最顶栅栏的顶边，只动 y 不动 x/尺寸。
+/// 行结构与 rows_from_rects 同源；归一可能新引入的行间挤压由调用方
+/// 既有的推挤/夹回兜底。返回是否有矩形被改动。
+pub fn align_rows_top(rects: &mut [Rect]) -> bool {
+    let rows = rows_from_rects(rects);
+    let mut changed = false;
+    for row in &rows {
+        let top = row.iter().map(|&i| rects[i].y).fold(f32::MAX, f32::min);
+        for &i in row {
+            if rects[i].y != top {
+                rects[i].y = top;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// 行间固定间隔(P1 布局规范化第二步)：自上而下级联，每行顶边 =
+/// 上一行最深底边 + GAP(与水平间距同源常量)。行距不足被推下、过远
+/// 被拉上；首行顶边保持不动(整列锚定，不向左上漂移)。行序天然保持
+/// (落点必在上一行底 + GAP，恒 > 上一行底)，行间不会交叉。
+/// 输入应为已行贴顶的矩形(先跑 align_rows_top)，行结构与
+/// rows_from_rects 同源。返回是否有矩形被改动。
+pub fn space_rows_gap(rects: &mut [Rect]) -> bool {
+    let rows = rows_from_rects(rects);
+    let mut changed = false;
+    let mut prev_bottom: Option<f32> = None;
+    for row in &rows {
+        if let Some(pb) = prev_bottom {
+            let top = row.iter().map(|&i| rects[i].y).fold(f32::MAX, f32::min);
+            let want = pb + GAP;
+            if top != want {
+                let dy = want - top;
+                for &i in row {
+                    rects[i].y += dy;
+                }
+                changed = true;
+            }
+        }
+        let bottom = row
+            .iter()
+            .map(|&i| rects[i].y + rects[i].h)
+            .fold(f32::MIN, f32::max);
+        prev_bottom = Some(bottom);
+    }
+    changed
+}
+
+/// 首行贴左(P1 布局规范化第三步)：把首行(rows_from_rects 最上行)整体
+/// 平移，使行内最左栅栏的 x 落到 anchor_x(工作区左缘)——行内间距与
+/// 相对位置保持，只是整排从屏幕左侧起步。anchor_x 由调用方按首行
+/// 最左栅栏所在显示器的工作区取值。返回是否有矩形被改动。
+pub fn align_first_row_left(rects: &mut [Rect], anchor_x: f32) -> bool {
+    let rows = rows_from_rects(rects);
+    let Some(first) = rows.first() else {
+        return false;
+    };
+    let min_x = first
+        .iter()
+        .map(|&i| rects[i].x)
+        .fold(f32::MAX, f32::min);
+    if min_x == anchor_x {
+        return false;
+    }
+    let dx = anchor_x - min_x;
+    for &i in first {
+        rects[i].x += dx;
+    }
+    true
+}
+
+// ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
+
+/// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
+/// 带内按 x 升序。返回各带成员在输入中的下标,带序自上而下。
+/// 任意层数通用(三层/四层…只是多几个带)。
+pub fn rows_from_rects(rects: &[Rect]) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    order.sort_by(|&a, &b| {
+        (rects[a].y + rects[a].h * 0.5)
+            .partial_cmp(&(rects[b].y + rects[b].h * 0.5))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for idx in order {
+        let r = &rects[idx];
+        let start_new = match rows.last() {
+            Some(row) => {
+                let prev = &rects[row[0]];
+                let tol = 0.6 * prev.h.min(r.h).max(24.0);
+                (r.y + r.h * 0.5) - (prev.y + prev.h * 0.5) > tol
+            }
+            None => true,
+        };
+        if start_new {
+            rows.push(vec![idx]);
+        } else {
+            rows.last_mut().unwrap().push(idx);
+        }
+    }
+    for row in rows.iter_mut() {
+        row.sort_by(|&a, &b| {
+            rects[a]
+                .x
+                .partial_cmp(&rects[b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    rows
+}
+
+/// 中心所在行(行 y 中心最近)与行内槽位(中心左侧成员数,0..=行长度)。
+pub fn row_slot_of(rects: &[Rect], rows: &[Vec<usize>], center: (f32, f32)) -> (usize, usize) {
+    let mut best_row = 0usize;
+    let mut bd = f32::MAX;
+    for (ri, row) in rows.iter().enumerate() {
+        let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+            / row.len() as f32;
+        let d = (center.1 - mid).abs();
+        if d < bd {
+            bd = d;
+            best_row = ri;
+        }
+    }
+    let k = rows
+        .get(best_row)
+        .map(|row| {
+            row.iter()
+                .filter(|&&i| rects[i].x + rects[i].w * 0.5 < center.0)
+                .count()
+        })
+        .unwrap_or(0);
+    (best_row, k)
+}
+
+/// 中心 y 到最近行中心的距离(拖远=自由放置区的判定输入)。
+pub fn nearest_row_distance(rects: &[Rect], rows: &[Vec<usize>], y: f32) -> f32 {
+    rows.iter()
+        .map(|row| {
+            let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+                / row.len() as f32;
+            (y - mid).abs()
+        })
+        .fold(f32::MAX, f32::min)
+}
+
+/// 行内插入落位(纯几何)。rects 含被拖者(a_idx)。A 从所在行拔出插入
+/// target=(行,位):受影响的两行按"行锚点x + 各自宽度 + GAP"行内重排
+/// (锚点=该行原首成员的 x/y),行 y 取原顶;未涉及的行一个像素不动,
+/// 尺寸全部保持各自——结构性保证不重叠、不塌行、不乱桌。
+/// 返回(逐输入下标的新位置, A 的落点)。
+pub fn row_insert_layout(
+    rects: &[Rect],
+    a_idx: usize,
+    target: (usize, usize),
+) -> (Vec<(f32, f32)>, (f32, f32)) {
+    let rows = rows_from_rects(rects);
+    let mut out: Vec<(f32, f32)> = rects.iter().map(|r| (r.x, r.y)).collect();
+    let slot = |i: usize| (rects[i].x, rects[i].y);
+    let (hr, hj) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(ri, row)| row.iter().position(|&i| i == a_idx).map(|j| (ri, j)))
+        .unwrap_or((0, 0));
+    let (tr, tk) = target;
+    if (hr, hj) == (tr, tk) {
+        return (out, slot(a_idx));
+    }
+    // 行锚点=该行(含 A)最左成员的 x/y:行首成员移走时,后继成员左滑
+    // 接管行首槽(体感:第一行第一个移走/插入,行首永远有栅栏在)
+    let anchor_i = rows[hr]
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            rects[a]
+                .x
+                .partial_cmp(&rects[b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap();
+    let (ax, ay) = slot(anchor_i);
+    let flow = |out: &mut Vec<(f32, f32)>, members: &[usize], x0: f32, y0: f32| {
+        let mut x = x0;
+        for &i in members {
+            out[i] = (x, y0);
+            x += rects[i].w + GAP;
+        }
+    };
+    if tr == hr {
+        let row = &rows[hr];
+        let mut order: Vec<usize> = row.clone();
+        order.remove(hj);
+        let k2 = (if tk > hj { tk - 1 } else { tk }).min(order.len());
+        order.insert(k2, a_idx);
+        flow(&mut out, &order, ax, ay);
+    } else {
+        let rest: Vec<usize> = rows[hr].iter().copied().filter(|&i| i != a_idx).collect();
+        if !rest.is_empty() {
+            flow(&mut out, &rest, ax, ay);
+        }
+        let row_t = &rows[tr.min(rows.len() - 1)];
+        let mut order: Vec<usize> = row_t.clone();
+        let k2 = tk.min(order.len());
+        order.insert(k2, a_idx);
+        let (tx, ty) = slot(row_t[0]);
+        flow(&mut out, &order, tx, ty);
+    }
+    let land = out[a_idx];
+    (out, land)
+}
+
+/// 当前 epoch 毫秒(墓碑/使用统计等墙钟时间戳用)
+pub fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 把栅栏组约束进工作区 [vx,vy,vw,vh]：
@@ -522,113 +719,6 @@ pub fn snap_rect_grid(r: &Rect) -> Rect {
     }
 }
 
-/// 单轴磁吸候选：`value` 是被拖栅栏 left/top 的目标坐标，`guide` 是对齐参考线坐标。
-#[derive(Clone, Copy)]
-struct SnapCand {
-    value: f32,
-    guide: f32,
-}
-
-/// 收集 x / y 方向的对齐候选边（相邻栅栏四边 ± GAP + 屏幕工作区边缘）。
-fn snap_candidates(
-    r: &Rect,
-    others: &[Rect],
-    vx: f32,
-    vy: f32,
-    vw: f32,
-    vh: f32,
-) -> (Vec<SnapCand>, Vec<SnapCand>) {
-    let mut cand_x: Vec<SnapCand> = vec![
-        SnapCand {
-            value: vx,
-            guide: vx,
-        }, // 屏幕左缘
-        SnapCand {
-            value: vx + vw - r.w,
-            guide: vx + vw,
-        }, // 屏幕右缘
-    ];
-    let mut cand_y: Vec<SnapCand> = vec![
-        SnapCand {
-            value: vy,
-            guide: vy,
-        }, // 屏幕上缘
-        SnapCand {
-            value: vy + vh - r.h,
-            guide: vy + vh,
-        }, // 屏幕下缘
-    ];
-    for o in others {
-        if o.w <= 0.0 || o.h <= 0.0 {
-            continue;
-        }
-        cand_x.push(SnapCand {
-            value: o.x,
-            guide: o.x,
-        }); // 左缘对齐
-        cand_x.push(SnapCand {
-            value: o.x + o.w - r.w,
-            guide: o.x + o.w,
-        }); // 右缘对齐
-        cand_x.push(SnapCand {
-            value: o.x - GAP - r.w,
-            guide: o.x,
-        }); // 贴到 other 左侧（留 GAP）
-        cand_x.push(SnapCand {
-            value: o.x + o.w + GAP,
-            guide: o.x + o.w,
-        }); // 贴到 other 右侧（留 GAP）
-        cand_y.push(SnapCand {
-            value: o.y,
-            guide: o.y,
-        }); // 上缘对齐
-        cand_y.push(SnapCand {
-            value: o.y + o.h - r.h,
-            guide: o.y + o.h,
-        }); // 下缘对齐
-        cand_y.push(SnapCand {
-            value: o.y - GAP - r.h,
-            guide: o.y,
-        }); // 贴到 other 上方（留 GAP）
-        cand_y.push(SnapCand {
-            value: o.y + o.h + GAP,
-            guide: o.y + o.h,
-        }); // 贴到 other 下方（留 GAP）
-    }
-    (cand_x, cand_y)
-}
-
-/// 单轴磁吸：返回 (吸附后值, 对齐参考线坐标, 是否吸附)。
-/// 即使与候选边距离为 0（本已对齐）也视为「已吸附」，避免再次被网格挪歪。
-fn snap_axis(v: f32, candidates: &[SnapCand]) -> (f32, f32, bool) {
-    let mut best = v;
-    let mut best_guide = v;
-    let mut best_d = f32::MAX;
-    for c in candidates {
-        let d = (c.value - v).abs();
-        if d < SNAP_THRESHOLD && d < best_d {
-            best_d = d;
-            best = c.value;
-            best_guide = c.guide;
-        }
-    }
-    (best, best_guide, best_d < f32::MAX)
-}
-
-/// 把 rect 磁吸到相邻栅栏的边（含 GAP 间距）与屏幕工作区边缘。
-/// x / y 各自独立选择阈值内位移最小的对齐候选，实现「拖到正下方/正右方
-/// 保持 GAP 固定间距」以及横竖左右对齐。
-#[allow(dead_code)] // 纯逻辑 API，供单元测试使用
-pub fn snap_to_neighbors(r: &Rect, others: &[Rect], vx: f32, vy: f32, vw: f32, vh: f32) -> Rect {
-    let (cand_x, cand_y) = snap_candidates(r, others, vx, vy, vw, vh);
-    let mut nr = *r;
-    let (nx, _, _) = snap_axis(r.x, &cand_x);
-    let (ny, _, _) = snap_axis(r.y, &cand_y);
-    nr.x = nx;
-    nr.y = ny;
-    nr
-}
-
 /// 水平重叠深度（正值 = 重叠量）
 #[allow(dead_code)]
 fn overlap_x(a: &Rect, b: &Rect) -> f32 {
@@ -752,19 +842,10 @@ pub struct FileItem {
 }
 
 // ---------- 分类 ----------
-/// 栅栏分类顺序（默认布局从左到右）：软件 → 文件夹 → 文档 → 图片 → 媒体 → 代码 → 压缩包 → 其他。
-/// 回收站虚拟图标固定在"软件"栅栏第一位（见 RECYCLE_BIN_PATH）。
-pub const CATEGORIES: [&str; 8] = [
-    "软件",
-    "文件夹",
-    "文档",
-    "图片",
-    "媒体",
-    "代码",
-    "压缩包",
-    "其他",
-];
-
+/// 栅栏分类顺序（默认布局从左到右）见 default_categories():
+/// 软件 → 文件夹 → 文档 → 图片 → 媒体 → 代码 → 压缩包 → 其他(兜底,不可删)。
+/// 回收站虚拟图标固定在第一类栅栏第一位（见 RECYCLE_BIN_PATH）。
+/// (2026-09-08 起:顺序与映射由可编辑分类表承载,不再有独立的顺序常量)
 pub const CATEGORY_COLORS: [[f32; 3]; 8] = [
     [0.51, 0.46, 0.86], // 软件 紫
     [0.85, 0.64, 0.27], // 文件夹 琥珀（柔和）
@@ -776,6 +857,42 @@ pub const CATEGORY_COLORS: [[f32; 3]; 8] = [
     [0.55, 0.56, 0.60], // 其他 灰
 ];
 
+/// 兜底分类:分类表里名为"其他"的条目不可删除、不可改名(面板强制)。
+/// 删除分类/扩展名未匹配/目录类缺失的文件全部归它——不变式:任何时刻
+/// 所有文件都在某个栅栏可见,不隐身(2026-09-08 用户定案)。
+pub const FALLBACK_CATEGORY: &str = "其他";
+
+/// 可编辑分类表条目(2026-09-08 起存 settings.json,面板可增删改名):
+/// name=分类名(与栅栏 category/title 同名关联);exts=内部扩展名映射
+/// (小写无点,暂不提供编辑入口,表结构预留);dirs=是否收纳文件夹
+/// (默认表里只有"文件夹"类为 true,改名跟随、删除则目录落兜底)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CategoryDef {
+    pub name: String,
+    #[serde(default)]
+    pub exts: Vec<String>,
+    #[serde(default)]
+    pub dirs: bool,
+}
+
+fn svec(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+/// 内置 8 类(与历史 categorize 硬编码逐字节一致,老配置无缝迁移)
+pub fn default_categories() -> Vec<CategoryDef> {
+    vec![
+        CategoryDef { name: "软件".into(), exts: svec(&["exe", "msi", "lnk", "bat", "cmd", "com"]), dirs: false },
+        CategoryDef { name: "文件夹".into(), exts: vec![], dirs: true },
+        CategoryDef { name: "文档".into(), exts: svec(&["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "rtf", "log"]), dirs: false },
+        CategoryDef { name: "图片".into(), exts: svec(&["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico"]), dirs: false },
+        CategoryDef { name: "媒体".into(), exts: svec(&["mp3", "wav", "flac", "aac", "ogg", "mp4", "avi", "mkv", "mov", "wmv", "flv"]), dirs: false },
+        CategoryDef { name: "代码".into(), exts: svec(&["js", "ts", "py", "rs", "go", "c", "cpp", "h", "hpp", "java", "cs", "rb", "php", "html", "css", "json", "xml", "yaml", "yml", "toml", "sh", "md"]), dirs: false },
+        CategoryDef { name: "压缩包".into(), exts: svec(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "part"]), dirs: false },
+        CategoryDef { name: FALLBACK_CATEGORY.into(), exts: vec![], dirs: false },
+    ]
+}
+
 /// 回收站虚拟条目的路径（Shell 命名空间 CLSID 解析名）。
 /// 该条目不对应磁盘文件，由 ui 层注入到扫描结果，固定显示在"软件"栅栏第一位。
 pub const RECYCLE_BIN_PATH: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
@@ -784,14 +901,19 @@ pub fn is_recycle_bin(path: &str) -> bool {
     path == RECYCLE_BIN_PATH
 }
 
-/// 回收站虚拟条目（归类为"软件"，使无配置时也落在软件栅栏）
+/// 回收站虚拟条目（归入分类表第一类,使无配置时也落在第一个栅栏;
+/// 用户改名首类后回收站跟随,不因硬编码"软件"失配而隐身）
 pub fn recycle_bin_item() -> FileItem {
+    let cat = category_table()
+        .first()
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "软件".into());
     FileItem {
         name: "回收站".into(),
         path: RECYCLE_BIN_PATH.into(),
         is_dir: true,
         ext: String::new(),
-        category: "软件".into(),
+        category: cat,
         mtime_ms: 0,
     }
 }
@@ -804,29 +926,51 @@ fn ext_of(name: &str) -> &str {
     }
 }
 
+/// 分类表运行时缓存:惰性从 settings.json 加载一次,面板修改后经
+/// set_category_table 同步(进程级 Mutex——categorize 在扫描线程也会被调)
+static CATEGORY_TABLE: std::sync::Mutex<Option<Vec<CategoryDef>>> =
+    std::sync::Mutex::new(None);
+
+/// 当前生效的分类表(惰性加载;未加载前与 load_settings().categories 一致)
+pub fn category_table() -> Vec<CategoryDef> {
+    let mut g = CATEGORY_TABLE.lock().unwrap();
+    if g.is_none() {
+        *g = Some(load_settings().categories);
+    }
+    g.as_ref().unwrap().clone()
+}
+/// 更新分类表缓存(持久化由 ui 层 update_stored_settings 负责)
+pub fn set_category_table(t: Vec<CategoryDef>) {
+    *CATEGORY_TABLE.lock().unwrap() = Some(t);
+}
+
 pub fn categorize(name: &str, is_dir: bool) -> String {
+    categorize_with(&category_table(), name, is_dir)
+}
+
+/// 纯函数版归类(可注入表,单测用):目录归 dirs 标记类(已删则落兜底),
+/// 扩展名按表序首个匹配,无匹配落兜底——任何文件都有归类,不隐身。
+pub fn categorize_with(table: &[CategoryDef], name: &str, is_dir: bool) -> String {
     if is_dir {
-        return "文件夹".into();
+        if let Some(c) = table.iter().find(|c| c.dirs) {
+            return c.name.clone();
+        }
+        return FALLBACK_CATEGORY.into();
     }
     let ext = ext_of(name).to_lowercase();
-    let cat = match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" | "ico" => "图片",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv" | "rtf"
-        | "log" => "文档",
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "mp4" | "avi" | "mkv" | "mov" | "wmv" | "flv" => {
-            "媒体"
-        }
-        "exe" | "msi" | "lnk" | "bat" | "cmd" | "com" => "软件",
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "part" => "压缩包",
-        "js" | "ts" | "py" | "rs" | "go" | "c" | "cpp" | "h" | "hpp" | "java" | "cs" | "rb"
-        | "php" | "html" | "css" | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" => "代码",
-        _ => "其他",
-    };
-    cat.to_string()
+    if let Some(c) = table.iter().find(|c| c.exts.contains(&ext)) {
+        return c.name.clone();
+    }
+    FALLBACK_CATEGORY.into()
 }
 
 pub fn category_index(cat: &str) -> usize {
-    CATEGORIES.iter().position(|c| *c == cat).unwrap_or(7)
+    let table = category_table();
+    table
+        .iter()
+        .position(|c| c.name == cat)
+        .or_else(|| table.iter().position(|c| c.name == FALLBACK_CATEGORY))
+        .unwrap_or(0)
 }
 
 // ---------- 栅栏 ----------
@@ -901,6 +1045,24 @@ pub fn record_open(path: &str) {
     e.last_ms = now;
 }
 
+/// 剔除已不存在文件的常用记录(2026-09-03):usage.json 残留已删路径的话,
+/// 删除后同名新建会继承旧使用次数,直接顶到"常用"排序第一位(用户实测
+/// "新建文本文档跑到第一位"真因)。返回剔除条数,有剔除才回写磁盘。
+pub fn prune_usage(keep: &std::collections::HashSet<String>) -> usize {
+    let mut g = usage_map();
+    let Some(map) = g.as_mut() else {
+        return 0;
+    };
+    let before = map.len();
+    map.retain(|path, _| keep.contains(path));
+    let removed = before - map.len();
+    drop(g);
+    if removed > 0 {
+        save_usage();
+    }
+    removed
+}
+
 pub fn usage_of(path: &str) -> (u32, u64) {
     let g = usage_map();
     g.as_ref()
@@ -911,7 +1073,8 @@ pub fn usage_of(path: &str) -> (u32, u64) {
 
 impl Fence {
     pub fn color(&self) -> [f32; 3] {
-        CATEGORY_COLORS[category_index(&self.category)]
+        // 分类可超过调色板数(用户新增):取模循环取色,绝不越界 panic
+        CATEGORY_COLORS[category_index(&self.category) % CATEGORY_COLORS.len()]
     }
 }
 
@@ -956,7 +1119,7 @@ pub fn layout_with_metrics(fence: &Fence, n_items: usize, metrics: &DpiMetrics) 
     let total_rows = if n_items == 0 {
         0
     } else {
-        (n_items + cols - 1) / cols
+        n_items.div_ceil(cols)
     };
     let max_scroll = total_rows.saturating_sub(rows);
     let mut scroll = fence.scroll_rows.min(max_scroll);
@@ -1084,10 +1247,6 @@ pub fn apply_resize(r: &Rect, edges: &[char], dx: f32, dy: f32) -> Rect {
 }
 
 /// 图标在栅栏内的绘制位置（相对左上角）
-pub fn cell_pos(la: &Layout, index: usize) -> (f32, f32) {
-    cell_pos_with_metrics(la, index, &DpiMetrics::system())
-}
-
 pub fn cell_pos_with_metrics(la: &Layout, index: usize, metrics: &DpiMetrics) -> (f32, f32) {
     let rel = index - la.first_index;
     let row = rel / la.cols;
@@ -1234,9 +1393,9 @@ pub struct Settings {
     /// transparent(渲染模式菜单里能看到当前实际档位)。
     #[serde(default = "default_render_mode")]
     pub render_mode: String,
-    /// 自动分类:true=按固定 8 类(软件/文件夹/文档/图片/媒体/代码/压缩包/其他)
-    /// 自动归类(默认);false=自定义分类模式,不按扩展名归类,文件只进被拖入
-    /// 的栅栏,未分配的文件集中显示在"未分类"栅栏。
+    /// 自动分类:true=按分类表(默认 8 类)按类型自动归类(默认);false=
+    /// 自定义分类模式,文件只进被拖入的栅栏,未归位文件进兜底"其他"(或
+    /// 旧配置里尚存的"未分类"栅栏)。
     #[serde(default = "default_auto_category")]
     pub auto_category: bool,
     /// 桌面状态(2026-08-27 起持久化):"normal"=栅栏显示(默认) /
@@ -1250,6 +1409,22 @@ pub struct Settings {
     /// (2026-08-28 wdprobe 实测)。置 false 回退为纯自愈行为,供降级排查。
     #[serde(default = "default_z_guard")]
     pub z_guard: bool,
+    /// 常显栅栏边框线(默认关):开=全部栅栏常显边框/标题/角手柄,便于观察
+    /// 布局;关=无边框常显(悬停或拖拽时才浮现)。托盘菜单切换即落盘。
+    #[serde(default)]
+    pub show_chrome: bool,
+    /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
+    /// 分类不再自动重建,除非之后出现该类的**新文件**(mtime 晚于删除)。
+    /// 防止"删了的栅栏又冒出来"(回收站恒在=软件类恒有文件,mp3 常驻=
+    /// 媒体类恒有文件,旧的缺类补建逻辑必然复活它们)。
+    #[serde(default)]
+    pub deleted_category_at: std::collections::HashMap<String, u64>,
+    /// 可编辑分类表(2026-09-08):分类名+扩展名映射+是否收纳目录。
+    /// 缺省=内置 8 类,老 settings.json 无此字段时无缝迁移。托盘"自动
+    /// 分类→管理分类"面板增删改名后落盘,categorize/缺类补建/配色索引
+    /// 全部改查此表;删除分类的文件落"其他"(兜底,不可删)。
+    #[serde(default = "default_categories")]
+    pub categories: Vec<CategoryDef>,
 }
 
 pub fn default_desktop_state() -> String {
@@ -1323,15 +1498,21 @@ impl Default for Settings {
             auto_category: default_auto_category(),
             desktop_state: default_desktop_state(),
             z_guard: default_z_guard(),
+            show_chrome: false,
+            deleted_category_at: Default::default(),
+            categories: default_categories(),
         }
     }
 }
 pub fn load_settings() -> Settings {
-    let p = settings_path();
-    if !p.exists() {
+    load_settings_from(&settings_path())
+}
+/// 可注入路径版本(单测用),其余行为与 load_settings 完全一致
+pub fn load_settings_from(path: &std::path::Path) -> Settings {
+    if !path.exists() {
         return Settings::default();
     }
-    let raw = match std::fs::read_to_string(&p) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
         Err(_) => return Settings::default(),
     };
@@ -1352,6 +1533,9 @@ pub fn load_settings() -> Settings {
                 auto_category: default_auto_category(),
                 desktop_state: default_desktop_state(),
                 z_guard: default_z_guard(),
+            show_chrome: false,
+            deleted_category_at: Default::default(),
+            categories: default_categories(),
             }
         }
     }
@@ -1380,7 +1564,7 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
                 windows::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
                     | windows::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
             )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         Ok(())
     }
@@ -1391,8 +1575,12 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 }
 
 pub fn save_settings(s: &Settings) {
+    save_settings_to(&settings_path(), s)
+}
+/// 可注入路径版本(单测用),其余行为与 save_settings 完全一致
+pub fn save_settings_to(path: &std::path::Path, s: &Settings) {
     let json = serde_json::to_string_pretty(s).unwrap_or_default();
-    let _ = atomic_write(&settings_path(), &json);
+    let _ = atomic_write(path, &json);
 }
 
 /// DeskFence 接管会话标记。它只表示本程序曾临时隐藏过原生桌面图标，
@@ -1487,29 +1675,58 @@ pub fn align_local_chain(rects: &mut [Rect], anchor: usize, vx: f32, vy: f32, vw
     }
 }
 
-pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> (f32, bool) {
-    let mut best: Option<(f32, f32)> = None; // (吸附x, 距离)
+/// 邻居等距磁吸(自由档拖拽用;网格档 2026-09-08 棋盘化后只对齐格线
+/// 不再调用本函数)。
+/// x 向——同带(行)邻居左右邻接保持 GAP(原有);
+/// y 向(2026-09-07 新增)——同列邻居三候选:「顶边对齐」y=o.y(吸齐
+/// 行顶,与 P1 行贴顶同款目标)、「紧贴下方」y=o.y+o.h+GAP 与
+/// 「紧贴上方」y=o.y-GAP-r.h(行间邻接,与 P1 行间固定间隔同款)。
+/// 同带/同列判定=y/x 范围重叠留 GAP*0.5 容差;全部候选里只取距离
+/// 最近的一个应用,未命中轴保持原值,吸完的位置即 P1 规范位
+/// (落位后 settle 归一仍会兜底)。返回((x,y), 是否吸附)。
+pub fn snap_gap_to_neighbors(r: &Rect, others: &[Rect], threshold: f32) -> ((f32, f32), bool) {
+    let mut best: Option<(f32, f32, f32)> = None; // (吸附x, 吸附y, 距离)
     let same_row = |o: &Rect| o.y < r.y + r.h + GAP * 0.5 && r.y < o.y + o.h + GAP * 0.5;
+    let same_col = |o: &Rect| o.x < r.x + r.w + GAP * 0.5 && r.x < o.x + o.w + GAP * 0.5;
     for o in others {
-        if !same_row(o) {
-            continue;
+        if same_row(o) {
+            // 放在 o 右侧: x = o.x + o.w + GAP
+            let cand_r = o.x + o.w + GAP;
+            let d_r = (r.x - cand_r).abs();
+            if d_r < threshold && best.is_none_or(|(_, _, d)| d_r < d) {
+                best = Some((cand_r, r.y, d_r));
+            }
+            // 放在 o 左侧: x = o.x - GAP - r.w
+            let cand_l = o.x - GAP - r.w;
+            let d_l = (r.x - cand_l).abs();
+            if d_l < threshold && best.is_none_or(|(_, _, d)| d_l < d) {
+                best = Some((cand_l, r.y, d_l));
+            }
         }
-        // 放在 o 右侧: x = o.x + o.w + GAP
-        let cand_r = o.x + o.w + GAP;
-        let d_r = (r.x - cand_r).abs();
-        if d_r < threshold && best.map_or(true, |(_, d)| d_r < d) {
-            best = Some((cand_r, d_r));
-        }
-        // 放在 o 左侧: x = o.x - GAP - r.w
-        let cand_l = o.x - GAP - r.w;
-        let d_l = (r.x - cand_l).abs();
-        if d_l < threshold && best.map_or(true, |(_, d)| d_l < d) {
-            best = Some((cand_l, d_l));
+        if same_col(o) {
+            // 行顶对齐: y = o.y
+            let cand_t = o.y;
+            let d_t = (r.y - cand_t).abs();
+            if d_t < threshold && best.is_none_or(|(_, _, d)| d_t < d) {
+                best = Some((r.x, cand_t, d_t));
+            }
+            // 紧贴下方: y = o.y + o.h + GAP
+            let cand_d = o.y + o.h + GAP;
+            let d_d = (r.y - cand_d).abs();
+            if d_d < threshold && best.is_none_or(|(_, _, d)| d_d < d) {
+                best = Some((r.x, cand_d, d_d));
+            }
+            // 紧贴上方: y = o.y - GAP - r.h
+            let cand_u = o.y - GAP - r.h;
+            let d_u = (r.y - cand_u).abs();
+            if d_u < threshold && best.is_none_or(|(_, _, d)| d_u < d) {
+                best = Some((r.x, cand_u, d_u));
+            }
         }
     }
     match best {
-        Some((x, _)) => (x, true),
-        None => (r.x, false),
+        Some((x, y, _)) => ((x, y), true),
+        None => ((r.x, r.y), false),
     }
 }
 
@@ -1562,7 +1779,9 @@ pub fn build_global_config(files: &[FileItem]) -> Vec<Fence> {
     }
     let mut out = Vec::new();
     let mut id = 1u32;
-    for cat in CATEGORIES {
+    // 动态分类表(2026-09-08):默认布局跟随可编辑表,不再限定内置 8 类
+    for cat_def in category_table() {
+        let cat: &str = &cat_def.name;
         let list = map.get(cat).cloned().unwrap_or_default();
         if list.is_empty() {
             continue;
@@ -1646,12 +1865,25 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
     // 自定义模式下切换不打乱现状——已建类别栅栏继续按类显示,
     // 只是新建类别栅栏停止、无类可归的进"未分类"。
     let _ = auto_category();
-    if fence.category == UNCATEGORIZED {
-        if !auto_category() {
-            for f in all.iter() {
-                if !pinned_elsewhere(&f.path) && !has_category_fence(&f.category) {
-                    out.push(f.clone());
-                }
+    // 自定义模式的孤儿(未被拖入任何栅栏且其类别无对应栅栏)归属:
+    // 有旧"未分类"栅栏则进它(兼容旧配置),没有才进兜底"其他"——
+    // 2026-09-09 起切自定义模式不再自动新建"未分类"栅栏(用户要求:
+    // 不冒出多余栅栏)。兜底栅栏同时显示自己的常规成员,按路径去重。
+    let orphan_home = if has_category_fence(UNCATEGORIZED) {
+        UNCATEGORIZED
+    } else {
+        FALLBACK_CATEGORY
+    };
+    if !auto_category() && fence.category == orphan_home {
+        let fb_members = fence.category == FALLBACK_CATEGORY;
+        for f in all.iter() {
+            if pinned_elsewhere(&f.path) {
+                continue;
+            }
+            let is_orphan = !has_category_fence(&f.category);
+            let is_member = fb_members && f.category == fence.category;
+            if (is_orphan || is_member) && !out.iter().any(|x| x.path == f.path) {
+                out.push(f.clone());
             }
         }
     } else {
@@ -1691,7 +1923,28 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
             "常用" => {
                 let (ca, la) = usage_of(&a.path);
                 let (cb, lb) = usage_of(&b.path);
-                cb.cmp(&ca).then_with(|| lb.cmp(&la)).then_with(fallback)
+                // 次数并列(典型:都是从未打开的新文件)按 mtime 升序——
+                // 先来的在左、新来的追加靠右(2026-09-03 用户实测反馈)。
+                // 旧实现并列时落到名称码点,"新建 Microsooft Excel"(M)会
+                // 压过先建的"新建 文本文档"(文)排到左边,位置毫无预告。
+                // 文件夹仍优先于文件(与 fallback 习惯一致)。
+                cb.cmp(&ca)
+                    .then_with(|| lb.cmp(&la))
+                    // 到达顺序(登记序):先来在左、后来靠右(迁移/新建的文件
+                    // 追加在末尾,不再被旧 mtime 拉到最前面)
+                    .then_with(|| {
+                        let pa = fence.item_order.iter().position(|p| p == &a.path);
+                        let pb = fence.item_order.iter().position(|p| p == &b.path);
+                        match (pa, pb) {
+                            (Some(x), Some(y)) => x.cmp(&y),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    })
+                    .then_with(|| b.is_dir.cmp(&a.is_dir))
+                    .then_with(|| a.mtime_ms.cmp(&b.mtime_ms))
+                    .then_with(fallback)
             }
             "时间" => b.mtime_ms.cmp(&a.mtime_ms).then_with(fallback),
             "名称" => natural_name_cmp(&a.name, &b.name),
@@ -1703,7 +1956,10 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
                     (Some(x), Some(y)) => x.cmp(&y),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => fallback(),
+                    // 拖拽顺序表里都没有的(纯新建未拖过):按 mtime 升序——
+                    // 先来的在左、新来的追加靠右(2026-09-03 用户实测:excel
+                    // 后建却排到 txt 左边);名称码点无时间语义
+                    (None, None) => a.mtime_ms.cmp(&b.mtime_ms).then_with(fallback),
                 }
             }
         }
@@ -1714,6 +1970,44 @@ pub fn display_list(fence: &Fence, all: &[FileItem]) -> Vec<FileItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_sort_appends_new_files_to_the_right() {
+        // "常用"排序:两个都从未打开过的文件,先建的(mtime 早)在左,
+        // 后建的追加靠右——不吃名称码点(旧实现 latin 文件名会插到中文前)
+        let fence = Fence {
+            id: 1,
+            title: "文档".into(),
+            category: "文档".into(),
+            pinned: vec![],
+            item_order: vec![],
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+            },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: "常用".into(),
+        };
+        let mk = |name: &str, mtime: u64| FileItem {
+            name: name.into(),
+            path: format!(r"C:\Desktop\{name}"),
+            is_dir: false,
+            ext: "txt".into(),
+            category: "文档".into(),
+            mtime_ms: mtime,
+        };
+        // 输入故意先给后建的,验证排序键而非输入顺序
+        let items = vec![mk("新建 Microsoft Excel 工作表.xlsx", 2000), mk("新建 文本文档 (2).txt", 1000)];
+        let out = display_list(&fence, &items);
+        assert_eq!(out[0].name, "新建 文本文档 (2).txt");
+        assert_eq!(out[1].name, "新建 Microsoft Excel 工作表.xlsx");
+    }
 
     #[test]
     fn chain_keeps_drop_position_and_fixed_gaps() {
@@ -1822,11 +2116,73 @@ mod tests {
             h: 704.0,
         }];
         // 靠近"放在 other 左侧"的吸附位(700-12-244=444)时应吸附
-        let (x, snapped) = snap_gap_to_neighbors(&Rect { x: 448.0, ..r }, &others, 18.0);
+        let ((x, y), snapped) = snap_gap_to_neighbors(&Rect { x: 448.0, ..r }, &others, 18.0);
         assert!(snapped && (x - 444.0).abs() < 0.01);
+        assert_eq!(y, 60.0); // 未命中轴保持原值
         // 远离时不吸附
-        let (x2, snapped2) = snap_gap_to_neighbors(&Rect { x: 100.0, ..r }, &others, 18.0);
+        let ((x2, _), snapped2) = snap_gap_to_neighbors(&Rect { x: 100.0, ..r }, &others, 18.0);
         assert!(!snapped2 && x2 == 100.0);
+    }
+
+    #[test]
+    fn gap_snap_aligns_row_top_when_close() {
+        // 同列(与下方一行 x 范围重叠):贴近其顶边(差 12)→ 吸齐行顶
+        let r = Rect {
+            x: 0.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 20.0,
+            y: 112.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((x, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(snapped);
+        assert_eq!(y, 112.0); // 行顶对齐(P1 行贴顶同款)
+        assert_eq!(x, 0.0); // x 轴未命中保持原值
+    }
+
+    #[test]
+    fn gap_snap_stacks_below_at_gap() {
+        // 上方邻居底 200:贴近下方邻接位(200+GAP=212)→ 吸到固定行距
+        let r = Rect {
+            x: 0.0,
+            y: 210.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 0.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((_, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(snapped);
+        assert_eq!(y, 212.0); // P1 行间固定间隔同款
+    }
+
+    #[test]
+    fn gap_snap_no_y_when_column_disjoint() {
+        // x 范围不相交(不同列):不做 y 向吸附,位置原样
+        let r = Rect {
+            x: 500.0,
+            y: 100.0,
+            w: 200.0,
+            h: 100.0,
+        };
+        let others = [Rect {
+            x: 0.0,
+            y: 112.0,
+            w: 200.0,
+            h: 100.0,
+        }];
+        let ((x, y), snapped) = snap_gap_to_neighbors(&r, &others, 18.0);
+        assert!(!snapped);
+        assert_eq!((x, y), (500.0, 100.0));
     }
 
     fn fence(id: u32) -> Fence {
@@ -1870,11 +2226,77 @@ mod tests {
 
     #[test]
     fn categorize_works() {
-        assert_eq!(categorize("a.png", false), "图片");
-        assert_eq!(categorize("b.exe", false), "软件");
-        assert_eq!(categorize("c", false), "其他");
-        assert_eq!(categorize("d", true), "文件夹");
-        assert_eq!(categorize("e.LNK", false), "软件");
+        // 注入默认表(不读真实 settings.json,测试保持确定性)
+        let t = default_categories();
+        assert_eq!(categorize_with(&t, "a.png", false), "图片");
+        assert_eq!(categorize_with(&t, "b.exe", false), "软件");
+        assert_eq!(categorize_with(&t, "c", false), "其他");
+        assert_eq!(categorize_with(&t, "d", true), "文件夹");
+        assert_eq!(categorize_with(&t, "e.LNK", false), "软件");
+        assert_eq!(categorize_with(&t, "F.TXT", false), "文档"); // 扩展名大小写不敏感
+    }
+
+    #[test]
+    fn category_delete_falls_back_to_other() {
+        // 删除"文档"分类后,原属文档的文件落兜底"其他",不隐身(2026-09-08 定案)
+        let t: Vec<CategoryDef> = default_categories()
+            .into_iter()
+            .filter(|c| c.name != "文档")
+            .collect();
+        assert_eq!(categorize_with(&t, "a.txt", false), "其他");
+        assert_eq!(categorize_with(&t, "a.pdf", false), "其他");
+        assert_eq!(categorize_with(&t, "a.png", false), "图片");
+    }
+
+    #[test]
+    fn category_rename_follows() {
+        // 改名后扩展名跟随新名(文件与栅栏由 ui 层同步改名)
+        let mut t = default_categories();
+        for c in t.iter_mut() {
+            if c.name == "文档" {
+                c.name = "资料".into();
+            }
+        }
+        assert_eq!(categorize_with(&t, "a.txt", false), "资料");
+    }
+
+    #[test]
+    fn dir_category_rename_and_delete() {
+        // 目录类的 dirs 标记随改名跟随;删除该类后目录落兜底
+        let mut t = default_categories();
+        for c in t.iter_mut() {
+            if c.name == "文件夹" {
+                c.name = "目录".into();
+            }
+        }
+        assert_eq!(categorize_with(&t, "any", true), "目录");
+        let t2: Vec<CategoryDef> = t.into_iter().filter(|c| !c.dirs).collect();
+        assert_eq!(categorize_with(&t2, "any", true), "其他");
+    }
+
+    #[test]
+    fn new_empty_category_receives_nothing() {
+        // 面板新增的空分类(无扩展名)不吸走任何现有文件;面板建栏后靠拖入(pin)
+        let mut t = default_categories();
+        t.push(CategoryDef {
+            name: "设计".into(),
+            exts: vec![],
+            dirs: false,
+        });
+        assert_eq!(categorize_with(&t, "a.txt", false), "文档");
+        assert_eq!(categorize_with(&t, "b.png", false), "图片");
+    }
+
+    #[test]
+    fn legacy_settings_without_categories_get_default_table() {
+        // 旧版 settings.json 无 categories 字段 → 无缝迁移为内置 8 类
+        let dir = std::env::temp_dir().join(format!("df_settings_legacy_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        std::fs::write(&p, r#"{"align_mode":"auto"}"#).unwrap();
+        let s = load_settings_from(&p);
+        assert_eq!(s.categories, default_categories());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2395,39 +2817,6 @@ mod tests {
     }
 
     #[test]
-    fn chain_positions_compact_and_wrap() {
-        // [A,B,C] 等宽从 x=0 排:间距 GAP 累积
-        let slots = chain_positions(
-            &[(100.0, 50.0), (100.0, 50.0), (100.0, 50.0)],
-            0.0,
-            0.0,
-            1000.0,
-        );
-        assert_eq!(slots[0], (0.0, 0.0));
-        assert_eq!(slots[1], (112.0, 0.0));
-        assert_eq!(slots[2], (224.0, 0.0));
-        // 宽度不够换行:第三项 224+100 > 250 → 换到 y=50+GAP
-        let slots = chain_positions(
-            &[(100.0, 50.0), (100.0, 50.0), (100.0, 50.0)],
-            0.0,
-            0.0,
-            250.0,
-        );
-        assert_eq!(slots[2], (0.0, 62.0));
-        // 不等高换行:行底取最深者
-        let slots = chain_positions(
-            &[(100.0, 80.0), (100.0, 30.0), (100.0, 30.0)],
-            0.0,
-            0.0,
-            250.0,
-        );
-        assert_eq!(slots[2], (0.0, 92.0));
-        // 换行以绝对右缘为准:x0=100 时行宽只剩 150,第二项就换行
-        let slots = chain_positions(&[(100.0, 50.0), (100.0, 50.0)], 100.0, 0.0, 250.0);
-        assert_eq!(slots[0], (100.0, 0.0));
-        assert_eq!(slots[1], (100.0, 62.0));
-    }
-
     fn fit_to_screen_clamps_without_scaling() {
         // 整体超出屏幕时：不再缩放尺寸，平移+夹回即可
         let mut rects = vec![
@@ -2676,78 +3065,6 @@ mod tests {
     }
 
     #[test]
-    fn snap_below_neighbor_keeps_gap() {
-        let other = Rect {
-            x: 40.0,
-            y: 40.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        // 拖到 other 正下方，y 距 40+300+12=352 差 5，应吸附
-        let r = Rect {
-            x: 40.0,
-            y: 347.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        let s = snap_to_neighbors(&r, &[other], 0.0, 0.0, 1920.0, 1040.0);
-        assert_eq!(s.y, 352.0, "{:?}", s);
-        assert_eq!(s.x, 40.0);
-    }
-
-    #[test]
-    fn snap_right_neighbor_keeps_gap() {
-        let other = Rect {
-            x: 40.0,
-            y: 40.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        // 拖到 other 正右方，x 距 40+200+12=252 差 4，应吸附
-        let r = Rect {
-            x: 248.0,
-            y: 40.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        let s = snap_to_neighbors(&r, &[other], 0.0, 0.0, 1920.0, 1040.0);
-        assert_eq!(s.x, 252.0, "{:?}", s);
-        assert_eq!(s.y, 40.0);
-    }
-
-    #[test]
-    fn snap_ignores_far_neighbor() {
-        let other = Rect {
-            x: 40.0,
-            y: 40.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        let r = Rect {
-            x: 400.0,
-            y: 400.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        let s = snap_to_neighbors(&r, &[other], 0.0, 0.0, 1920.0, 1040.0);
-        assert_eq!(s.x, 400.0);
-        assert_eq!(s.y, 400.0);
-    }
-
-    #[test]
-    fn snap_to_screen_edge() {
-        let r = Rect {
-            x: 4.0,
-            y: 6.0,
-            w: 200.0,
-            h: 300.0,
-        };
-        let s = snap_to_neighbors(&r, &[], 0.0, 0.0, 1920.0, 1040.0);
-        assert_eq!(s.x, 0.0);
-        assert_eq!(s.y, 0.0);
-    }
-
-    #[test]
     fn flow_layout_same_row_sorts_by_x() {
         // 乱序但 y 重叠 → 同行，按 x 左对齐流式排列
         let mut rects = vec![
@@ -2885,5 +3202,299 @@ mod tests {
         assert!(la2.total_rows <= la2.rows);
         let h2 = hit_test(&f, &la2, 194.0, 60.0, 4);
         assert_ne!(h2, Hit::Scrollbar);
+    }
+
+    // ---------- 拖拽落位(2026-09-02 行内槽位模型) ----------
+
+    fn rr(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    /// 两行基准布局(7 成员,被拖者 A 固定 a_idx=6):
+    /// 上行 [M0(0,0,244) M1(256,0,244) M2(512,0,132)],
+    /// 下行 [M3(0,112,244) M4(256,112,132) M5(400,112,132)]
+    fn two_row_layout(a: Rect) -> Vec<Rect> {
+        vec![
+            rr(0.0, 0.0, 244.0, 100.0), // 0 M0
+            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
+            rr(512.0, 0.0, 132.0, 100.0), // 2 M2
+            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(256.0, 112.0, 132.0, 100.0), // 4 M4
+            rr(400.0, 112.0, 132.0, 100.0), // 5 M5
+            a,                          // 6 A(被拖者)
+        ]
+    }
+
+    fn assert_no_overlap(rects: &[Rect], pos: &[(f32, f32)]) {
+        // 用移动后的位置重新聚类,再逐行检查相邻成员无重叠
+        let moved: Vec<Rect> = rects
+            .iter()
+            .zip(pos)
+            .map(|(r, (x, y))| rr(*x, *y, r.w, r.h))
+            .collect();
+        let rows = rows_from_rects(&moved);
+        for row in &rows {
+            for w in row.windows(2) {
+                let (a, b) = (&moved[w[0]], &moved[w[1]]);
+                assert!(
+                    b.x >= a.x + a.w,
+                    "overlap: ({},{}) vs ({},{})",
+                    a.x,
+                    a.y,
+                    b.x,
+                    b.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_same_row_before_member_rotates() {
+        // A(700,0) 在上行末尾,插到 M2(512) 之前(槽位2):
+        // A 接管 M2 的槽(512),M2 右移到行尾新槽(656);下行不动
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 2));
+        assert_eq!(land, (512.0, 0.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[6], (512.0, 0.0));
+        // 下行不动
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_top_to_bottom_before_member() {
+        // 上→下:A(700,0) 插到下行 M4(256) 之前(行1槽位1):
+        // 上行 A 在行尾拔出不挪任何人;下行 [M3,A,M4,M5] @ 0/256/400/544
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (1, 1));
+        assert_eq!(land, (256.0, 112.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (512.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (400.0, 112.0));
+        assert_eq!(pos[5], (544.0, 112.0));
+        assert_eq!(pos[6], (256.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_bottom_to_top_after_member() {
+        // 下→上:A(700,112) 插到上行 M1(256) 之后(行0槽位2):
+        // A 接管 M2 的槽(512),M2 右移;下行 A 在行尾拔出,其余原位
+        let rects = two_row_layout(rr(700.0, 112.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 2));
+        assert_eq!(land, (512.0, 0.0));
+        assert_eq!(pos[0], (0.0, 0.0));
+        assert_eq!(pos[1], (256.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_bottom_to_top_before_first() {
+        // 下→上:A(700,112) 插到上行 M0 之前(行0槽位0):
+        // 上行全体右移 [A,M0,M1,M2] @ 0/144/400/656;下行不动
+        let rects = two_row_layout(rr(700.0, 112.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (0, 0));
+        assert_eq!(land, (0.0, 0.0));
+        assert_eq!(pos[0], (144.0, 0.0));
+        assert_eq!(pos[1], (400.0, 0.0));
+        assert_eq!(pos[2], (656.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn insert_at_row_end_extends_row() {
+        // A(0,300) 独占一行,插到下行行尾(行1槽位3):
+        // A 落在 M5 之后 (544,112);原行只有 A,拔出无影响
+        let rects = two_row_layout(rr(0.0, 300.0, 132.0, 100.0));
+        let (pos, land) = row_insert_layout(&rects, 6, (1, 3));
+        assert_eq!(land, (544.0, 112.0));
+        assert_eq!(pos[3], (0.0, 112.0));
+        assert_eq!(pos[4], (256.0, 112.0));
+        assert_eq!(pos[5], (400.0, 112.0));
+        assert_eq!(pos[6], (544.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn three_rows_move_middle_to_third() {
+        // 三层:中行 A(256,212) 插到第三行 G(512) 之前:
+        // 第三行 [A,G] @ 512/656;中行另一成员 M1 不动
+        let rects = vec![
+            rr(0.0, 212.0, 244.0, 100.0), // 0 M1(中行)
+            rr(512.0, 424.0, 132.0, 100.0), // 1 G(第三行)
+            rr(256.0, 212.0, 132.0, 100.0), // 2 A(中行)
+        ];
+        let (pos, land) = row_insert_layout(&rects, 2, (2, 0));
+        assert_eq!(land, (512.0, 424.0));
+        assert_eq!(pos[1], (656.0, 424.0)); // G 右移一格
+        assert_eq!(pos[0], (0.0, 212.0)); // 中行成员不动
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn head_slot_fills_when_first_member_leaves() {
+        // 行首 A(0,0) 移走进下行:上行 M0 左滑接管行首(0,0),不残留空洞
+        let rects = vec![
+            rr(0.0, 0.0, 132.0, 100.0), // 0 A(行首)
+            rr(144.0, 0.0, 244.0, 100.0), // 1 M0
+            rr(400.0, 0.0, 244.0, 100.0), // 2 M1
+            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(256.0, 112.0, 132.0, 100.0), // 4 M4
+        ];
+        let (pos, land) = row_insert_layout(&rects, 0, (1, 0));
+        assert_eq!(land, (0.0, 112.0));
+        assert_eq!(pos[1], (0.0, 0.0)); // M0 左滑接管行首(0,0)
+        assert_eq!(pos[2], (256.0, 0.0)); // M1 跟进,与 M0 保持固定 GAP
+        // 下行 [A,M3,M4] @ 0/144/400
+        assert_eq!(pos[3], (144.0, 112.0));
+        assert_eq!(pos[4], (400.0, 112.0));
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn second_member_slides_to_row_head() {
+        // 下行两个 [B1(0),B2(256)],B1 移走进上行:B2 左滑到下行行首(0,112)
+        let rects = vec![
+            rr(0.0, 0.0, 244.0, 100.0), // 0 M0(上行)
+            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
+            rr(0.0, 112.0, 132.0, 100.0), // 2 B1
+            rr(256.0, 112.0, 132.0, 100.0), // 3 B2
+        ];
+        let (pos, land) = row_insert_layout(&rects, 2, (0, 0));
+        assert_eq!(land, (0.0, 0.0));
+        assert_eq!(pos[0], (144.0, 0.0)); // 上行右移让位
+        assert_eq!(pos[1], (400.0, 0.0));
+        assert_eq!(pos[3], (0.0, 112.0)); // B2 左滑接管下行行首
+        assert_no_overlap(&rects, &pos);
+    }
+
+    #[test]
+    fn row_slot_counts_left_members() {
+        let rects = two_row_layout(rr(700.0, 0.0, 132.0, 100.0));
+        let rows = rows_from_rects(&rects);
+        assert_eq!(rows.len(), 2);
+        // 行内任意点:中心在 M4 与 M5 之间(394) → 行1槽位2
+        assert_eq!(row_slot_of(&rects, &rows, (394.0, 162.0)), (1, 2));
+        // 中心在 M0 左侧 → 行0槽位0
+        assert_eq!(row_slot_of(&rects, &rows, (10.0, 50.0)), (0, 0));
+        // 距行中心很远 = 自由区
+        assert!(nearest_row_distance(&rects, &rows, 2000.0) > 300.0);
+    }
+
+    #[test]
+    fn align_rows_top_normalizes_row_tops() {
+        // 同行错位:行内 y 归一到最顶栅栏顶边,两行各自归一互不越行;
+        // x/尺寸一律不动
+        let mut rects = vec![
+            rr(0.0, 30.0, 200.0, 100.0), // 0 行0 顶
+            rr(220.0, 80.0, 200.0, 100.0), // 1 行0 错位(中心差 50 ≤ 容差 60)
+            rr(0.0, 180.0, 132.0, 100.0), // 2 行1 顶
+            rr(220.0, 220.0, 132.0, 100.0), // 3 行1 错位
+        ];
+        assert!(align_rows_top(&mut rects));
+        assert_eq!(rects[0].y, 30.0);
+        assert_eq!(rects[1].y, 30.0);
+        assert_eq!(rects[2].y, 180.0);
+        assert_eq!(rects[3].y, 180.0);
+        assert_eq!(rects[1].x, 220.0);
+        assert_eq!(rects[1].w, 200.0);
+        assert_eq!(rects[1].h, 100.0);
+    }
+
+    #[test]
+    fn align_rows_top_keeps_distinct_rows_intact() {
+        // 中心距超容差=两行,各自顶边已是最小 → 无改动(归一不合并行)
+        let mut rects = vec![
+            rr(0.0, 0.0, 132.0, 100.0),    // 中心 50
+            rr(0.0, 115.0, 132.0, 100.0), // 中心 165,差 115 > 容差 60
+        ];
+        assert!(!align_rows_top(&mut rects));
+        assert_eq!(rects[0].y, 0.0);
+        assert_eq!(rects[1].y, 115.0);
+    }
+
+    #[test]
+    fn space_rows_gap_cascades_to_fixed_gap() {
+        // 行距不足被推下、过远被拉上;首行顶锚不动;下行顶=上行最深底+GAP
+        let mut rects = vec![
+            rr(0.0, 100.0, 200.0, 100.0), // 行0(中心150)顶锚
+            rr(0.0, 190.0, 132.0, 100.0), // 行1(中心240,差90>60)过近
+            rr(0.0, 400.0, 132.0, 100.0), // 行2(中心450)过远
+        ];
+        assert!(space_rows_gap(&mut rects));
+        assert_eq!(rects[0].y, 100.0); // 首行不动
+        assert_eq!(rects[1].y, 212.0); // 100+100+GAP(推下)
+        assert_eq!(rects[2].y, 324.0); // 212+100+GAP(拉上)
+    }
+
+    #[test]
+    fn space_rows_gap_keeps_single_row_anchored() {
+        // 单行:顶锚保持,成员各自 y 不动(对齐是 align_rows_top 的职责)
+        let mut rects = vec![
+            rr(0.0, 300.0, 200.0, 100.0),
+            rr(220.0, 340.0, 132.0, 100.0), // 同行(中心差 40 ≤ 60)
+        ];
+        assert!(!space_rows_gap(&mut rects));
+        assert_eq!(rects[0].y, 300.0);
+        assert_eq!(rects[1].y, 340.0);
+    }
+
+    #[test]
+    fn align_first_row_left_translates_row_to_edge() {
+        // 首行整体平移到工作区左缘,行内间距保持;第二行不动
+        let mut rects = vec![
+            rr(120.0, 0.0, 200.0, 100.0), // 首行最左
+            rr(360.0, 20.0, 132.0, 100.0), // 首行第二(中心差 20 ≤ 60)
+            rr(300.0, 300.0, 132.0, 100.0), // 第二行
+        ];
+        assert!(align_first_row_left(&mut rects, 0.0));
+        assert_eq!(rects[0].x, 0.0);
+        assert_eq!(rects[1].x, 240.0); // 随整行平移 -120
+        assert_eq!(rects[2].x, 300.0); // 第二行不动
+    }
+
+    #[test]
+    fn align_first_row_left_noop_when_already_at_edge() {
+        let mut rects = vec![rr(0.0, 0.0, 200.0, 100.0)];
+        assert!(!align_first_row_left(&mut rects, 0.0));
+    }
+
+    #[test]
+    fn partial_settings_update_preserves_other_fields() {
+        // 回归(2026-09-08):旧的 set_*_stored 手工重建 Settings,任何一次
+        // 托盘开关都会把 deleted_category_at 墓碑表清空(已删分类随后被
+        // 缺类补建复活)。收敛为 load→改一个字段→save 后,无关字段必须
+        // 原样保留。
+        let dir = std::env::temp_dir().join(format!("df_settings_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("settings.json");
+        let mut s = Settings::default();
+        s.deleted_category_at.insert("文档".into(), 1_726_400_000_000);
+        save_settings_to(&p, &s);
+        // 部分更新:只改对齐档位
+        let mut cur = load_settings_from(&p);
+        cur.align_mode = "grid".into();
+        save_settings_to(&p, &cur);
+        let reread = load_settings_from(&p);
+        assert_eq!(reread.align_mode, "grid");
+        assert_eq!(
+            reread.deleted_category_at.get("文档"),
+            Some(&1_726_400_000_000)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

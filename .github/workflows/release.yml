@@ -16,6 +16,18 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Extract release notes from tag message
+        shell: bash
+        run: |
+          # checkout 会把 tag 简化成指向提交的轻量引用(%(contents) 变成
+          # 一行 commit message);必须显式重取 annotated tag 对象,
+          # cat-file 输出剥掉 object/type/tag/tagger 头部即纯说明文本。
+          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          git cat-file tag "${{ github.ref_name }}" | sed '1,/^$/d' > release_notes.md
+
+      - name: Test
+        run: cargo test --release --locked
+
       - name: Build
         run: cargo build --release --locked
 
@@ -38,7 +50,9 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          # Release 正文 = annotated tag 注释(全量版本说明),发版那一刻
+          # 随 Release 一起创建;同步提交只留一行短标题,二者解耦。
+          body_path: release_notes.md
           files: |
             target/release/deskfence.exe
             deskfence.exe.sha256
-          generate_release_notes: true

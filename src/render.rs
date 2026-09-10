@@ -85,7 +85,7 @@ fn rounded(r: D2D_RECT_F, rad: f32) -> D2D1_ROUNDED_RECT {
     }
 }
 
-pub fn as_brush<'a>(s: &'a ID2D1SolidColorBrush) -> &'a ID2D1Brush {
+pub fn as_brush(s: &ID2D1SolidColorBrush) -> &ID2D1Brush {
     unsafe { &*(s as *const ID2D1SolidColorBrush as *const ID2D1Brush) }
 }
 
@@ -366,7 +366,7 @@ fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
         use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         let name = shell::wide("comctl32.dll");
         let dll = LoadLibraryW(PCWSTR::from_raw(name.as_ptr())).ok()?;
-        let proc = GetProcAddress(dll, PCSTR(b"DrawShadowText\0".as_ptr()))?;
+        let proc = GetProcAddress(dll, PCSTR(c"DrawShadowText".as_ptr().cast()))?;
         Some(std::mem::transmute::<
             unsafe extern "system" fn() -> isize,
             DrawShadowTextProc,
@@ -382,6 +382,7 @@ fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
 /// 2) 用同一 DrawShadowText/ClearType 对种子画字(边缘色与原生同源);
 /// 3) RGB 与种子有差异的像素=墨水,置 alpha=255;其余像素恢复垫种子前
 ///    的原状(透明底+覆盖层)——背景透出实时壁纸。
+///
 /// 壁纸切换期间种子暂为旧快照(墨水边缘色停在旧底色版本),与原生过渡
 /// 期行为一致;快照重捕获完成后 refresh 即换新种子。
 /// fence_x/fence_y 为栅栏呈现位置(与 present 的取整一致),用于把
@@ -630,6 +631,13 @@ pub fn draw_fence(
     fence_hovered: bool,
     active: bool,
     marquee: Option<(f32, f32, f32, f32)>,
+    // 正在就地重命名的文件路径:该成员的图标名标签由编辑框替代,不绘制
+    // (与原生一致,避免标签从编辑框底下透出)
+    hide_label: Option<&str>,
+    // 正在入场动画中的文件路径:不绘制其墨水(图标+标签),但布局槽位保留——
+    // 新文件"先落在桌面、再飞入栅栏"期间栅栏里不能提前露脸,落地(动画结束
+    // 后 refresh_fence)才显形
+    hide_arrivals: &[String],
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
     let w = fence.rect.w;
@@ -698,7 +706,7 @@ pub fn draw_fence(
                 let rr = rounded(rect(0.0, 0.0, w, h), 7.0);
                 rt.FillRoundedRectangle(&rr, as_brush(&bg));
             }
-            draw_title(rt, r, fence, w, h, true);
+            draw_title(rt, r, fence, w, h);
         }
 
         if !fence.collapsed {
@@ -706,6 +714,10 @@ pub fn draw_fence(
             for i in 0..layout.visible {
                 let real = layout.first_index + i;
                 let Some(item) = items.get(real) else { break };
+                if hide_arrivals.iter().any(|p| p == &item.path) {
+                    // 入场动画中:槽位保留(几何稳定),墨水不画
+                    continue;
+                }
                 let (ix, iy) = model::cell_pos_with_metrics(layout, real, metrics);
                 let hovered = hover_idx == Some(real);
                 let selected = selected_paths.contains(&item.path);
@@ -713,6 +725,7 @@ pub fn draw_fence(
                 draw_item(
                     rt, r, item, ix, iy, metrics, icon_cache, hovered, selected, focused, accent,
                     &mut jobs,
+                    hide_label == Some(item.path.as_str()),
                 );
             }
             if layout.total_rows > layout.rows && show_chrome {
@@ -777,9 +790,10 @@ fn draw_text_shadow(
 
 /// 标签截断缓存:名字+宽度+盒高+行数上限 -> 实际显示文本(含省略号)。
 /// 盒高随 DPI 缩放,键里带上它可避免改缩放后残留旧截断。
-static LABEL_TRIM_CACHE: OnceLock<Mutex<HashMap<(String, u32, u32, u32), String>>> =
-    OnceLock::new();
-fn label_cache() -> &'static Mutex<HashMap<(String, u32, u32, u32), String>> {
+/// 标签截断缓存键:名字+宽度+盒高+行数上限
+type LabelTrimCache = HashMap<(String, u32, u32, u32), String>;
+static LABEL_TRIM_CACHE: OnceLock<Mutex<LabelTrimCache>> = OnceLock::new();
+fn label_cache() -> &'static Mutex<LabelTrimCache> {
     LABEL_TRIM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -864,13 +878,9 @@ pub struct ArrivalFrame {
 
 pub fn draw_guides(
     rt: &ID2D1DCRenderTarget,
-    w: f32,
-    h: f32,
     icon_px: f32,
     scale: f32,
     label_w: f32,
-    gx: Option<f32>,
-    gy: Option<f32>,
     insert_line: Option<(f32, f32, f32, f32)>,
     ghost: Option<(&[u8], &str, f32, f32)>,
     arrivals: &[ArrivalFrame],
@@ -879,16 +889,6 @@ pub fn draw_guides(
     unsafe {
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
-        if let Some(x) = gx {
-            if let Some(b) = brush(rt, &color(0.30, 0.62, 1.0, 0.95)) {
-                rt.FillRectangle(&rect(x, 0.0, x + 1.0, h), as_brush(&b));
-            }
-        }
-        if let Some(y) = gy {
-            if let Some(b) = brush(rt, &color(0.30, 0.62, 1.0, 0.95)) {
-                rt.FillRectangle(&rect(0.0, y, w, y + 1.0), as_brush(&b));
-            }
-        }
         // 插入指示线:线体垂直于排列方向(竖线=水平邻居之间,横线=上下邻居之间),
         // 两端各一段垂直小端点,宽度 2.5px
         if let Some((lx, ly, lw, lh)) = insert_line {
@@ -1111,14 +1111,7 @@ pub fn gdi_draw_labels_transparent(s: &Surface, jobs: &[GdiLabelJob]) {
     }
 }
 
-fn draw_title(
-    rt: &ID2D1DCRenderTarget,
-    r: &Renderer,
-    fence: &Fence,
-    w: f32,
-    _h: f32,
-    show_chrome: bool,
-) {
+fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h: f32) {
     unsafe {
         let accent = fence.color();
         // A thin category rail is easier to scan than a large colored card.
@@ -1128,16 +1121,16 @@ fn draw_title(
                 accent[0],
                 accent[1],
                 accent[2],
-                if show_chrome { 0.95 } else { 0.72 },
+                0.95,
             ),
         ) {
             let rr = rounded(rect(7.0, 7.0, 10.0, model::TITLE_H - 7.0), 1.5);
             rt.FillRoundedRectangle(&rr, as_brush(&a));
         }
         let main_c = if r.light {
-            color(0.10, 0.11, 0.14, if show_chrome { 0.96 } else { 0.78 })
+            color(0.10, 0.11, 0.14, 0.96)
         } else {
-            color(0.95, 0.96, 0.98, if show_chrome { 0.97 } else { 0.82 })
+            color(0.95, 0.96, 0.98, 0.97)
         };
         let shadow_c = if r.light {
             color(1.0, 1.0, 1.0, 0.72)
@@ -1154,7 +1147,8 @@ fn draw_title(
                 rect(18.0, 4.0, w - model::COLLAPSE_W - 6.0, model::TITLE_H - 2.0),
             );
             {
-                // 箭头始终可见(未悬停时其余 chrome 仍隐藏)。
+                // 折叠箭头随标题栏一起、仅在悬停/拖拽(chrome)时绘制;
+                // 平时栅栏完全无边框(无边框常显基线,2026-08-26)。
                 // 可点击提示:半透明深色圆角小条(与壁纸底都搭),
                 // 内画宽扁三角(宽:高=2:1),垂直中心与左侧栅栏名同水平线。
                 // 展开态三角向下,折叠态向右。
@@ -1165,13 +1159,13 @@ fn draw_title(
                 // 底色浅灰:肉眼可见即可(不抢图标名的视觉)
                 if let Some(bb) = brush(
                     rt,
-                    &color(0.05, 0.06, 0.09, if show_chrome { 0.26 } else { 0.16 }),
+                    &color(0.05, 0.06, 0.09, 0.26),
                 ) {
                     rt.FillRoundedRectangle(&zone_rr, as_brush(&bb));
                 }
                 if let Some(sb) = brush(
                     rt,
-                    &color(1.0, 1.0, 1.0, if show_chrome { 0.42 } else { 0.30 }),
+                        &color(1.0, 1.0, 1.0, 0.42),
                 ) {
                     rt.DrawRoundedRectangle(&zone_rr, as_brush(&sb), 1.0, None);
                 }
@@ -1197,24 +1191,24 @@ fn draw_title(
                 if tri.len() == 3 {
                     if let Ok(geo) = r.factory.CreatePathGeometry() {
                         if let Ok(sink) = geo.Open() {
-                            let _ = sink.BeginFigure(
+                            sink.BeginFigure(
                                 D2D_POINT_2F { x: tri[0].0, y: tri[0].1 },
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_FILLED,
                             );
-                            let _ = sink.AddLine(D2D_POINT_2F {
+                            sink.AddLine(D2D_POINT_2F {
                                 x: tri[1].0,
                                 y: tri[1].1,
                             });
-                            let _ = sink.AddLine(D2D_POINT_2F {
+                            sink.AddLine(D2D_POINT_2F {
                                 x: tri[2].0,
                                 y: tri[2].1,
                             });
-                            let _ = sink.EndFigure(
+                            sink.EndFigure(
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED,
                             );
                             let _ = sink.Close();
                             if let Some(ab) = brush(rt, &color(0.95, 0.96, 0.98, 0.95)) {
-                                let _ = rt.FillGeometry(&geo, as_brush(&ab), None);
+                                rt.FillGeometry(&geo, as_brush(&ab), None);
                             }
                         }
                     }
@@ -1238,6 +1232,7 @@ fn draw_item(
     focused: bool,
     accent: [f32; 3],
     jobs: &mut Vec<GdiLabelJob>,
+    hide_label: bool,
 ) {
     unsafe {
         let cs = metrics.icon_px;
@@ -1338,6 +1333,10 @@ fn draw_item(
         // 文字统一交给 GDI ClearType(DrawShadowText,截断按 GDI 经典度量):
         // 有快照时用真实壁纸种子(逐位同原生),无快照时黑种子兜底(引擎/几何
         // 仍与原生一致,仅 ClearType 边缘色近似)。
+        if hide_label {
+            // 就地重命名中:标签由编辑框替代(与原生一致),只画图标
+            return;
+        }
         let trimmed = trim_to_lines(
             &r.dw,
             &txt,

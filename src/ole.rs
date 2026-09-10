@@ -25,6 +25,9 @@ extern "system" {
 pub const DRAGDROP_S_CANCEL: i32 = 0x00040101;
 pub const DRAGDROP_S_DROP: i32 = 0x00040100;
 pub const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x00040102;
+// 手写 IDropSource vtable 的返回码别名:沿用 Win32 的 HRESULT 拼写,
+// 与官方文档/签名一致(不允许大写缩写改名,反而伤可读性)
+#[allow(clippy::upper_case_acronyms)]
 pub type HRESULT = i32;
 
 // ---------------- IDropSource ----------------
@@ -338,7 +341,7 @@ pub fn drag_out_files(paths: &[String], _on_dropped_into_fence: impl Fn(&[String
                 Ok(d) => d,
                 Err(_) => {
                     for pidl in &pidls {
-                        let _ = windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
+                        windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
                     }
                     return;
                 }
@@ -352,7 +355,7 @@ pub fn drag_out_files(paths: &[String], _on_dropped_into_fence: impl Fn(&[String
             &mut effect,
         );
         for pidl in &pidls {
-            let _ = windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
+            windows::Win32::System::Com::CoTaskMemFree(Some(*pidl as *const _));
         }
         drop(_keep);
     }
@@ -371,5 +374,5 @@ pub fn register_drop_target(hwnd: HWND, fence_id: u32) -> bool {
 }
 
 fn on_fence_drop(fence_id: u32, paths: Vec<String>, screen_x: i32, screen_y: i32) {
-    crate::ui::on_fence_drop_cb(fence_id, paths, screen_x, screen_y);
+    crate::drag::on_fence_drop_cb(fence_id, paths, screen_x, screen_y);
 }

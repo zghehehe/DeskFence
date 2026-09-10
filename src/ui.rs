@@ -1,16 +1,14 @@
-//! 窗口管理与交互：栅栏窗口、命中测试、移动/缩放/滚动、右键菜单、重命名、刷新
+//! 窗口管理与交互：栅栏窗口、命中测试、移动/缩放/滚动、右键菜单、刷新(重命名子系统见 rename.rs)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    BOOL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-};
+use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateFontIndirectW, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect,
-    HBRUSH, HDC, HMONITOR, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, HBRUSH, HDC, HFONT, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
 };
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Com::CoInitializeEx;
@@ -21,17 +19,13 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LEFT,
+    GetAsyncKeyState, ReleaseCapture, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LEFT,
     VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW,
 };
-use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 // windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
-const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
-const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::model::{self, Fence, FileItem, Hit, Rect};
@@ -39,6 +33,11 @@ use crate::ole;
 use crate::render;
 use crate::render::{IconBuffer, Renderer, Surface};
 use crate::shell;
+use crate::drag::*;
+use crate::rename::*;
+use crate::iconcache::{load_icon_cache_file, save_icon_cache_file_now};
+use crate::selfheal::*;
+use crate::menu::{delete_fence_ex, quit_app, set_render_mode, show_tray_menu};
 
 fn class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
@@ -52,7 +51,7 @@ fn tray_class_name() -> PCWSTR {
     PCWSTR::from_raw(v.as_ptr())
 }
 
-fn guide_class_name() -> PCWSTR {
+pub(crate) fn guide_class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
     let v = W.get_or_init(|| "DeskFenceGuide\0".encode_utf16().collect());
     PCWSTR::from_raw(v.as_ptr())
@@ -66,7 +65,7 @@ fn menu_host_class_name() -> PCWSTR {
     PCWSTR::from_raw(v.as_ptr())
 }
 
-fn hinstance() -> HINSTANCE {
+pub(crate) fn hinstance() -> HINSTANCE {
     unsafe {
         HINSTANCE(
             windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
@@ -77,6 +76,9 @@ fn hinstance() -> HINSTANCE {
 }
 
 fn deskfence_icon() -> HICON {
+    // PCWSTR(1) = MakeIntResourceW(1),即 DeskFence.rc 里 ID=1 的图标资源。
+    // 不能按 clippy 建议换成 ptr::dangling()(地址=对齐值 2,会查错资源)
+    #[allow(clippy::manual_dangling_ptr)]
     unsafe { LoadIconW(hinstance(), PCWSTR(1usize as *const u16)).unwrap_or_default() }
 }
 
@@ -94,16 +96,21 @@ pub fn align_mode() -> String {
     *ALIGN_MODE.lock().unwrap() = m.clone();
     m
 }
+/// 统一的设置落盘入口:读 settings.json → 就地改一个字段 → 原子写回。
+/// 旧实现是 5 处 set_*_stored 各自手工重建 Settings 逐字段拷贝,新增字段
+/// 漏改任意一处=静默把该字段写回默认值(实锤:每次开关托盘设置都会把
+/// deleted_category_at 墓碑表整个清空,已删的分类栅栏随后被缺类补建复活)。
+/// 收敛后新增 Settings 字段无需改这里,任何部分更新天然保留其余字段。
+pub(crate) fn update_stored_settings(f: impl FnOnce(&mut model::Settings)) {
+    let mut s = model::load_settings();
+    f(&mut s);
+    model::save_settings(&s);
+}
+
 /// 写入对齐档位并立即持久化到设置文件
-fn set_align_mode_stored(mode: &str) {
+pub(crate) fn set_align_mode_stored(mode: &str) {
     *ALIGN_MODE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: mode.to_string(),
-        render_mode: render_mode(),
-        auto_category: auto_category(),
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-    });
+    update_stored_settings(|s| s.align_mode = mode.to_string());
 }
 pub fn auto_align_on() -> bool {
     align_mode() == "auto"
@@ -128,15 +135,9 @@ pub fn render_mode() -> String {
     *RENDER_MODE.lock().unwrap() = m.clone();
     m
 }
-fn set_render_mode_stored(mode: &str) {
+pub(crate) fn set_render_mode_stored(mode: &str) {
     *RENDER_MODE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: mode.to_string(),
-        auto_category: auto_category(),
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-    });
+    update_stored_settings(|s| s.render_mode = mode.to_string());
 }
 
 /// 桌面状态(持久化):normal=栅栏显示 / zen=纯净(只剩壁纸) / native=原生图标。
@@ -153,49 +154,66 @@ pub fn desktop_state() -> String {
     *DESKTOP_STATE.lock().unwrap() = m.clone();
     m
 }
-fn set_desktop_state_stored(mode: &str) {
+pub(crate) fn set_desktop_state_stored(mode: &str) {
     *DESKTOP_STATE.lock().unwrap() = mode.to_string();
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: render_mode(),
-        auto_category: auto_category(),
-        desktop_state: mode.to_string(),
-        z_guard: z_guard_setting(),
-    });
+    update_stored_settings(|s| s.desktop_state = mode.to_string());
 }
 
-/// 自动分类开关:默认 true=按固定 8 类自动归类;false=自定义分类模式
-/// (不按扩展名,文件只进被拖入的栅栏,未分配的进"未分类"栅栏)
-static AUTO_CATEGORY: Mutex<Option<bool>> = Mutex::new(None);
+/// 自动分类开关(2026-09-09 起单一真相=model 的线程局部缓存,boot 预热;
+/// false=自定义分类模式:文件只进被拖入的栅栏,未归位文件进兜底"其他")
 pub fn auto_category() -> bool {
-    let mut g = AUTO_CATEGORY.lock().unwrap();
-    if let Some(v) = *g {
-        return v;
-    }
-    let v = model::load_settings().auto_category;
-    model::set_auto_category(v);
-    *g = Some(v);
-    v
+    model::auto_category()
 }
-fn set_auto_category_stored(v: bool) {
+pub(crate) fn set_auto_category_stored(v: bool) {
     model::set_auto_category(v);
-    *AUTO_CATEGORY.lock().unwrap() = Some(v);
-    model::save_settings(&model::Settings {
-        align_mode: align_mode(),
-        render_mode: render_mode(),
-        auto_category: v,
-        desktop_state: desktop_state(),
-        z_guard: z_guard_setting(),
-    });
+    update_stored_settings(|s| s.auto_category = v);
 }
 
 /// z 守卫设置(缓存读取,模式同上):菜单落盘点需要带上当前值。
-fn z_guard_setting() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| model::load_settings().z_guard)
+/// 2026-09-08 起暴露为托盘开关(异常降级用),缓存需可写。
+static Z_GUARD: Mutex<Option<bool>> = Mutex::new(None);
+pub(crate) fn z_guard_setting() -> bool {
+    let mut g = Z_GUARD.lock().unwrap();
+    if let Some(v) = *g {
+        return v;
+    }
+    let v = model::load_settings().z_guard;
+    *g = Some(v);
+    v
+}
+
+/// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
+/// 开=全部栅栏常显边框/标题/角手柄,便于观察布局边界;关=无边框常显基线。
+static SHOW_CHROME: AtomicBool = AtomicBool::new(false);
+
+pub fn chrome_always_on() -> bool {
+    SHOW_CHROME.load(Ordering::Relaxed)
+}
+pub(crate) fn set_show_chrome_stored(on: bool) {
+    SHOW_CHROME.store(on, Ordering::Relaxed);
+    update_stored_settings(|s| s.show_chrome = on);
+}
+
+/// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
+/// 复活,除非之后出现该类的新文件(mtime 晚于墓碑)——那时清除墓碑并
+/// 正常补建,保留"首次出现该类文件会自动新建"的原设计。
+fn category_tombstone_at(cat: &str) -> Option<u64> {
+    model::load_settings().deleted_category_at.get(cat).copied()
+}
+pub(crate) fn set_category_tombstone(cat: &str) {
+    let mut s = model::load_settings();
+    s.deleted_category_at
+        .insert(cat.to_string(), model::epoch_ms());
+    model::save_settings(&s);
+}
+pub(crate) fn clear_category_tombstone(cat: &str) {
+    let mut s = model::load_settings();
+    if s.deleted_category_at.remove(cat).is_some() {
+        model::save_settings(&s);
+    }
 }
 /// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
-fn rebuild_pins() {
+pub(crate) fn rebuild_pins() {
     let s = state().lock().unwrap();
     model::rebuild_pinned_registry(&s.fences);
 }
@@ -209,7 +227,7 @@ pub fn precise_mode_on() -> bool {
 
 const TIMER_GLOBAL: usize = 1;
 /// 悬停延迟提交定时器（图标高亮与原生桌面一致需悬停 ~400ms 才出现）
-const TIMER_HOVER: usize = 2;
+pub(crate) const TIMER_HOVER: usize = 2;
 const TIMER_ANIMATION: usize = 3;
 /// 壁纸追赶定时器:精确模式快照缺失时以 200ms 节奏重捕获,
 /// 就绪后一次性整帧重绘,避免栅栏先出 D2D 文字帧再切换成 ClearType+阴影
@@ -220,36 +238,9 @@ const TIMER_WALLPAPER_FOLLOW: usize = 6;
 /// 桌面态快速自检定时器:三指手势的窗口扫动不发任何 WinEvent,
 /// 恢复过渡的检测只能靠轮询(见 zcheck_fences_now 注释)
 const TIMER_DESKTOP_WATCH: usize = 7;
-const EM_SETSEL: u32 = 0x00B1;
-const WM_SETFONT: u32 = 0x0030;
-const RENAME_COMMIT_MSG: u32 = WM_USER + 1;
-const RENAME_CANCEL_MSG: u32 = WM_USER + 2;
-
-const MENU_ADD_FENCE: u32 = 0x5101;
-const MENU_RENAME: u32 = 0x5102;
-const MENU_TOGGLE_COLLAPSE: u32 = 0x5103;
-const MENU_LOCK: u32 = 0x5104;
-const MENU_DELETE_FENCE: u32 = 0x5105;
-const MENU_REFRESH: u32 = 0x5106;
-const MENU_HIDE_ALL: u32 = 0x5107;
-const MENU_SHOW_ALL: u32 = 0x5108;
-const MENU_QUIT: u32 = 0x5109;
-const MENU_RESET_LAYOUT: u32 = 0x510A;
-const MENU_TOGGLE_DESKTOP_ICONS: u32 = 0x510B;
-const MENU_AUTO_ALIGN: u32 = 0x510C;
-const MENU_UNDO: u32 = 0x510D;
-const MENU_AUTOSTART: u32 = 0x510E;
-const MENU_ALIGN_GRID: u32 = 0x5114;
-const MENU_ALIGN_FREE: u32 = 0x5115;
-const MENU_RESTORE_DESKTOP: u32 = 0x510F;
-const MENU_SORT_FREQ: u32 = 0x5110;
-const MENU_SORT_TIME: u32 = 0x5111;
-const MENU_SORT_NAME: u32 = 0x5112;
-const MENU_SORT_MANUAL: u32 = 0x5113;
-const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
-const MENU_RENDER_PRECISE: u32 = 0x5117;
-const MENU_AUTO_CATEGORY: u32 = 0x5118;
-const MENU_HELP: u32 = 0x5119;
+pub(crate) const EM_SETSEL: u32 = 0x00B1;
+pub(crate) const RENAME_COMMIT_MSG: u32 = WM_USER + 1;
+pub(crate) const RENAME_CANCEL_MSG: u32 = WM_USER + 2;
 
 const TRAY_MSG: u32 = WM_APP + 1;
 /// 第二实例请求:显示全部栅栏
@@ -263,13 +254,15 @@ const WM_DL3_CLEAR_SEL: u32 = WM_APP + 5;
 /// 壁纸缓存目录(Themes\TranscodedWallpaper)有变化:幻灯片轮换/换壁纸的
 /// 毫秒级事件信号,由目录 watcher 线程投递,UI 侧防抖后重捕获
 const WM_DL3_WALLPAPER_DIRTY: u32 = WM_APP + 6;
+/// 后台扫描完成:扫描线程投递,UI 线程在托盘消息里应用结果(apply_pending_scan)
+const WM_DL3_SCAN_APPLY: u32 = WM_APP + 8;
 /// 全局 z 序事件触发的高速自检请求(WinEvent 回调合并投递)
-const WM_DL3_ZCHECK: u32 = WM_APP + 7;
+pub(crate) const WM_DL3_ZCHECK: u32 = WM_APP + 7;
 /// windows 0.52 crate 未导出,按 Win32 头文件补定义
 const WM_MOUSELEAVE: u32 = 0x02A3;
-static TRAY_HWND: OnceLock<HWND> = OnceLock::new();
+pub(crate) static TRAY_HWND: OnceLock<HWND> = OnceLock::new();
 /// 菜单前台宿主窗口(1x1 隐形):菜单前台化的目标,避免提升栅栏窗口 z 序
-static MENU_HOST_HWND: OnceLock<HWND> = OnceLock::new();
+pub(crate) static MENU_HOST_HWND: OnceLock<HWND> = OnceLock::new();
 
 /// 菜单 owner 用的前台宿主;尚未创建时回退到调用方窗口
 pub fn menu_host_or(fallback: HWND) -> HWND {
@@ -277,67 +270,13 @@ pub fn menu_host_or(fallback: HWND) -> HWND {
 }
 static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 static TICK_COUNT: AtomicU32 = AtomicU32::new(0);
-/// 箭头悬停自动弹菜单的防重触发时间戳(毫秒)
-
 fn taskbar_created_msg() -> u32 {
     *TASKBAR_CREATED_MSG.get_or_init(|| unsafe {
         let name = shell::wide("TaskbarCreated");
         RegisterWindowMessageW(PCWSTR::from_raw(name.as_ptr()))
     })
 }
-
-#[derive(Clone, Copy)]
-enum DragMode {
-    Move,
-    Resize { edges: [char; 2] },
-    Icon(usize),
-    Marquee,
-    ScrollThumb { grab: f32 },
-}
-
-#[derive(Clone)]
-struct Drag {
-    fence_id: u32,
-    mode: DragMode,
-    start_x: f32,
-    start_y: f32,
-    /// 按下时的屏幕坐标（Move/Resize 的位移基准，与窗口位置无关）
-    start_sx: f32,
-    start_sy: f32,
-    start_rect: Rect,
-    start_layout: Vec<Fence>,
-    dragged_out: bool,
-    /// 图标按下时该项是否已被选中(第二次点击已选中项 = Explorer 的慢双击重命名)
-    icon_was_selected: bool,
-    icon_path: String,
-}
-
-/// 拖拽实时预览状态:拖动中即时重排显示,松手才生效;取消/拖出释放则回滚
-#[derive(Clone)]
-struct GhostPreview {
-    fence_id: u32,
-    /// 按下时的完整显示顺序(回滚与重排的基准)
-    original: Vec<String>,
-    /// 按下时的排序模式(预览期间切"手动",回滚时恢复)
-    original_sort_mode: String,
-    /// 被拖路径集合；重排时按它们在 original 中的相对顺序组成块
-    dragged_paths: Vec<String>,
-    /// 当前预览目标槽位（删除拖动块后的列表中，范围 0..=剩余项数）
-    target: usize,
-}
-
-#[derive(Clone)]
-struct ArrivalAnimation {
-    fence_id: u32,
-    path: String,
-    name: String,
-    from: (f32, f32),
-    to: (f32, f32),
-    started_ms: u64,
-    duration_ms: u64,
-}
-
-struct UiState {
+pub(crate) struct UiState {
     pub renderer: Option<Renderer>,
     pub fences: Vec<Fence>,
     pub files: Vec<FileItem>,
@@ -368,6 +307,10 @@ struct UiState {
     pub rename_edit: Option<HWND>,
     /// 文件就地重命名的 EDIT 窗口（图标名标签上的编辑框）
     pub file_rename_edit: Option<HWND>,
+    /// Target-fence metrics and stable cell centers for active file editors.
+    pub rename_metrics: HashMap<isize, model::DpiMetrics>,
+    pub rename_centers: HashMap<isize, i32>,
+    pub rename_fonts: HashMap<isize, HFONT>,
     /// 拖动节流：上次真正重排时的鼠标位置（用于抑制高频 WM_MOUSEMOVE 抖动）
     pub drag_settle_x: f32,
     pub drag_settle_y: f32,
@@ -375,9 +318,9 @@ struct UiState {
     pub last_resize_ms: u64,
     /// 栅栏移动时间节流:上次移动呈现时刻(毫秒),逐像素跟随但限频
     pub last_move_ms: u64,
-    /// 拖动对齐参考线（overlay 绘制）：guide_x = 竖线坐标，guide_y = 横线坐标
-    pub guide_x: Option<f32>,
-    pub guide_y: Option<f32>,
+    /// 拖动中内容重渲染(壁纸种子重烘焙)节拍:上次全量 refresh_fence 时刻。
+    /// 位置跟随已由"已有像素重呈现"逐帧完成,内容重烘焙降到 ~30fps。
+    pub last_drag_render_ms: u64,
     /// 内部图标拖拽残影:被拖图标(半透明)跟随鼠标的屏幕坐标绘制在 overlay 上
     pub drag_ghost: Option<(Vec<String>, f32, f32)>,
     /// 拖拽实时预览(松手生效,取消回滚)
@@ -424,35 +367,7 @@ struct UiState {
     pub last_healthy_ms: HashMap<u32, u64>,
 }
 
-/// 一次走查失位的故障签名。防抖只在"同一签名连续出现"时累计拍数:
-/// 恢复过渡期穿过 band 的应用窗每拍都是不同窗口,签名一变就重置计数,
-/// 不再误触修复(2026-08-28 Chrome/CabinetWClass 拦截误报即此类);而常驻
-/// 拦路者(同 HWND 同类)或沉底故障签名稳定,防抖/退避语义保持不变。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WalkFault {
-    /// 可见外来窗先于栅栏出现在宿主之上
-    Blocked { hwnd: isize, class: u64 },
-    /// 走查到栈顶未找到:栅栏确定在宿主之下(显示桌面批次),首拍即修
-    NotFoundTop,
-    /// 走查预算耗尽:状态不明,只记日志不动手
-    NotFoundBudget,
-}
-
-struct WalkStrike {
-    fault: WalkFault,
-    count: u32,
-}
-
-fn class_hash(cls: &[u16]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &c in cls {
-        h ^= c as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-fn state() -> &'static Mutex<UiState> {
+pub(crate) fn state() -> &'static Mutex<UiState> {
     static S: OnceLock<Mutex<UiState>> = OnceLock::new();
     S.get_or_init(|| {        Mutex::new(UiState {
             renderer: None,
@@ -483,12 +398,14 @@ fn state() -> &'static Mutex<UiState> {
             rename_fence: None,
             rename_edit: None,
             file_rename_edit: None,
+            rename_metrics: HashMap::new(),
+            rename_centers: HashMap::new(),
+            rename_fonts: HashMap::new(),
             drag_settle_x: 0.0,
             drag_settle_y: 0.0,
             last_resize_ms: 0,
             last_move_ms: 0,
-            guide_x: None,
-            guide_y: None,
+            last_drag_render_ms: 0,
             drag_ghost: None,
             ghost_preview: None,
             insert_line: None,
@@ -519,12 +436,10 @@ fn clear_all_interaction(s: &mut UiState) {
     s.drag = None;
     s.drag_ghost = None;
     s.ghost_preview = None;
-    s.guide_x = None;
-    s.guide_y = None;
     s.arrival_animations.clear();
 }
 
-fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
+pub(crate) fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
     s.hover.remove(&fence_id);
     s.hover_pending.remove(&fence_id);
     s.hover_hit.remove(&fence_id);
@@ -542,8 +457,6 @@ fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
         s.marquee = None;
         s.drag_ghost = None;
         s.ghost_preview = None;
-        s.guide_x = None;
-        s.guide_y = None;
     }
     // Selection is global because pinned items can appear in multiple fences.
     // A lifecycle change invalidates any visual ownership, so clear it wholesale.
@@ -552,7 +465,7 @@ fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
     s.selection_anchor = None;
 }
 
-fn finish_interaction_cleanup() {
+pub(crate) fn finish_interaction_cleanup() {
     unsafe {
         let _ = ReleaseCapture();
     }
@@ -564,11 +477,7 @@ fn finish_interaction_cleanup() {
             }
         }
     }
-    if s.guide_x.is_none()
-        && s.guide_y.is_none()
-        && s.drag_ghost.is_none()
-        && s.arrival_animations.is_empty()
-    {
+    if s.drag_ghost.is_none() && s.arrival_animations.is_empty() {
         if let Some(hwnd) = s.guide_hwnd {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -663,7 +572,9 @@ fn metrics_for_window(hwnd: HWND) -> model::DpiMetrics {
 /// 键不变就永不重发探测,把对宿主的骚扰从每 10s 一次降到"配置变化时一次"。
 /// sync_icon_size 的跟随能力不受影响:用户 Ctrl+滚轮 → 注册表变化 → 键失配
 /// → 恰好探测一次并重算格距。
-static ITEM_SPACING_CACHE: Mutex<Option<((f32, u32), (f32, f32))>> = Mutex::new(None);
+/// 图标格距探测缓存:键=(注册表 IconSize, 系统 DPI),值=(格距, 残余偏移)
+type SpacingCache = Option<((f32, u32), (f32, f32))>;
+static ITEM_SPACING_CACHE: Mutex<SpacingCache> = Mutex::new(None);
 
 fn probe_desktop_item_spacing() -> Option<(f32, f32)> {
     let key = (shell::desktop_icon_size(), unsafe {
@@ -801,7 +712,7 @@ pub fn init() -> bool {
     model::set_cell_pads(pad_x, pad_y);
     model::set_icon_size(current_icon_size());
     // 系统右键菜单里的"重命名"改由栅栏内就地编辑完成
-    shell::set_rename_request_hook(on_shell_rename_request);
+    shell::set_rename_request_hook(crate::rename::on_shell_rename_request);
     // 加载用户偏好（自动对齐等）
     let _ = align_mode(); // 预热(加载持久化档位)
     {
@@ -882,16 +793,16 @@ fn register_class() {
 /// 可收养栅栏窗口的桌面宿主:带图标的 WorkerW/Progman(主屏)或
 /// 通过 0x052C 消息生成的每显示器 WorkerW(副屏)。坐标为屏幕坐标。
 #[derive(Clone, Copy)]
-struct HostInfo {
-    hwnd: HWND,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    primary: bool,
+pub(crate) struct HostInfo {
+    pub(crate) hwnd: HWND,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) primary: bool,
     /// 宿主是否可见:Explorer 重启重建期间 WorkerW 可能短暂隐藏,
     /// 收养到隐藏宿主会导致栅栏不可见,必须过滤。
-    visible: bool,
+    pub(crate) visible: bool,
 }
 
 static HOSTS_CACHE: OnceLock<Mutex<(std::time::Instant, Vec<HostInfo>)>> = OnceLock::new();
@@ -904,7 +815,7 @@ fn invalidate_hosts_cache() {
 }
 
 /// 桌面宿主列表(带 500ms 缓存,拖动高频调用不重复枚举窗口)
-fn desktop_hosts() -> Vec<HostInfo> {
+pub(crate) fn desktop_hosts() -> Vec<HostInfo> {
     {
         if let Some(cache) = HOSTS_CACHE.get() {
             let c = cache.lock().unwrap();
@@ -969,13 +880,13 @@ fn refresh_hosts() -> Vec<HostInfo> {
             visible: unsafe { IsWindowVisible(primary).as_bool() },
         });
     }
-    hosts.sort_by(|a, b| b.primary.cmp(&a.primary));
+    hosts.sort_by_key(|h| !h.primary);
     hosts
 }
 
 /// 为栅栏选择宿主:中心点落在哪个【可见】宿主就收养到哪;都不覆盖时返回 None
 /// (窗口暂缓创建,由全局定时器在宿主就绪后补挂,绝不复用 HWND_TOP 回退)。
-fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
+pub(crate) fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
     let cx = rect.x + rect.w * 0.5;
     let cy = rect.y + rect.h * 0.5;
     hosts
@@ -989,7 +900,7 @@ fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
 /// 典型:SystemSettings/TextInputHost 的全屏 CoreWindow(cloak=2)、Shell 经验宿主、
 /// 某些安全/管控软件钩子层的全屏瞬态。菜单开合瞬间它们被塞进宿主与栅栏之间,曾触发整链
 /// 重排(每次=z 序重排闪屏),必须跳过。
-fn window_is_cloaked(w: HWND) -> bool {
+pub(crate) fn window_is_cloaked(w: HWND) -> bool {
     let mut cloaked: u32 = 0;
     let ok = unsafe {
         DwmGetWindowAttribute(
@@ -1007,7 +918,7 @@ fn window_is_cloaked(w: HWND) -> bool {
 /// 但绝不能高于正常窗口——HWND_TOP 曾把它顶到整个 z 栈顶端(浮窗)。
 /// 返回"最高兄弟栅栏"的句柄(插到它之后=兄弟之上、正常窗口之下);
 /// 没有其他兄弟栅栏时返回 None(无需提升)。
-fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
+pub(crate) fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
     let mut anchor: Option<HWND> = None;
     let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
     for _ in 0..64 {
@@ -1036,196 +947,9 @@ fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
     anchor
 }
 
-/// SetWindowPos places a window *behind* hWndInsertAfter. Passing WorkerW directly
-/// therefore puts the fence below the desktop host and can produce a fully blank
-/// desktop after Show Desktop changes WorkerW ordering. Use the window immediately
-/// above the host so the fence sits between desktop and normal application windows.
-/// 宿主之上没有任何窗口时返回 None(不移动):绝不能回退 HWND_TOP——那会把
-/// 栅栏顶到整个 z 栈顶端(2026-08-27 实测三个栅栏被顶到宿主之上 215 层,
-/// 即用户看到的"栅栏浮在别的窗口上方")。
-fn desktop_insert_after(host: HWND) -> Option<HWND> {
-    // 宿主正上方第一个**非坏锚**窗口(UIPI 拒锚窗口做了锚,插入必败;
-    // 2026-08-31 WeLink elevated 实测)。坏锚在带底紧贴宿主时沿链向上跳过。
-    let mut above = unsafe { GetWindow(host, GW_HWNDPREV) };
-    for _ in 0..32 {
-        if above.0 == 0 {
-            return None;
-        }
-        if !bad_anchor_recent(above) {
-            return Some(above);
-        }
-        above = unsafe { GetWindow(above, GW_HWNDPREV) };
-    }
-    None
-}
-
-/// 栅栏窗口类名("DeskFenceFence",14 字符)——供无锁判定自家栅栏。
-const FENCE_CLASS: [u16; 14] = [
-    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65, 0x6E, 0x63, 0x65,
-];
-
-/// 无锁判定自家栅栏窗口:band_attach_anchor 在窗口过程/持锁的走查修复里
-/// 直接调用,不能取状态锁;辅助窗(菜单宿主/托盘)类名不同,不会误判。
-fn is_own_fence_window(w: HWND) -> bool {
-    let mut cls_buf = [0u16; 16];
-    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-    n as usize == FENCE_CLASS.len() && cls_buf[..FENCE_CLASS.len()] == FENCE_CLASS
-}
-
-fn is_topmost_window(w: HWND) -> bool {
-    // WS_EX_TOPMOST = 0x8
-    (unsafe { GetWindowLongW(w, GWL_EXSTYLE) } & 0x8) != 0
-}
-
-// ---------------- UIPI 坏锚缓存(2026-08-31) ----------------
-// 以高完整性(elevated)进程的窗口为 hWndInsertAfter 会被 UIPI 拒绝
-// (0x80070005)。实测案例:WeLinkMeeting 以管理员运行,其会议窗参与
-// 桌面切换停泊批落到带内低位后,band_attach_anchor 主规则解析出的
-// "最低可见外来窗"正是它 → 5 个栅栏的 repair/下压/re-anchor 全部
-// 被拒 → 栅栏持续浮在会议窗上方(浮窗),8s 健康宽限过期后 reconcile
-// 放出原生图标(图标重合)。被拒过的 hwnd 缓存一段时间,锚解析绕开;
-// 成功插入即清除。TTL 兜底句柄复用风险。
-const BAD_ANCHOR_TTL_MS: u64 = 60_000;
-static BAD_ANCHORS: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
-
-fn bad_anchor_mark(h: HWND) {
-    let now = resize_now_ms();
-    let mut g = BAD_ANCHORS.lock().unwrap();
-    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
-    g.push((h.0, now));
-}
-
-fn bad_anchor_clear(h: HWND) {
-    let now = resize_now_ms();
-    let mut g = BAD_ANCHORS.lock().unwrap();
-    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
-}
-
-fn bad_anchor_recent(h: HWND) -> bool {
-    let now = resize_now_ms();
-    let g = BAD_ANCHORS.lock().unwrap();
-    g.iter()
-        .any(|(k, t)| *k == h.0 && now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS)
-}
-
-/// 带内就位锚点(2026-08-29 修"菜单后点桌面闪屏"根因,勿回退):返回栅栏
-/// 应插到"其正下方"的窗口。旧实现=宿主正上方(带底,z 序 1-5 步)——那是
-/// 菜单开合/IME/辅助窗的底层扰动区:zwatch 60ms 实测(12:33:31.469),
-/// 菜单关闭时系统把菜单宿主连同其 z 邻居(=紧贴带底的栅栏簇)整帧静默
-/// 沉到宿主之下(不发 CHANGING/CHANGED,否决无从下手),高速自检再整链
-/// 拉回=栅栏消失 0.1-0.8s=菜单后点空白的轻微闪。日志指纹:track
-/// dismissed 后紧跟 5 条 re-anchored。规则(分两档):
-/// 主规则(所有调用方):从宿主向上按走查同源容忍集(隐形/辅助/自家栅栏/
-/// topmost 全跳过)找到第一个"可见且非 topmost 的外来窗"L,锚定 L 正下方。
-/// 应用态 L=最低可见应用窗(~380 层深位,数百层垃圾与带底扰动区绝缘)。
-/// topmost 跳过的原因:带内大量 topmost 风格隐形翻转垃圾(Outlook ATL/
-/// tooltip、SPES ScW),活跃瞬间冒充最低可见窗;曾试"以 topmost 为界下探
-/// 到非 topmost 窗",终点是不受过滤保护的 MSCTFIME UI(IME 翻转窗),
-/// 锚它=留在扰动区(第一版实踩,下探已删)。
-/// 深位回退(仅晋升路径 deep=true,显示桌面态):主规则找不到 L 时,锚定
-/// "最低的可见或 topmost 外来窗"正下方(本机显示态=ScW 钩子层群底部,
-/// ~30 步)——低于一切可见窗=不浮窗,且隔 20+ 层隐形垃圾离开菜单宿主的
-/// 停泊扰动区。只在晋升(1s 走查节拍、状态已稳定)启用,不在快速
-/// re-anchor/创建/修复路径用:过渡期窗口可见性闪烁瞬间误判会把栅栏锚到
-/// topmost 群之下=浮到应用窗上(应用态 ScW 在 ~440 层,高于 Chrome)。
-/// 最后回退:健康兄弟栅栏正下方(归队)→宿主正上方(旧行为)。锚点绝不
-/// 能是宿主本身(会把栅栏放到壁纸后面)或 HWND_TOP(会浮顶)。
-/// UIPI 坏锚降级(2026-08-31):主规则候选若在坏锚缓存(被 0x80070005
-/// 拒过,elevated 进程窗口)→改插它 GW_HWNDNEXT 下方窗口之下=栅栏落到
-/// 坏锚之下,绝不遮挡;下方无可垫窗才走兄弟归队/带底。
-fn band_attach_anchor(host: HWND, skip: HWND, deep: bool) -> Option<HWND> {
-    let vs = virtual_screen_rect();
-    let menu_host = MENU_HOST_HWND.get().copied();
-    let tray = TRAY_HWND.get().copied();
-    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-    for _ in 0..1000 {
-        if w.0 == 0 {
-            break;
-        }
-        if w == skip
-            || is_own_fence_window(w)
-            || is_topmost_window(w)
-            || band_invisible(w, &vs)
-            || band_aux(w, menu_host, tray)
-        {
-            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-            continue;
-        }
-        // UIPI 坏锚(如 elevated 会议窗)不能插其下方:改插它 GW_HWNDNEXT
-        // 方向(更低)的窗口之下,让栅栏落到坏锚之下=绝不遮挡它;沿下方找
-        // 可垫窗,全不可用才走兄弟归队/带底回退。绝不能"跳过继续向上"——
-        // 那样锚更浅,栅栏还是浮在坏锚上方(浮窗复现)。下方窗口必然非
-        // topmost(同一非 topmost 带内,坏锚下方不会再有 topmost)。
-        if bad_anchor_recent(w) {
-            let mut lower = unsafe { GetWindow(w, GW_HWNDNEXT) };
-            let mut tried = 0;
-            while lower.0 != 0 && tried < 8 {
-                // 排除宿主:锚宿主=栅栏沉到壁纸后面(勿回退)。
-                if lower != host
-                    && lower != skip
-                    && !is_topmost_window(lower)
-                    && !is_own_fence_window(lower)
-                    && !bad_anchor_recent(lower)
-                {
-                    return Some(lower);
-                }
-                lower = unsafe { GetWindow(lower, GW_HWNDNEXT) };
-                tried += 1;
-            }
-            break; // 坏锚下方无可垫窗:走兄弟归队/带底(栅栏在宿主正上方=坏锚之下)
-        }
-        return Some(w);
-    }
-    // 深位回退(deep=true):主规则无"可见且非 topmost"外来窗时,锚到"最低
-    // 可见或 topmost 外来窗"之下、紧贴它的最高**非 topmost 隐形**外来窗。
-    // 锚必须自身非 topmost:插到 topmost 窗正下方会把栅栏并入 topmost band
-    // (2026-08-29 实测 5 栅栏全变 topmost=True;且 SetWindowLongW 清不掉
-    // 该位,HWND_NOTOPMOST 又会把窗口移到非 topmost 带顶部=位置不可控,
-    // 此路不通,勿再试)。无可垫垃圾则继续兄弟归队/带底。
-    if deep {
-        let mut best: Option<HWND> = None;
-        let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-        for _ in 0..1000 {
-            if w.0 == 0 {
-                break;
-            }
-            if w == skip || is_own_fence_window(w) || band_aux(w, menu_host, tray) {
-                w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                continue;
-            }
-            if band_invisible(w, &vs) {
-                if !is_topmost_window(w) {
-                    best = Some(w);
-                }
-                w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                continue;
-            }
-            break; // 首个可见外来窗(含 topmost)到顶
-        }
-        if best.is_some() {
-            return best;
-        }
-    }
-    // 走完预算仍无可用外来窗:优先归队到带内最低的兄弟栅栏之下,保持
-    // 集群;没有兄弟才回退带底。
-    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-    for _ in 0..1000 {
-        if w.0 == 0 {
-            break;
-        }
-        if w != skip && is_own_fence_window(w) {
-            return Some(w);
-        }
-        w = unsafe { GetWindow(w, GW_HWNDPREV) };
-    }
-    desktop_insert_after(host)
-}
-
-// ---------------- 窗口生命周期 ----------------
-
 /// 当前鼠标屏幕坐标（拖动位移必须用屏幕坐标，
 /// 因为窗口移动后 WM_MOUSEMOVE 的客户区坐标会随之变化，造成抖动/拖不动）。
-fn screen_cursor() -> (f32, f32) {
+pub(crate) fn screen_cursor() -> (f32, f32) {
     unsafe {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -1234,7 +958,7 @@ fn screen_cursor() -> (f32, f32) {
 }
 
 /// 刷新所有栅栏窗口（位置/尺寸/内容），用于自动对齐重排后
-fn refresh_all_fences() {
+pub(crate) fn refresh_all_fences() {
     let ids: Vec<u32> = state()
         .lock()
         .unwrap()
@@ -1247,7 +971,7 @@ fn refresh_all_fences() {
     }
 }
 
-fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bool {
+pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bool {
     let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
         return false;
     };
@@ -1257,16 +981,15 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
     let hinstance = hinstance();
     let w = fence.rect.w.round() as i32;
     let h = fence.rect.h.round() as i32;
-    // 顶层分层窗口 + z 序插到桌面宿主(WorkerW/Progman)之后 ——
-    // 位于壁纸/桌面图标层之上、所有普通窗口之下,常驻桌面且不浮窗。
-    // 注意:绝不能做成桌面子窗口(分层子窗口挂在 Progman 下不会绘制),
-    // 也绝不能回退 HWND_TOP(会浮到应用之上);找不到宿主就延迟创建,
-    // 由全局定时器每秒重试自愈。
+    // 保持顶层分层 WS_POPUP,由桌面宿主持有,不是 WS_CHILD/SetParent。
+    // owned popup 必须在 owner 之上,避免显示桌面后被再次压到壁纸下面。
+    // 普通应用之下的上界仍由 band 就位维护;找不到宿主则延迟创建。
     let host = host_for_rect(&fence.rect, hosts);
     if host.is_none() {
         log(&format!("no desktop host yet, defer fence {}", fence_id));
         return false;
     }
+    let Some(owner) = desktop_shell_window() else { return false };
     let _zcreate = z_scope(ZIntent::Create);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1280,7 +1003,7 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
             0,
             w,
             h,
-            HWND(0),
+            owner,
             HMENU(0),
             hinstance,
             None,
@@ -1293,13 +1016,11 @@ fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bo
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, fence_id as isize);
         ole::register_drop_target(hwnd, fence_id);
-        // 就位目标:最低可见外来窗正下方(带内绝缘位,见 band_attach_anchor;
-        // 勿回退到"宿主正上方"——带底是菜单开合的扰动区,2026-08-29 闪屏
-        // 根因)。取不到锚点时不动 z——初始位置由全局 tick 的自愈在宿主
-        // 就绪后校正;HWND_TOP 回退曾把栅栏顶到栈顶。
-        let insert_after = match host.map(|h| band_attach_anchor(h.hwnd, HWND(0), false)).flatten() {
+        // owned 关系约束宿主下界;锚点限制应用上界,不能跨过最低可见应用窗。
+        // 无安全锚点时不使用 HWND_TOP/topmost,留待下一轮就位。
+        let insert_after = match host.and_then(|h| band_attach_anchor(h.hwnd, hwnd)) {
             Some(a) => Some(a),
-            None => desktop_shell_window().and_then(|s| band_attach_anchor(s, HWND(0), false)),
+            None => band_attach_anchor(owner, hwnd),
         };
         let mut attached = false;
         if let Some(after) = insert_after {
@@ -1426,7 +1147,7 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
         if !fail_dbg.is_empty() {
             s.wallpaper_fails = s.wallpaper_fails.saturating_add(1);
             let n = s.wallpaper_fails;
-            if n <= 2 || n % 25 == 0 {
+            if n <= 2 || n.is_multiple_of(25) {
                 log(&format!(
                     "wallpaper capture empty (fails={}): visible_hosts={} [{}]",
                     n,
@@ -1549,213 +1270,7 @@ fn wallpaper_cache_path() -> std::path::PathBuf {
     model::config_dir().join("wallpaper.bin")
 }
 
-fn icon_cache_path() -> std::path::PathBuf {
-    model::config_dir().join("iconcache.bin")
-}
-
-/// 图标像素字节必须是 size×size×4(DIB 32bpp,见 render::icon_pixels),
-/// 加载时逐条校验,不符即丢弃该条(防御旧版/损坏文件)。
-const ICON_ENTRY_MAX_BYTES: usize = 4 * 256 * 256;
-
-/// 持久化图标/显示名缓存——冷启动加速核心。此前每次启动都对全部桌面
-/// 条目跑 SHGFI 显示名解析 + 图标提取(.lnk/exe 冷盘+杀软扫描单个可达
-/// 数百 ms),这是"开机后栅栏比原生桌面晚好几秒"的主要可控来源。
-///
-/// 键与内存缓存一致:{path}\0{px};校验:mtime 与 raw 扫描一致 + 长度
-/// ==4*px*px。返回 (图标命中表, 显示名命中表)。
-fn load_icon_cache_file(
-    raw: &[model::FileItem],
-) -> (std::collections::HashMap<String, Vec<u8>>, std::collections::HashMap<String, String>) {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(icon_cache_path()) {
-        Ok(f) => f,
-        Err(_) => return Default::default(),
-    };
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() || buf.len() < 12 || &buf[0..4] != b"DFIC" {
-        return Default::default();
-    }
-    let ver = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
-    if ver != 1 {
-        return Default::default();
-    }
-    let px = u32::from_le_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
-    // px 由调用方条目键的后缀再核一次;这里只挡住荒谬值
-    if px < 16 || px > 256 {
-        return Default::default();
-    }
-    let expected_len = (px as usize) * (px as usize) * 4;
-    let count = u32::from_le_bytes(
-        buf.get(12..16)
-            .map(|s| s.try_into().unwrap_or([0; 4]))
-            .unwrap_or([0; 4]),
-    ) as usize;
-    let mut off = 16usize;
-    let mut icons: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
-    let expect_mtime: std::collections::HashMap<&str, u64> =
-        raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
-    for _ in 0..count.min(8192) {
-        if off + 2 > buf.len() {
-            break;
-        }
-        let klen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
-        off += 2;
-        if klen == 0 || klen > 1024 || off + klen + 12 > buf.len() {
-            break;
-        }
-        let key = String::from_utf8_lossy(&buf[off..off + klen]).to_string();
-        off += klen;
-        let mtime = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]));
-        off += 8;
-        let blen = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
-        off += 4;
-        if blen > ICON_ENTRY_MAX_BYTES || off + blen > buf.len() {
-            break;
-        }
-        // 键的路径部分必须存在于本次扫描且 mtime 一致(px 后缀也须匹配当前
-        // DPI);单条不合规只跳过该条,不再中断整表。
-        let path_part = key.split('\0').next().unwrap_or("");
-        if blen == expected_len
-            && key.ends_with(&format!("\0{px}"))
-            && expect_mtime.get(path_part).copied() == Some(mtime)
-            && mtime != 0
-        {
-            icons.insert(key, buf[off..off + blen].to_vec());
-        }
-        off += blen;
-    }
-    // 第二段:显示名表(path→display)。段头 magic 缺失不算错误(纯图标版兼容)。
-    let mut names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    if off + 4 <= buf.len() && &buf[off..off + 4] == b"DFNM" {
-        off += 4;
-        if off + 4 <= buf.len() {
-            let ncnt = u32::from_le_bytes(
-                buf[off..off + 4].try_into().unwrap_or([0; 4]),
-            ) as usize;
-            off += 4;
-            for _ in 0..ncnt.min(8192) {
-                if off + 2 > buf.len() {
-                    break;
-                }
-                let plen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
-                off += 2;
-                if plen == 0 || plen > 1024 || off + plen > buf.len() {
-                    break;
-                }
-                let p = String::from_utf8_lossy(&buf[off..off + plen]).to_string();
-                off += plen;
-                if off + 2 > buf.len() {
-                    break;
-                }
-                let dlen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
-                off += 2;
-                if dlen > 512 || off + dlen > buf.len() {
-                    break;
-                }
-                let d = String::from_utf8_lossy(&buf[off..off + dlen]).to_string();
-                off += dlen;
-                if !p.is_empty() && !d.is_empty() {
-                    names.insert(p, d);
-                }
-            }
-        }
-    }
-    log(&format!(
-        "boot icon cache loaded: icons={} names={}",
-        icons.len(),
-        names.len()
-    ));
-    (icons, names)
-}
-
-/// 把当前 icon_cache 与 files 的显示名快照落盘(tmp+rename 原子替换)。
-/// 只收 px==当前系统图标像素 的条目(文件头单值 px,保证与加载端逐条
-/// 长度校验一致);字节流恒为 px×px×4(render::icon_pixels 契约)。
-/// ~56 项 ≈ 0.5MB,后台线程序列化无感知。由全局 tick 检测到提取计数
-/// 变化后延迟调用——运行期懒提取(DPI 切换/新文件/残影预览)自动覆盖。
-fn save_icon_cache_file_now(px_expected: u32) {
-    // 1) 短暂持锁克隆快照
-    let mut entries: Vec<(String, u64, std::sync::Arc<Vec<u8>>)> = Vec::new();
-    let mut names: Vec<(String, String)> = Vec::new();
-    {
-        let s = state().lock().unwrap();
-        let by_path: HashMap<&str, &model::FileItem> =
-            s.files.iter().map(|f| (f.path.as_str(), f)).collect();
-        for (key, buf) in s.icon_cache.iter() {
-            let Some((p, pxs)) = key.split_once('\0') else {
-                continue;
-            };
-            if pxs.parse::<u32>().ok() != Some(px_expected) {
-                continue;
-            }
-            let blen = (px_expected as usize) * (px_expected as usize) * 4;
-            if buf.len() != blen || blen > ICON_ENTRY_MAX_BYTES {
-                continue;
-            }
-            let Some(fi) = by_path.get(p) else { continue };
-            if fi.mtime_ms == 0 {
-                continue;
-            }
-            entries.push((
-                key.clone(),
-                fi.mtime_ms,
-                std::sync::Arc::new(buf.clone()),
-            ));
-        }
-        for f in s.files.iter() {
-            names.push((f.path.clone(), f.name.clone()));
-        }
-    }
-    if entries.is_empty() {
-        return;
-    }
-    if entries.len() > 512 {
-        entries.sort_by_key(|(_, mt, _)| *mt);
-        entries.drain(..entries.len() - 512);
-    }
-    // 2) 后台序列化+写盘
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let total: usize = entries.iter().map(|e| e.2.len()).sum();
-        let mut buf: Vec<u8> = Vec::with_capacity(total + 4096);
-        buf.extend_from_slice(b"DFIC");
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&px_expected.to_le_bytes());
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for (key, mtime, bytes) in &entries {
-            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(&mtime.to_le_bytes());
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        buf.extend_from_slice(b"DFNM");
-        buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
-        for (p, d) in &names {
-            buf.extend_from_slice(&(p.len() as u16).to_le_bytes());
-            buf.extend_from_slice(p.as_bytes());
-            buf.extend_from_slice(&(d.len() as u16).to_le_bytes());
-            buf.extend_from_slice(d.as_bytes());
-        }
-        let path = icon_cache_path();
-        let tmp = path.with_extension("bin.tmp");
-        let ok = std::fs::File::create(&tmp)
-            .and_then(|mut f| {
-                f.write_all(&buf)?;
-                f.sync_all()
-            })
-            .and_then(|()| std::fs::rename(&tmp, &path))
-            .is_ok();
-        if !ok {
-            log("icon cache save failed");
-        }
-    });
-}
-
-
-fn save_wallpaper_cache(caps: &[render::WallpaperPixels]) {
+pub(crate) fn save_wallpaper_cache(caps: &[render::WallpaperPixels]) {
     use std::io::Write;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     buf.extend_from_slice(b"DFWP");
@@ -1833,7 +1348,7 @@ fn load_wallpaper_cache() -> Option<Vec<render::WallpaperPixels>> {
 /// 壁纸变化(手动换壁纸/主题切换/幻灯片轮换)时请求重捕获。保留旧快照
 /// (栅栏不呈现退化帧),清零节流哨兵,并同时武装追赶与跟随定时器:
 /// 跟随定时器做"捕获-比对-变了才重绘",捕获到过渡黑帧时自动重试。
-fn invalidate_wallpaper() {
+pub(crate) fn invalidate_wallpaper() {
     if let Ok(mut s) = state().try_lock() {
         s.wallpaper_ms = 0;
         s.wallpaper_fails = 0;
@@ -2023,7 +1538,10 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     let items = model::display_list(fence, &s.files);
     let lay = model::layout_with_metrics(fence, items.len(), &metrics);
     let hover = *s.hover.get(&fence_id).unwrap_or(&None);
-    let fence_hovered = *s.fence_hover.get(&fence_id).unwrap_or(&false);
+    // fence_hovered 在渲染侧仅控制 chrome 显隐;托盘"显示栅栏边框线"打开时
+    // 全部栅栏常显边框(无边框常显基线的可观察模式)
+    let fence_hovered =
+        *s.fence_hover.get(&fence_id).unwrap_or(&false) || chrome_always_on();
     let active = matches!(&s.drag, Some(d) if d.fence_id == fence_id
         && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
     let marquee = s.marquee;
@@ -2037,7 +1555,13 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
             && cy >= wp.origin_y as f32
             && cy < (wp.origin_y + wp.h as i32) as f32
     });
-    let surf_ref = s.surfaces.get(&fence_id).unwrap();
+    let Some(surf_ref) = s.surfaces.get(&fence_id) else {
+        // 防御(2026-09-08):上方 needs_new 分支正常已保证表面存在;万一未来
+        // 路径破坏该不变式,跳过本帧留痕即可,不 panic 整个进程(图标还在
+        // 隐藏态,进程一死用户看到的就是"程序凭空消失")
+        log(&format!("draw skip: surface missing fence {fence_id}"));
+        return;
+    };
     let t_draw0 = resize_now_ms();
     let jobs = render::draw_fence(
         &surf_ref.target,
@@ -2053,6 +1577,13 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
         fence_hovered,
         active,
         marquee,
+        // 正在就地重命名的成员:标签由编辑框替代(与原生一致)
+        FILE_RENAME_PATH.lock().unwrap().as_deref(),
+        // 入场动画中的成员:落地前不在栅栏里露脸(先落在桌面格,再飞入)
+        &s.arrival_animations
+            .iter()
+            .map(|a| a.path.clone())
+            .collect::<Vec<String>>(),
     );
     let t_draw = resize_now_ms() - t_draw0;
     let pos = POINT {
@@ -2092,7 +1623,7 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
 
 /// 刷新单个栅栏
 pub fn present_fence_only(fence_id: u32) {
-    let s = state().lock().unwrap();
+    let mut s = state().lock().unwrap();
     let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
         return;
     };
@@ -2102,15 +1633,21 @@ pub fn present_fence_only(fence_id: u32) {
     let Some(surface) = s.surfaces.get(&fence_id) else {
         return;
     };
-    let _ = render::present_existing_surface(
+    let ok = render::present_existing_surface(
         surface,
         hwnd,
         fence.rect.x.round() as i32,
         fence.rect.y.round() as i32,
     );
+    if ok {
+        s.presented.insert(fence_id);
+    } else {
+        s.presented.remove(&fence_id);
+        log(&format!("present existing failed fence {fence_id}"));
+    }
 }
 
-fn refresh_fence(fence_id: u32) {
+pub(crate) fn refresh_fence(fence_id: u32) {
     let t0 = resize_now_ms();
     let hosts = desktop_hosts();
     let mut s = state().lock().unwrap();
@@ -2131,7 +1668,7 @@ fn refresh_fence(fence_id: u32) {
     }
 }
 
-fn ensure_fence_window(id: u32) {
+pub(crate) fn ensure_fence_window(id: u32) {
     let hosts = desktop_hosts();
     let mut s = state().lock().unwrap();
     if !s.windows.contains_key(&id) {
@@ -2190,6 +1727,8 @@ fn warm_renderer_scratch() {
         false,
         false,
         None,
+        None,
+        &[],
     );
     // 空作业时标签绘制会早退,补一个 1 字符作业触发
     // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
@@ -2308,22 +1847,265 @@ pub fn show_all_fences() {
     reconcile_desktop_icons();
 }
 
+/// 缺类补建:按当前分类规则找出"有文件但无对应栅栏"的类别并新建栅栏,
+/// 返回新建的类别名。rescan 与 boot 共用——只改分类规则(如 md 文档→代码)
+/// 不动文件集合,rescan 的"无变化早退"永远等不到补建,boot 也必须跑一遍,
+/// 否则受影响文件无栅栏可归=隐身(2026-09-01)。
+pub(crate) fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
+    let mut have: std::collections::HashSet<String> = s
+        .fences
+        .iter()
+        .filter(|f| !f.category.is_empty())
+        .map(|f| f.category.clone())
+        .collect();
+    let mut added = Vec::new();
+    if auto_category() {
+        // 动态分类表(2026-09-08):按可编辑表补建;表里新增的空分类因无
+        // 文件不会在此建栏(由面板"新增"显式建),已删分类不再迭代=不复活
+        for cat_def in model::category_table() {
+            let cat: &str = &cat_def.name;
+            if have.contains(cat) {
+                continue;
+            }
+            if s.files.iter().any(|f| f.category == cat) {
+                // 用户手动删过的分类在墓碑期内不复活;该类出现**新文件**
+                // (mtime 晚于删除时刻)才清除墓碑并补建
+                if let Some(ts) = category_tombstone_at(cat) {
+                    let has_newer = s
+                        .files
+                        .iter()
+                        .any(|f| f.category == cat && f.mtime_ms > ts);
+                    if has_newer {
+                        clear_category_tombstone(cat);
+                        log(&format!("category fence '{cat}' resurrected by newer file"));
+                    } else {
+                        continue;
+                    }
+                }
+                added.push(cat.to_string());
+                have.insert(cat.to_string());
+            }
+        }
+    } else if !have.contains(model::FALLBACK_CATEGORY) {
+            // 自定义分类模式:未归位文件统一进兜底"其他",保证没有任何文件隐身
+            // (2026-09-09 起不再自动新建"未分类"栅栏——切模式不冒出多余栅栏)
+            added.push(model::FALLBACK_CATEGORY.to_string());
+    }
+    let mut new_ids = Vec::new();
+    for cat in &added {
+        let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+        new_ids.push(max_id);
+        // 尺寸按该类当前内容数收窄:不足 5 项宽 1 列(2026-09-02 用户要求)
+        let count = s.files.iter().filter(|f| &f.category == cat).count();
+        s.fences.push(Fence {
+            id: max_id,
+            title: cat.clone(),
+            category: cat.clone(),
+            pinned: Vec::new(),
+            item_order: Vec::new(),
+            rect: {
+                let (dw, dh) = default_size_for_items(count);
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: dw,
+                    h: dh,
+                }
+            },
+            collapsed: false,
+            scroll_rows: 0,
+            locked: false,
+            hidden: false,
+            manual_size: false,
+            sort_mode: model::default_sort_mode(),
+        });
+    }
+    // 新栅栏落位:第一行最后一个栅栏右侧,靠顶对齐,保持默认间隔
+    // (与手动新建同一规则 new_fence_rect,2026-09-02;旧的左上角落位会
+    // 压到占住左上角的既有栅栏)
+    for id in &new_ids {
+        let Some((w, h)) = s
+            .fences
+            .iter()
+            .find(|f| f.id == *id)
+            .map(|f| (f.rect.w, f.rect.h))
+        else {
+            continue;
+        };
+        let rect = new_fence_rect(s, w, h);
+        if let Some(fence) = s.fences.iter_mut().find(|f| f.id == *id) {
+            fence.rect = rect;
+        }
+    }
+    added
+}
+
 /// 桌面文件变更刷新
-pub fn rescan() {
-    let files = with_recycle_bin(shell::scan_desktop());
-    let (added_paths, removed_any) = {
+/// 空分类栅栏自动移除(2026-09-04 用户要求):分类成员走光(改名换类/
+/// 删除)后栅栏不再占位,右侧栅栏经 delete_fence_ex 的行内左移补位。
+/// 只处理分类栅栏(category 非空;手动新建的空栏是用户预留,不自动删);
+/// 不记墓碑。逐个走 delete_fence_ex(含 undo/左移/落盘),须在 state 锁外调用。
+fn remove_empty_category_fences() {
+    let empty_ids: Vec<u32> = {
         let s = state().lock().unwrap();
+        s.fences
+            .iter()
+            .filter(|f| !f.category.is_empty())
+            .filter(|f| model::display_list(f, &s.files).is_empty())
+            .map(|f| f.id)
+            .collect()
+    };
+    for id in empty_ids {
+        log(&format!("auto-removed empty category fence {}", id));
+        delete_fence_ex(id, false);
+    }
+}
+
+/// 重扫进行中标记:同一时刻至多一个后台扫描线程(重复请求合并进 REQUEUED)
+static SCAN_INFLIGHT: AtomicBool = AtomicBool::new(false);
+/// 扫描期间又来了重扫请求:本轮应用完再补一轮,收敛到最新状态
+static SCAN_REQUEUED: AtomicBool = AtomicBool::new(false);
+/// 扫描快照代际:内存文件列表被 rescan 之外的路径同步改写(改名提交/分类
+/// 规则应用)时 +1,使在途快照作废——否则陈旧结果会把改名前的旧路径/旧
+/// 分类写回内存(同步时代不存在此窗口,扫描与改写同线程串行)
+static SCAN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 后台线程产出的扫描结果(带取值时的代际),等 UI 线程取走应用(单槽)
+static SCAN_RESULT: Mutex<Option<(u64, Vec<FileItem>)>> = Mutex::new(None);
+
+/// 使在途扫描快照作废(内存文件列表被绕过 rescan 直接改写时必须调用:
+/// 改名提交、分类规则应用;拖拽删除走 mark_scan_removed 已内置)。
+pub(crate) fn invalidate_pending_scans() {
+    SCAN_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 异步重扫入口:文件系统枚举+显示名解析(~百 ms 级 shell 调用,4 线程并行)
+/// 全部搬到后台线程,结果经 WM_DL3_SCAN_APPLY 回 UI 线程应用——UI 线程不再
+/// 被 watcher 事件/手动"刷新"卡住(2026-09-09,遗留#5;此前扫描在 UI 线程,
+/// 54 文件冷缓存时栅栏交互可感知卡顿)。后台线程只做纯数据扫描,不碰任何
+/// 窗口(自愈体系线程不变式);应用段(原 rescan 的 diff+重绘)全在 UI 线程。
+/// 需要同步语义的调用方(改名提交:跨栏迁移动画必须排在扫描应用之后)
+/// 用 rescan_now()。
+pub fn rescan() {
+    if SCAN_INFLIGHT.swap(true, Ordering::Relaxed) {
+        SCAN_REQUEUED.store(true, Ordering::Relaxed);
+        return;
+    }
+    let epoch = SCAN_EPOCH.load(Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let files = with_recycle_bin(shell::scan_desktop());
+        *SCAN_RESULT.lock().unwrap() = Some((epoch, files));
+        // TRAY_HWND 在托盘初始化时创建,rescan 的全部调用方都在其后;万一
+        // 未就绪,结果留在槽里由 global_tick 兜底应用
+        if let Some(tray) = TRAY_HWND.get().copied() {
+            unsafe {
+                let _ = PostMessageW(tray, WM_DL3_SCAN_APPLY, WPARAM(0), LPARAM(0));
+            }
+        }
+    });
+}
+
+/// 同步重扫(rescan 拆分前的原行为):扫描+应用一次完成,调用返回即生效。
+/// 仅供改名提交使用——它已把内存文件列表同步到新路径,rescan 只为缺类
+/// 补建+收敛,且迁移动画必须在应用之后排队(异步版做不到这个顺序)。
+pub fn rescan_now() {
+    invalidate_pending_scans(); // 在途异步快照已过时,丢弃(见 SCAN_EPOCH)
+    apply_scan(with_recycle_bin(shell::scan_desktop()));
+}
+
+/// 取走后台扫描结果并应用(托盘 WM_DL3_SCAN_APPLY / global_tick 兜底)。
+/// 代际失配的陈旧快照直接丢弃;应用完毕清 INFLIGHT,期间有新请求
+/// (REQUEUED)则再起一轮。
+fn apply_pending_scan() {
+    let cur = SCAN_EPOCH.load(Ordering::Relaxed);
+    let pending = SCAN_RESULT.lock().unwrap().take();
+    if let Some((epoch, files)) = pending {
+        if epoch == cur {
+            apply_scan(files);
+        } else {
+            log("stale scan snapshot dropped (memory synced behind scanner)");
+        }
+    }
+    if SCAN_INFLIGHT.swap(false, Ordering::Relaxed)
+        && SCAN_REQUEUED.swap(false, Ordering::Relaxed)
+    {
+        rescan();
+    }
+}
+
+/// 应用一批扫描结果(必须 UI 线程):扫描宽恕合并、diff 判定、状态更新、
+/// 缺类补建、重绘收敛。
+fn apply_scan(mut files: Vec<FileItem>) {
+    let (added_paths, removed_any, recat_any, gained_cats) = {
+        let s = state().lock().unwrap();
+        // 扫描宽恕:上一轮在册、本轮扫不到的路径,连续 SCAN_MISS_DROP 轮
+        // 才真正移除(未达阈值时从上一轮找回,保持文件可见)——元数据瞬态
+        // 读取失败不再引发"文件消失/栅栏重排"(用户实测"文档自动移位")
+        {
+            let mut miss = scan_miss_map().lock().unwrap();
+            let present: std::collections::HashSet<String> =
+                files.iter().map(|f| f.path.clone()).collect();
+            for f in s.files.iter() {
+                if present.contains(&f.path) {
+                    miss.remove(&f.path);
+                } else if shell::path_gone_from_disk(&f.path) {
+                    // 磁盘上已确认不在(shell 菜单删除/外部进程删除):当轮移除,
+                    // 不进宽恕。宽恕只保护"元数据瞬态锁导致 read_dir 漏读"——
+                    // 那种情况属性查询依然成功。没有这层,外部删除的图标只能
+                    // 等宽恕轮数收敛,表现为"明明删了,栅栏里还在"。
+                    miss.remove(&f.path);
+                    log(&format!("scan: '{}' gone from disk, removed immediately", f.path));
+                } else {
+                    let c = miss.entry(f.path.clone()).or_insert(0);
+                    // 计数递增(2026-09-09 修复):此前 c 从不递增,自然消失路径
+                    // 永远到不了阈值=删掉的文件图标永久滞留(拖拽删除不受影响,
+                    // 那条路 mark_scan_removed 直接写满阈值)
+                    if *c < SCAN_MISS_DROP {
+                        files.push(f.clone());
+                    }
+                    *c += 1;
+                }
+            }
+            miss.retain(|k, _| present.contains(k) || s.files.iter().any(|f| f.path == *k));
+        }
         let added = model::newly_added_paths(&s.files, &files);
         let new_set: std::collections::HashSet<&str> =
             files.iter().map(|f| f.path.as_str()).collect();
         let removed = s.files.iter().any(|f| !new_set.contains(f.path.as_str()));
-        (added, removed)
+        // 分类漂移也算变化(2026-09-03):同名文件的分类变了(改名内存同步
+        // 后、或将来分类规则调整)不能走"无变化早退"——早退会跳过
+        // ensure_missing_category_fences,改名成 mp4 的文件永远留在文档栏
+        let mut old_cats: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for f in s.files.iter() {
+            old_cats.insert(f.path.as_str(), f.category.as_str());
+        }
+        let recat = files
+            .iter()
+            .any(|f| old_cats.get(f.path.as_str()).is_some_and(|&c| c != f.category));
+        // 有成员"迁入"的分类(2026-09-03):外部改名/分类规则调整导致某文件
+        // 分类变化,与在应用内改名同权——清该分类墓碑,否则墓碑挡住缺类补
+        // 建,迁入成员无栏可归=隐身
+        let mut gained: Vec<String> = Vec::new();
+        for f in files.iter() {
+            if let Some(old) = old_cats.get(f.path.as_str()) {
+                if *old != f.category && !gained.contains(&f.category) {
+                    gained.push(f.category.clone());
+                }
+            }
+        }
+        (added, removed, recat, gained)
     };
-    if added_paths.is_empty() && !removed_any {
-        // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
-        // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
-        // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
-        // 表现为点桌面/关菜单后栅栏区域闪一下。
+    // 文件集合没有任何变化:桌面目录的文件系统事件(Explorer 的元数据
+    // 触碰、菜单交互的伴生事件)不值得做任何重绘。此前的无条件
+    // show_all_fences 让每次 watcher dirty 都全量重绘 5 个栅栏,
+    // 表现为点桌面/关菜单后栅栏区域闪一下。
+    // 改名提交置位 RENAME_RESCAN_PENDING 强制走一遍:补建缺类栅栏+收敛
+    // (swap 副作用仅在 diff 为空时求值,与原嵌套 if 语义一致)。
+    if added_paths.is_empty()
+        && !removed_any
+        && !recat_any
+        && !RENAME_RESCAN_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
         return;
     }
     let new_cats: Vec<String> = {
@@ -2333,7 +2115,16 @@ pub fn rescan() {
         // 缓存键还包含像素尺寸，因此扫描时统一失效可避免保留陈旧图标。
         let keep: std::collections::HashSet<String> =
             s.files.iter().map(|f| f.path.clone()).collect();
-        s.icon_cache.clear();
+        // 只清已消失文件的图标缓存(2026-09-09:原实现全清,桌面一有变化
+        // 全部图标重新 SHGFI 提取=可感知的卡顿)
+        s.icon_cache
+            .retain(|k, _| k.split('\0').next().map(|p| keep.contains(p)).unwrap_or(false));
+        // 已删文件的常用记录同步剔除(2026-09-03):usage.json 残留旧路径时,
+        // 同名新建会继承旧次数直接顶到"常用"第一位(用户实测)
+        let pruned = model::prune_usage(&keep);
+        if pruned > 0 {
+            log(&format!("pruned {pruned} stale usage entries"));
+        }
         s.selected_paths.retain(|p| keep.contains(p));
         if s.focused_path.as_ref().is_some_and(|p| !keep.contains(p)) {
             s.focused_path = None;
@@ -2349,67 +2140,39 @@ pub fn rescan() {
                 .item_order
                 .retain(|p| keep.contains(p) || fence.pinned.contains(p));
         }
-        let mut have: std::collections::HashSet<String> = s
-            .fences
-            .iter()
-            .filter(|f| !f.category.is_empty())
-            .map(|f| f.category.clone())
-            .collect();
-        let mut added = Vec::new();
-        if auto_category() {
-            for cat in model::CATEGORIES {
-                if have.contains(cat) {
-                    continue;
-                }
-                if s.files.iter().any(|f| f.category == cat) {
-                    added.push(cat.to_string());
-                    have.insert(cat.to_string());
-                }
+        // 迁入分类的墓碑清理必须在补建之前(否则墓碑挡路,迁入成员隐身)
+        for cat in &gained_cats {
+            if category_tombstone_at(cat).is_some() {
+                clear_category_tombstone(cat);
+                log(&format!(
+                    "category '{cat}' tombstone cleared by incoming member"
+                ));
             }
-        } else if !have.contains(model::UNCATEGORIZED) {
-            // 自定义分类模式:未分配文件都进"未分类",保证没有任何文件隐身
-            added.push(model::UNCATEGORIZED.to_string());
         }
-        added
+        let new_cats_inner = ensure_missing_category_fences(&mut s);
+        // 到达顺序登记进 item_order(2026-09-04):新出现/迁入的成员追加到
+        // 所在栅栏拖拽顺序表末尾,排序按"先来在左、后来靠右"——迁移来的
+        // 文件不再因旧 mtime 排到最前面
+        // MutexGuard 的 Deref 不支持字段级分裂借用:先克隆文件列表
+        let files_snapshot = s.files.clone();
+        for fence in s.fences.iter_mut() {
+            let items = model::display_list(fence, &files_snapshot);
+            let missing: Vec<String> = items
+                .iter()
+                .filter(|it| !fence.item_order.contains(&it.path))
+                .map(|it| it.path.clone())
+                .collect();
+            fence.item_order.extend(missing);
+        }
+        new_cats_inner
     };
-    {
-        let added_any = !new_cats.is_empty();
-        let mut s = state().lock().unwrap();
-        for cat in new_cats {
-            let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-            s.fences.push(Fence {
-                id: max_id,
-                title: cat.clone(),
-                category: cat,
-                pinned: Vec::new(),
-                item_order: Vec::new(),
-                rect: Rect {
-                    x: 60.0 + max_id as f32 * 40.0,
-                    y: 60.0,
-                    ..{
-                        let (dw, dh) = default_fence_size();
-                        Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            w: dw,
-                            h: dh,
-                        }
-                    }
-                },
-                collapsed: false,
-                scroll_rows: 0,
-                locked: false,
-                hidden: false,
-                manual_size: false,
-                sort_mode: model::default_sort_mode(),
-            });
-        }
-        // 只有真的新增了分类栅栏才收敛；周期 rescan 不应把用户手动摆放的
-        // 位置重排回左上角（推挤式保留相对位置，而不是流式重排）。
-        drop(s);
-        if added_any {
-            settle_preserve_positions();
-        }
+    // 栅栏创建已全部收口在 ensure_missing_category_fences 内部(单一创建
+    // 来源)。此前这里还有第二个创建循环——rescan 路径每个新分类会建出
+    // 两个同名栅栏(2026-09-02 修"mp3 一来冒出两个媒体")。
+    // 只有真的新增了分类栅栏才收敛；周期 rescan 不应把用户手动摆放的
+    // 位置重排回左上角（推挤式保留相对位置 + 行贴顶归一，而不是流式重排）。
+    if !new_cats.is_empty() {
+        settle_preserve_positions();
     }
     {
         let s = state().lock().unwrap();
@@ -2417,18 +2180,62 @@ pub fn rescan() {
     }
     rebuild_pins();
     refit_auto_fence_heights();
-    show_all_fences();
+    // 空分类栅栏自动移除(右侧左移补位)——先于 show_all_fences,避免
+    // 空栏闪现;不记墓碑,该类再来文件时缺类补建照常重建
+    remove_empty_category_fences();
+    // 先排队入场动画再渲染栅栏(2026-09-03):栅栏帧按 hide_arrivals 跳过
+    // 飞行中成员的墨水——新文件"先落在桌面格、飞入落地后才在栅栏显形";
+    // 若先渲染后排队,文件会瞬间出现在栅栏里,动画沦为重复影子
     start_arrival_animations(&added_paths);
+    show_all_fences();
 }
 
 /// 默认栅栏尺寸:2 列宽 × 5 行高(用户指定;内容超出自动滚动)
-fn default_fence_size() -> (f32, f32) {
-    // 默认高度 4 行:一屏可上下放两排栅栏(build_global_config 的兜底同规则)
+pub(crate) fn default_fence_size() -> (f32, f32) {
     let (title_h, pad) = model::chrome(model::dpi_scale());
     (
         model::cell_w() * 2.0 + pad * 2.0 + 2.0,
         title_h + model::cell_h() * 4.0 + pad * 2.0 + 2.0,
     )
+}
+
+/// 按内容数给默认尺寸(2026-09-02 用户要求):不足 5 项宽 1 列,≥5 项宽 2 列;
+/// 高固定 4 行。与首次运行布局(build_global_config)同一规则
+pub(crate) fn default_size_for_items(n: usize) -> (f32, f32) {
+    let cols = if n < 5 { 1usize } else { 2usize };
+    let (title_h, pad) = model::chrome(model::dpi_scale());
+    (
+        model::cell_w() * cols as f32 + pad * 2.0 + 2.0,
+        title_h + model::cell_h() * 4.0 + pad * 2.0 + 2.0,
+    )
+}
+
+/// 新栅栏落位(2026-09-02 统一规则,手动/自动新建共用):第一行最后一个
+/// 栅栏右侧,与其靠顶对齐、保持默认间隔;无栅栏时放工作区左上角;
+/// 行尾放不下夹回屏内(残余重叠由随后的 settle 推开兜底)。
+pub(crate) fn new_fence_rect(s: &UiState, w: f32, h: f32) -> Rect {
+    let visible: Vec<Rect> = s
+        .fences
+        .iter()
+        .filter(|f| !f.hidden && !f.collapsed)
+        .map(|f| f.rect)
+        .collect();
+    let rows = model::rows_from_rects(&visible);
+    let (x, y) = match rows.first() {
+        Some(row) if !row.is_empty() => {
+            let last = &visible[row[row.len() - 1]];
+            (last.x + last.w + model::GAP, last.y)
+        }
+        _ => {
+            let (vx, vy, _, _) = work_area();
+            (vx, vy)
+        }
+    };
+    let r = Rect { x, y, w, h };
+    let (vx, vy, vw, vh) = work_area_for_rect(&r);
+    let mut tmp = [r];
+    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
+    tmp[0]
 }
 
 /// 扫描结果注入回收站虚拟条目(固定显示在"软件"栅栏第一位,可拖拽文件进去删除)
@@ -2485,6 +2292,75 @@ fn desktop_free_slot(s: &UiState, used: &mut Vec<Rect>) -> Option<(f32, f32)> {
     None
 }
 
+/// 定位能展示 path 的栅栏及其可见槽位的图标屏幕坐标(图标左上角)。
+/// auto_scroll=槽位在滚动页外时把栅栏滚到该行(新建入场用);false=页外
+/// 直接返回 None(迁移动画抓旧栏起点用,不应为起飞而滚动旧栏)。
+pub(crate) fn fence_slot_screen_pos(
+    s: &mut UiState,
+    path: &str,
+    auto_scroll: bool,
+) -> Option<(u32, (f32, f32))> {
+    let item = s.files.iter().find(|item| item.path == path)?.clone();
+    let mut fence = s
+        .fences
+        .iter()
+        .find(|fence| {
+            fence.pinned.contains(&item.path)
+                || fence.category.is_empty()
+                || fence.category == item.category
+        })?
+        .clone();
+    if fence.hidden || fence.collapsed {
+        return None;
+    }
+    let items = model::display_list(&fence, &s.files);
+    let index = items.iter().position(|c| c.path == item.path)?;
+    let metrics = s
+        .metrics
+        .get(&fence.id)
+        .copied()
+        .unwrap_or_else(model::DpiMetrics::system);
+    let mut layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+    if index < layout.first_index || index >= layout.first_index + layout.visible {
+        // 新条目落在滚动页外(2026-09-03):"常用"排序下新文件使用次数为
+        // 零只能排最后,内容超一页的栅栏(如文档 2×4=8 槽)会把它排进
+        // 第二页——旧逻辑这里静默跳过,新文件既无动画也看不见落在哪
+        // (用户实测"新建没动画"的真因)。改为把栅栏滚到该条目所在行,
+        // 让飞入落点可见;连滚都滚不到(不可能:行数≤总行数)才放弃。
+        if !auto_scroll {
+            return None;
+        }
+        let cols = layout.cols.max(1);
+        let row = index / cols;
+        let max_scroll = layout.total_rows.saturating_sub(layout.rows);
+        if max_scroll == 0 {
+            return None;
+        }
+        let scroll = row.min(max_scroll);
+        fence.scroll_rows = scroll;
+        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence.id) {
+            f.scroll_rows = scroll;
+        }
+        layout = model::layout_with_metrics(&fence, items.len(), &metrics);
+        if index < layout.first_index || index >= layout.first_index + layout.visible {
+            return None;
+        }
+        log(&format!(
+            "arrival: scrolled fence {} to row {} for off-page item",
+            fence.id, scroll
+        ));
+    }
+    let (cell_x, cell_y) = model::cell_pos_with_metrics(&layout, index, &metrics);
+    let icon_offset = (metrics.cell_w - metrics.icon_px) / 2.0;
+    Some((
+        fence.id,
+        (
+            fence.rect.x + cell_x + icon_offset,
+            fence.rect.y + cell_y + 4.0,
+        ),
+    ))
+}
+
 fn start_arrival_animations(added_paths: &[String]) {
     if added_paths.is_empty() || !client_area_animations_enabled() {
         return;
@@ -2500,51 +2376,30 @@ fn start_arrival_animations(added_paths: &[String]) {
         let Some(item) = s.files.iter().find(|item| &item.path == path).cloned() else {
             continue;
         };
-        let Some(fence) = s
-            .fences
-            .iter()
-            .find(|fence| {
-                fence.pinned.contains(path)
-                    || fence.category.is_empty()
-                    || fence.category == item.category
-            })
-            .cloned()
-        else {
-            continue;
-        };
-        if fence.hidden || fence.collapsed {
-            continue;
-        }
-        let items = model::display_list(&fence, &s.files);
-        let Some(index) = items
-            .iter()
-            .position(|candidate| candidate.path == item.path)
-        else {
+        let Some((fence_id, to)) = fence_slot_screen_pos(&mut s, path, true) else {
             continue;
         };
         let metrics = s
             .metrics
-            .get(&fence.id)
+            .get(&fence_id)
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
-        let layout = model::layout_with_metrics(&fence, items.len(), &metrics);
-        if index < layout.first_index || index >= layout.first_index + layout.visible {
-            continue;
-        }
-        let (cell_x, cell_y) = model::cell_pos_with_metrics(&layout, index, &metrics);
-        let icon_offset = (metrics.cell_w - metrics.icon_px) / 2.0;
-        let to = (
-            fence.rect.x + cell_x + icon_offset,
-            fence.rect.y + cell_y + 4.0,
-        );
         // 新文件先"落在桌面空白处"(围栏外的原生网格位),停留片刻再飞入栅栏;
         // 找不到围栏外空位时回退为从栅栏标题中心飞出
-        let from = desktop_free_slot(&s, &mut used_slots).unwrap_or((
-            fence.rect.x + fence.rect.w * 0.5 - metrics.icon_px * 0.5,
-            (fence.rect.y + metrics.title_h * 0.5 - metrics.icon_px * 0.5).max(0.0),
-        ));
+        let from = desktop_free_slot(&s, &mut used_slots).unwrap_or_else(|| {
+            let (fx, fy, fw) = s
+                .fences
+                .iter()
+                .find(|f| f.id == fence_id)
+                .map(|f| (f.rect.x, f.rect.y, f.rect.w))
+                .unwrap_or((0.0, 0.0, 200.0));
+            (
+                fx + fw * 0.5 - metrics.icon_px * 0.5,
+                (fy + metrics.title_h * 0.5 - metrics.icon_px * 0.5).max(0.0),
+            )
+        });
         pending.push(ArrivalAnimation {
-            fence_id: fence.id,
+            fence_id,
             path: item.path,
             name: render::display_name(&item.name),
             from,
@@ -2557,6 +2412,12 @@ fn start_arrival_animations(added_paths: &[String]) {
     if pending.is_empty() {
         return;
     }
+    for p in &pending {
+        log(&format!(
+            "arrival: animate '{}' fence={} from=({:.0},{:.0}) to=({:.0},{:.0})",
+            p.name, p.fence_id, p.from.0, p.from.1, p.to.0, p.to.1
+        ));
+    }
     s.arrival_animations.extend(pending);
     ensure_guide_window(&mut s);
     if let Some(tray) = TRAY_HWND.get().copied() {
@@ -2567,26 +2428,105 @@ fn start_arrival_animations(added_paths: &[String]) {
     refresh_guide(&mut s);
 }
 
-fn tick_arrival_animations() {
-    let mut s = state().lock().unwrap();
-    if s.arrival_animations.is_empty() {
+/// 跨栏迁移动画(2026-09-03):改名改扩展名(如 mp3→md)导致分类变化时,
+/// 从旧栏旧槽位飞向新栏新槽位——与新建入场动画共用同一 overlay 管线。
+/// moves: (路径, 旧栅栏id, 旧槽位屏幕x, y)。必须在 rescan 之后调用:
+/// 旧栏已不含该成员、新栏帧已渲染;排队后刷新新栏把成员藏到落地
+/// (hide_arrivals),飞行由 TIMER_ANIMATION 驱动,落地由 tick 显形。
+pub(crate) fn queue_migration_animations(moves: &[(String, u32, f32, f32)]) {
+    if moves.is_empty() || !client_area_animations_enabled() {
         return;
     }
-    ensure_guide_window(&mut s);
-    refresh_guide(&mut s);
-    if s.arrival_animations.is_empty() {
-        if let Some(tray) = TRAY_HWND.get().copied() {
-            unsafe {
-                let _ = KillTimer(tray, TIMER_ANIMATION);
+    let now = resize_now_ms();
+    let mut refresh_ids: Vec<u32> = Vec::new();
+    {
+        let mut s = state().lock().unwrap();
+        let mut queued_any = false;
+        for (path, old_fence, fx, fy) in moves {
+            let Some((fence_id, to)) = fence_slot_screen_pos(&mut s, path, true) else {
+                continue;
+            };
+            if fence_id == *old_fence {
+                continue;
             }
+            let name = s
+                .files
+                .iter()
+                .find(|i| &i.path == path)
+                .map(|i| render::display_name(&i.name))
+                .unwrap_or_default();
+            log(&format!(
+                "arrival: migrate '{}' fence {}->{} from=({:.0},{:.0}) to=({:.0},{:.0})",
+                name, old_fence, fence_id, fx, fy, to.0, to.1
+            ));
+            s.arrival_animations.push(ArrivalAnimation {
+                fence_id,
+                path: path.clone(),
+                name,
+                from: (*fx, *fy),
+                to,
+                // 旧栏位置短暂停留(150ms)再起飞,飞行距离跨栏更远,不加停留
+                started_ms: now + 150,
+                duration_ms: 520,
+            });
+            if !refresh_ids.contains(&fence_id) {
+                refresh_ids.push(fence_id);
+            }
+            queued_any = true;
         }
-        if s.drag_ghost.is_none() && s.guide_x.is_none() && s.guide_y.is_none() {
-            if let Some(hwnd) = s.guide_hwnd {
+        if !queued_any {
+            return;
+        }
+        ensure_guide_window(&mut s);
+        refresh_guide(&mut s);
+    }
+    // 锁外刷新:refresh_fence 内部要拿 state 锁
+    for id in refresh_ids {
+        refresh_fence(id);
+    }
+    if let Some(tray) = TRAY_HWND.get().copied() {
+        unsafe {
+            let _ = SetTimer(tray, TIMER_ANIMATION, 16, None);
+        }
+    }
+}
+
+fn tick_arrival_animations() {
+    let landed: Vec<u32>;
+    {
+        let mut s = state().lock().unwrap();
+        if s.arrival_animations.is_empty() {
+            return;
+        }
+        // 已落地(动画到期)的成员:记下栅栏,refresh_guide 的 retain 清掉
+        // 它们之后逐栏刷新——栅栏此前按 hide_arrivals 跳过其墨水,落地即显形
+        let now = resize_now_ms();
+        landed = s
+            .arrival_animations
+            .iter()
+            .filter(|a| now.saturating_sub(a.started_ms) > a.duration_ms + 180)
+            .map(|a| a.fence_id)
+            .collect();
+        ensure_guide_window(&mut s);
+        refresh_guide(&mut s);
+        if s.arrival_animations.is_empty() {
+            if let Some(tray) = TRAY_HWND.get().copied() {
                 unsafe {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
+                    let _ = KillTimer(tray, TIMER_ANIMATION);
+                }
+            }
+            if s.drag_ghost.is_none() {
+                if let Some(hwnd) = s.guide_hwnd {
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
                 }
             }
         }
+    }
+    // 锁外刷新:refresh_fence 内部要拿 state 锁,持锁重入必死锁
+    for fence_id in landed {
+        refresh_fence(fence_id);
     }
 }
 
@@ -2692,7 +2632,8 @@ pub fn startup() {
     };
     model::load_usage();
     {
-        let _ = auto_category(); // 预热开关(读设置文件)
+        model::set_auto_category(model::load_settings().auto_category); // 预热:开关单一真相
+        SHOW_CHROME.store(model::load_settings().show_chrome, Ordering::Relaxed);
     }
     // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载
     // 持久化缓存(快,且免去"原生图标可见时现场捕获"的残影/闪烁问题);无缓存
@@ -2743,10 +2684,21 @@ pub fn startup() {
     let (files, t_names) = bg_names.join().unwrap_or_else(|_| (Vec::new(), 0));
     let (icon_prewarm, t_icons) =
         bg_icons.join().unwrap_or_else(|_| (Default::default(), 0));
+    let mut created_cats: Vec<String> = Vec::new();
     {
         let mut s = state().lock().unwrap();
         let n_files = files.len();
         s.files = files;
+        // 启动即清理已删文件的常用记录(2026-09-03):应用关闭期间删的文件
+        // 同样会在 usage.json 留残账,同名新建继承旧次数顶到常用第一位
+        {
+            let keep: std::collections::HashSet<String> =
+                s.files.iter().map(|f| f.path.clone()).collect();
+            let pruned = model::prune_usage(&keep);
+            if pruned > 0 {
+                log(&format!("pruned {pruned} stale usage entries at boot"));
+            }
+        }
         // 启动持久化缓存命中先入,后台新提取覆盖同键(构造上 fresh 优先)
         for (k, v) in boot_icons {
             s.icon_cache.entry(k).or_insert(v);
@@ -2780,6 +2732,15 @@ pub fn startup() {
                 });
             }
             let _ = n_files;
+        } else {
+            // 非空配置启动:分类规则可能已变(如 md 文档→代码)而文件集合没变,
+            // rescan 不会触发,这里补建缺类栅栏,防止受影响文件无栅栏可归=隐身
+            created_cats = ensure_missing_category_fences(&mut s);
+            if !created_cats.is_empty() {
+                log(&format!(
+                    "boot created missing category fences: {created_cats:?}"
+                ));
+            }
         }
     }
     rebuild_pins();
@@ -2796,6 +2757,11 @@ pub fn startup() {
         resize_now_ms()
     ));
     settle_all_fences();
+    if !created_cats.is_empty() {
+        // 与 rescan 一致:补建后立即持久化(settle 之后的矩形才是最终位置)
+        let s = state().lock().unwrap();
+        let _ = model::save_config(&s.fences);
+    }
     refit_auto_fence_heights();
     log(&format!("boot pre-show done ({}ms)", resize_now_ms()));
     show_all_fences(); // 桌面壳未就绪时暂缓,由全局定时器自动补挂
@@ -2828,9 +2794,6 @@ pub fn startup() {
     }
 }
 
-/// 全局自愈:定时器与显示变化时调用。
-/// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
-/// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
 /// IDesktopWallpaper 签名的最近值(幻灯片轮换检测)
 static WALLPAPER_SIG: Mutex<String> = Mutex::new(String::new());
 static WALLPAPER_SIG_WARN: std::sync::atomic::AtomicBool =
@@ -2870,8 +2833,20 @@ fn finish_rename_if_clicked_outside() {
     }
 }
 
+fn fence_needs_presentation(hidden: bool, presented: bool, has_surface: bool) -> bool {
+    !hidden && (!presented || !has_surface)
+}
+
+/// 全局自愈:定时器与显示变化时调用。
+/// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
+/// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
 fn global_tick() {
     finish_rename_if_clicked_outside();
+
+    // 兜底:后台扫描结果因 TRAY_HWND 未就绪而没被消息路径取走时,这里补应用
+    if SCAN_RESULT.lock().is_ok_and(|r| r.is_some()) {
+        apply_pending_scan();
+    }
 
     let t = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     // 环境自稳:30s 节拍体检,持续异常超宽限期自动重建桌面层(见
@@ -2890,7 +2865,7 @@ fn global_tick() {
             ICON_SAVE_DIRTY_MS.store(resize_now_ms(), Ordering::Relaxed);
         }
         let dirty = ICON_SAVE_DIRTY_MS.load(Ordering::Relaxed);
-        if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t % 4 == 0 {
+        if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t.is_multiple_of(4) {
             ICON_SAVE_DIRTY_MS.store(0, Ordering::Relaxed);
             let px = model::DpiMetrics::system().icon_px.round().clamp(16.0, 256.0) as u32;
             save_icon_cache_file_now(px);
@@ -2900,25 +2875,21 @@ fn global_tick() {
     // 在 Progman/WorkerW 之间切换宿主,导致桌面反复重建(栅栏消失、桌面空白)。
     // 只用现有宿主,缺失时等待 Explorer 自然重建,由 ensure_all_attached 自愈。
     ensure_all_attached();
-    let needs_represent = {
+    // z 序暂时失位不代表 ULW 表面丢失。只恢复尚未呈现/缺失表面的
+    // 栅栏,不因 attached 的三拍防抖对全组重复提交画面。
+    let ids: Vec<u32> = {
         let s = state().lock().unwrap();
-        let expected = s.fences.iter().filter(|f| !f.hidden).count();
-        expected > 0 && (s.attached.len() < expected || s.presented.len() < expected)
+        s.fences
+            .iter()
+            .filter(|f| fence_needs_presentation(
+                f.hidden,
+                s.presented.contains(&f.id),
+                s.surfaces.contains_key(&f.id),
+            ))
+            .map(|f| f.id)
+            .collect()
     };
-    if needs_represent {
-        // Win+D/three-finger/desktop-host rebuilds can preserve HWNDs while discarding
-        // their layered presentation. 用现有表面立即重呈现(ULW 同一张位图,毫秒级)
-        // 代替全量重绘——精确模式全量重绘 5 个栅栏要 1-2 秒,用户会看到桌面空白。
-        invalidate_hosts_cache();
-        ensure_all_attached();
-        let ids: Vec<u32> = {
-            let s = state().lock().unwrap();
-            s.fences
-                .iter()
-                .filter(|f| !f.hidden)
-                .map(|f| f.id)
-                .collect()
-        };
+    if !ids.is_empty() {
         let mut full = Vec::new();
         {
             let s = state().lock().unwrap();
@@ -2963,7 +2934,7 @@ fn global_tick() {
     // 壁纸跟随(两模式共用,2026-08-26 起透明模式同样需要快照作文字种子)。
     // 快照到期时重捕获,内容有变(带容差:捕获亮度有 ~4% 时序波动,严格比较
     // 会引发无谓全量重绘=闪)才刷新栅栏。
-    if t % 3 == 0 {
+    if t.is_multiple_of(3) {
         let changed = {
             let mut s = state().lock().unwrap();
             if s.wallpapers.is_empty() {
@@ -3004,7 +2975,7 @@ fn global_tick() {
             }
         }
     }
-    if t % 10 == 0 {
+    if t.is_multiple_of(10) {
         let changed = {
             let mut s = state().lock().unwrap();
             match s.renderer.as_mut() {
@@ -3020,620 +2991,20 @@ fn global_tick() {
             refresh_all_fences();
         }
     }
-    if shell::take_desktop_dirty() || t % 30 == 0 {
+    if shell::take_desktop_dirty() || t.is_multiple_of(30) {
         rescan();
     }
 }
 
-/// 确保所有栅栏窗口存在、存活,并且 z 序紧贴桌面宿主之后(自愈):
-/// 顶层分层窗口 + 每秒重申插入位置 —— Explorer 重启、z 序漂移、启动竞态
-/// 都能在 1 秒内自动修复;找不到宿主时窗口保持原 z 位(新桌面在其下,不浮窗),
-/// 缺失窗口延迟到宿主就绪后创建。
-// ---------------- band 走查共享判据 ----------------
-// 主走查、肇事扫描、z-guard 快速通道三处必须用同一套"可忽略窗口"语义,
-// 2026-08-28 抽取为单一来源(此前走查内部即有两份复制粘贴)。
-
-struct VirtualScreen {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-}
-
-fn virtual_screen_rect() -> VirtualScreen {
-    unsafe {
-        VirtualScreen {
-            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
-            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
-            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        }
-    }
-}
-
-const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38]; // "#32768"
-const TRAY_CLASS: [u16; 13] = [
-    0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
-]; // "Shell_TrayWnd"
-// EdgeUiInputTopWndClass:系统触摸/输入边缘条,band 内常驻半透明,只覆盖
-// 屏幕边角几像素且自身透明,不可能视觉遮挡桌面内容。它在前后台切换
-//(菜单开合)时会上下漂移穿过我们的 band,按 band 原生系统窗容忍。
-const EDGEUI_CLASS: [u16; 22] = [
-    0x45, 0x64, 0x67, 0x65, 0x55, 0x69, 0x49, 0x6E, 0x70, 0x75, 0x74, 0x54, 0x6F, 0x70, 0x57,
-    0x6E, 0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
-];
-
-/// IME 候选/状态窗("MSCTFIME UI")与其线程宿主("Default IME")。2026-08-29
-/// 实测:MSCTFIME UI 的可见性/矩形随输入焦点振荡(空闲时 0x0 矩形隐藏,
-/// 活跃瞬间在带内"live"),稳稳钉在宿主正上方几层——若当可见外来窗处理,
-/// band_attach_anchor 的锚点会被它钉死在带底 churn 区(Win+D 后栅栏永远
-/// 晋升不出去=菜单关闭闪屏不愈);它零像素/瞬态,不可能视觉遮挡桌面内容,
-/// 与 EdgeUi 输入条同类,按 band 原生系统窗容忍。
-const MSCTFIME_CLASS: [u16; 11] = [
-    0x4D, 0x53, 0x43, 0x54, 0x46, 0x49, 0x4D, 0x45, 0x20, 0x55, 0x49,
-]; // "MSCTFIME UI"
-const DEFAULT_IME_CLASS: [u16; 11] = [
-    0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
-]; // "Default IME"
-
-/// band 走查的"不可见"判据:隐藏/最小化/离屏/退化尺寸(≤2px,GDI+ 钩子与
-/// 锁屏残留 CoreWindow 常以 1x1@0,0 插队,实际遮不住)/cloaked(visible
-/// 位有效但 DWM 不合成)。
-fn band_invisible(w: HWND, vs: &VirtualScreen) -> bool {
-    let mut wr = RECT::default();
-    let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
-    !rect_ok
-        || unsafe { IsIconic(w).as_bool() }
-        || !unsafe { IsWindowVisible(w).as_bool() }
-        || wr.right - wr.left <= 2
-        || wr.bottom - wr.top <= 2
-        || wr.right <= vs.x
-        || wr.bottom <= vs.y
-        || wr.left >= vs.x + vs.w
-        || wr.top >= vs.y + vs.h
-        || window_is_cloaked(w)
-}
-
-/// band 走查的"自有辅助窗/系统 band 窗"判据:菜单宿主/托盘窗/#32768 弹层/
-/// Shell_TrayWnd(自动隐藏任务栏转换瞬态)/EdgeUi 输入条。
-fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
-    if menu_host == Some(w) || tray == Some(w) {
-        return true;
-    }
-    let mut cls_buf = [0u16; 32];
-    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-    (n == 6 && cls_buf[..6] == MENU_CLASS)
-        || (n == 13 && cls_buf[..13] == TRAY_CLASS)
-        || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
-        || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
-        || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
-}
-
-fn ensure_all_attached() {
-    let hosts = desktop_hosts();
-    let mut created: Vec<u32> = Vec::new();
-    {
-        let mut s = state().lock().unwrap();
-        // Attachment is valid only for the host enumeration from this pass.
-        s.attached.clear();
-        // 1) 清理已销毁的窗口
-        let stale: Vec<u32> = s
-            .windows
-            .iter()
-            .filter(|(_, h)| !unsafe { IsWindow(**h).as_bool() })
-            .map(|(k, _)| *k)
-            .collect();
-        for id in stale {
-            s.windows.remove(&id);
-            s.metrics.remove(&id);
-            s.presented.remove(&id);
-            s.attached.remove(&id);
-            if let Some(sf) = s.surfaces.remove(&id) {
-                render::release_surface(sf);
-            }
-            s.fence_hover.remove(&id);
-        }
-        // 2) 创建缺失窗口(宿主已就绪)
-        let ids: Vec<u32> = s.fences.iter().map(|f| f.id).collect();
-        for id in ids {
-            if !s.windows.contains_key(&id) {
-                if create_fence_window(&mut s, id, &hosts) {
-                    created.push(id);
-                }
-            }
-        }
-        // 3) z 序重申:每个存活窗口重新插到其宿主之后(防漂移/Explorer 重建自愈)。
-        //    先做整链检查:宿主上方窗口之下恰好是全部栅栏(顺序不限)则视为
-        //    已就位,跳过所有 SetWindowPos——对分层窗口,即使参数相同的
-        //    SetWindowPos 也会触发 DWM 重新合成;每秒的"洗牌式重申"在
-        //    前台 band 变化(菜单交互)后会变成真实 z 移动,表现为
-        //    栅栏区域整体闪一下(表面内容并没有变)。
-        // z 序自愈(逐栅栏按需,2026-08-27 终版):
-        // 对每个栅栏,从其宿主向上(GW_HWNDPREV)走,直到命中该栅栏:
-        // - 命中 → 该栅栏就位,不动它(SetWindowPos 同位也触发 DWM 重合成=闪);
-        // - 自有辅助窗(菜单宿主/托盘窗/#32768 弹层)与一切"不可见"窗
-        //   (最小化/隐藏/矩形与虚拟屏幕不相交,含最小化沉底的 Chrome、
-        //   第三方软件离屏 CoreWindow)→ 跳过继续;
-        // - 自动隐藏任务栏(Shell_TrayWnd)在隐藏/弹出转换时会短暂沉到桌面
-        //   层,但弹起时本就在顶层且矩形(y≥任务栏)与栅栏(y≤内容区)不相交,
-        //   做空间相交测试后自然跳过;
-        // - 外来**可见且与该栅栏矩形相交**的窗口先于栅栏出现 → 该栅栏真被
-        //   遮挡,单独移回宿主之后(只动这一个)。
-        // 教训(勿回退):旧"单次遍历收集+不在集内就修"的写法,会在窗口沉到
-        // 栅栏包下方时提前折断,把"栅栏其实都在它上面"误判成"全部失位",
-        // 全量 SetWindowPos=每次菜单交互都闪。
-        let trayw = TRAY_HWND.get().copied();
-        let host1 = MENU_HOST_HWND.get().copied();
-        let vs = virtual_screen_rect();
-        let mut to_move: Vec<u32> = Vec::new();
-        let mut all_healthy = true;
-        for (id, h) in s.windows.clone() {
-            // 被拖栅栏拖拽期间提升到最高兄弟栅栏之上(band 内,见 handle_mousemove),
-            // 自愈豁免;拖拽结束由 handle_lbuttonup 归位底带
-            if matches!(&s.drag, Some(d) if d.fence_id == id) {
-                s.walk_strikes.remove(&id);
-                s.walk_strike_ms.remove(&id);
-                s.attached.insert(id);
-                continue;
-            }
-            // 显示桌面态 topmost 免疫:免疫栅栏(topmost 化)天然健康,
-            // 走查不得把它"修复"回带内(否则与免疫模式互殴)。
-            if SHOWN_TOPMOST.load(Ordering::Relaxed) && is_topmost_window(h) {
-                s.walk_strikes.remove(&id);
-                s.walk_strike_ms.remove(&id);
-                s.last_healthy_ms.insert(id, resize_now_ms());
-                s.attached.insert(id);
-                continue;
-            }
-            let Some(fence) = s.fences.iter().find(|f| f.id == id) else {
-                continue;
-            };
-            // 提前拷出:健康分支后半段有对 s 的可变借用(MutexGuard 不能字段分裂)
-            let fence_hidden = fence.hidden;
-            let Some(host) = host_for_rect(&fence.rect, &hosts) else {
-                continue; // 无宿主:不动窗口,保持原 z 位
-            };
-            // 不变式:从宿主向上,只允许出现(可跳过的)不可见窗/自有辅助窗,
-            // 然后就是本栅栏。途中撞上任何**可见且在屏内**的外来窗口还没
-            // 找到栅栏 → 栅栏已离开桌面 band(浮在真实窗口上方),必须拉回。
-            // 注意不是"是否与栅栏相交":不重叠的外来窗口同样说明栅栏出带
-            // (2026-08-27 实测:被顶到宿主之上 215 层的栅栏因下方窗口不与
-            // 它相交而被旧判定放行=持续浮窗)。
-            let mut out_of_band = false;
-            let mut found = false;
-            let mut blocker = (0isize, 0u64);
-            // 预算要能覆盖"栈内大量不可见垃圾窗垫在中间"的现实:不少软件会把
-            // 辅助窗 HWND_BOTTOM 沉底,一层层垫在宿主与栅栏之间(2026-08-28
-            // 实测单日累积 ~369 层隐形垃圾)。预算耗尽与到顶都
-            // 是失位,但报文要区分(勿回退到 320——垃圾层只会更多)。
-            let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-            let mut budget = 0usize;
-            for _ in 0..1000 {
-                if w.0 == 0 {
-                    budget = usize::MAX; // 真到顶
-                    break;
-                }
-                budget += 1;
-                if w.0 == 0 {
-                    break;
-                }
-                if h == w {
-                    found = true;
-                    break; // 栅栏就位
-                }
-                // 其他自家栅栏:正常(整包连续排在底带),跳过继续找自己
-                if s.windows.values().any(|v| *v == w) {
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                    continue;
-                }
-                let invisible = band_invisible(w, &vs);
-                if invisible {
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                    continue;
-                }
-                let mut cls_buf = [0u16; 32];
-                let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-                if band_aux(w, host1, trayw) {
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                    continue;
-                }
-                // 可见在屏内外来窗口先于栅栏出现:栅栏出带
-                out_of_band = true;
-                blocker = (w.0, class_hash(&cls_buf[..n.max(0) as usize]));
-                if to_move.is_empty() {
-                    let mut db = [0u16; 32];
-                    let dn = unsafe { GetClassNameW(w, &mut db) };
-                    let mut dr = RECT::default();
-                    let _ = unsafe { GetWindowRect(w, &mut dr) };
-                    // 身份点名:w 是否在我方窗口表里(排除孤儿同类窗干扰),
-                    // 句柄一并打印供跨 tick 对账。
-                    let own = s.windows.values().any(|v| *v == w);
-                    log(&format!(
-                        "walk-break: fence {id} host=0x{:x} blocked by cls={} own={} h=0x{:x} rect=({},{})-({},{}) vis={} iconic={}",
-                        host.hwnd.0,
-                        String::from_utf16_lossy(&db[..dn.max(0) as usize]),
-                        own,
-                        w.0,
-                        dr.left, dr.top, dr.right, dr.bottom,
-                        unsafe { IsWindowVisible(w).as_bool() },
-                        unsafe { IsIconic(w).as_bool() }
-                    ));
-                }
-                break;
-            }
-            let fault = if out_of_band {
-                Some(WalkFault::Blocked {
-                    hwnd: blocker.0,
-                    class: blocker.1,
-                })
-            } else if !found {
-                if budget == usize::MAX {
-                    Some(WalkFault::NotFoundTop)
-                } else {
-                    Some(WalkFault::NotFoundBudget)
-                }
-            } else {
-                None
-            };
-            if let Some(fault) = fault {
-                all_healthy = false;
-                // 防抖(勿回退):连续三拍**同签名**失位才动手;签名一变
-                //(拦路者换窗/类型变化=过路者)立即重置。退避保持第 3、13、
-                // 23…拍出手,防"每秒全链 SetWindowPos"复活成周期闪屏源。
-                // 限速:同秒内的重复走查(global_tick 双调用)只推一拍。
-                let now = resize_now_ms();
-                let last = s.walk_strike_ms.get(&id).copied().unwrap_or(0);
-                let advanced = last == 0 || now.saturating_sub(last) >= 500;
-                if advanced {
-                    s.walk_strike_ms.insert(id, now);
-                }
-                let strikes_n = {
-                    let e = s
-                        .walk_strikes
-                        .entry(id)
-                        .or_insert(WalkStrike { fault, count: 0 });
-                    if e.fault != fault {
-                        e.fault = fault;
-                        e.count = 0;
-                    }
-                    if advanced {
-                        e.count += 1;
-                    }
-                    e.count
-                };
-                // 沉底(栈顶未找到)确定非瞬态,首拍即修;预算耗尽状态不明,
-                // 只记日志;被拦截走三拍防抖。
-                let attempt = match fault {
-                    WalkFault::NotFoundTop => true,
-                    WalkFault::NotFoundBudget => false,
-                    WalkFault::Blocked { .. } => {
-                        strikes_n == 3 || (strikes_n > 3 && (strikes_n - 3) % 10 == 0)
-                    }
-                };
-                if matches!(fault, WalkFault::NotFoundTop | WalkFault::NotFoundBudget)
-                    && to_move.is_empty()
-                {
-                    let why = if budget == usize::MAX {
-                        "top reached"
-                    } else {
-                        "budget exhausted"
-                    };
-                    log(&format!(
-                        "walk-break: fence {id} host=0x{:x} NOT FOUND in {} steps ({}), strikes={}",
-                        host.hwnd.0,
-                        budget, why, strikes_n
-                    ));
-                }
-                if attempt {
-                    to_move.push(id);
-                } else if strikes_n == 1 {
-                    log(&format!("walk-break: fence {id} flagged strike 1/3, waiting confirm"));
-                }
-            } else {
-                s.walk_strikes.remove(&id);
-                s.walk_strike_ms.remove(&id);
-                s.last_healthy_ms.insert(id, resize_now_ms());
-                s.attached.insert(id);
-                // iconic 兜底:漏网的路径可能把栅栏最小化,走查找到了也
-                // 不等于可渲染(repair 的纯 z SetWindowPos 取消不了最小化,
-                // 必须走 ShowWindow)。
-                if unsafe { IsIconic(h) }.as_bool() {
-                    let _z = z_scope(ZIntent::Restore);
-                    unsafe {
-                        let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
-                    }
-                    log(&format!("walk: fence {id} was iconic, restored"));
-                }
-                // 注意:此处健康栅栏不做任何"粘底"重申(深漂移是安全位)。
-                // 出带修复的落点在上方 repair 分支:band_attach_anchor=
-                // 最低可见外来窗正下方(2026-08-29),同样不做带底粘底。
-                //
-                // churn 区晋升(2026-08-29,勿回退):显示桌面(Win+D)后,
-                // 高速拉回只能锚到过渡瞬间的中途态窗口(沉底扫动未完成时
-                // 某个仍 live 的窗,两秒后它自己隐掉),栅栏常被留在宿主
-                // 正上方 1-10 层=菜单开合/IME/辅助窗静默沉底的扰动区
-                // ("菜单关闭后点桌面空白闪屏"的根因)。应用态无需晋升
-                // (恢复扫动会把栅栏一路托到最低应用窗之下);显示态无人
-                // 托底,由走查在健康后一次性晋升到 band_attach_anchor 的
-                // 绝缘位。仅当仍在 churn 区(≤12 层)且目标位显著更高
-                // (滞后 6 层防边界抖动;曾用 20——会把"从带底送入 parked 应用
-                // 窗之下十几层"的机会挡掉,2026-08-29 12:22:58 实测)才动——
-                // 深位健康栅栏绝不重排
-                // (重排本身=重合成闪)。
-                if !fence_hidden {
-                    let mut in_churn = false;
-                    let mut depth = 0usize;
-                    {
-                        let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-                        for _ in 0..12 {
-                            if w.0 == 0 {
-                                break;
-                            }
-                            if w == h {
-                                in_churn = true;
-                                break;
-                            }
-                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                            depth += 1;
-                        }
-                    }
-                    if in_churn {
-                        // 诊断(限频 30s,显示态常驻带底会持续命中):晋升未
-                        // 发生时把判定中间量留在日志里
-                        static LAST_PROMOTE_DIAG: AtomicU64 = AtomicU64::new(0);
-                        let now_ms = resize_now_ms();
-                        let diag =
-                            now_ms.saturating_sub(LAST_PROMOTE_DIAG.load(Ordering::Relaxed)) > 30000;
-                        if diag {
-                            LAST_PROMOTE_DIAG.store(now_ms, Ordering::Relaxed);
-                        }
-                        if let Some(a) = band_attach_anchor(host.hwnd, h, true) {
-                            if a != h {
-                                let mut d2 = 0usize;
-                                let mut target_far = false;
-                                let mut w2 = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-                                for _ in 0..1000 {
-                                    if w2.0 == 0 {
-                                        break;
-                                    }
-                                    if w2 == a {
-                                        // 双重门:目标比当前深(滞后防抖)且目标
-                                        // 自身已脱离 churn 区(>12 层)。后者防
-                                        // "锚点在底部簇内穿插"的自循环——每次
-                                        // 晋升都还在 churn 区里,下个 tick 又升
-                                        // =每秒一次 z 移动的振荡(2026-08-29
-                                        // 12:48 实测 promote 风暴)。
-                                        target_far = d2 + 1 > depth + 6 && d2 + 1 > 12;
-                                        break;
-                                    }
-                                    w2 = unsafe { GetWindow(w2, GW_HWNDPREV) };
-                                    d2 += 1;
-                                }
-                                if diag {
-                                    let mut cb = [0u16; 32];
-                                    let cn = unsafe { GetClassNameW(a, &mut cb) };
-                                    log(&format!(
-                                        "promote-diag: fence {id} depth={} anchor=0x{:x} cls={}(n={}) inv={} aux={} target_depth={} far={}",
-                                        depth + 1,
-                                        a.0,
-                                        String::from_utf16_lossy(&cb[..cn.max(0) as usize]),
-                                        cn,
-                                        band_invisible(a, &vs),
-                                        band_aux(a, host1, trayw),
-                                        d2 + 1,
-                                        target_far
-                                    ));
-                                }
-                                if target_far {
-                                    // 锚点邻域重试:SPES ScW 等高完整性窗作锚报
-                                    // 0x80070005,且 ScW 群 8 层连坐,沿链换 3 个
-                                    // 穿不过去(2026-08-29 实测 promote-diag:
-                                    // SetWindowPos failed on all anchors)。改为
-                                    // 从期望锚点向下(更深入绝缘区)/向上各探
-                                    // ±8 层找第一个可作锚的窗口——该区间由
-                                    // resolver 构造保证全是隐形/辅助/自家窗,
-                                    // 位置偏差不影响绝缘语义。
-                                    let mut moved = false;
-                                    let mut shift_used = 0i32;
-                                    for delta in [
-                                        0i32, -1, -2, -3, -4, 1, 2, 3, 4, -5, -6, -7, -8, 5, 6,
-                                        7, 8,
-                                    ] {
-                                        let mut cur = a;
-                                        let mut ok = true;
-                                        for _ in 0..delta.unsigned_abs() {
-                                            let next = unsafe {
-                                                GetWindow(
-                                                    cur,
-                                                    if delta < 0 {
-                                                        GW_HWNDNEXT
-                                                    } else {
-                                                        GW_HWNDPREV
-                                                    },
-                                                )
-                                            };
-                                            if next.0 == 0 || next == host.hwnd || next == h {
-                                                ok = false;
-                                                break;
-                                            }
-                                            cur = next;
-                                        }
-                                        if !ok || cur == h || is_topmost_window(cur) {
-                                            continue;
-                                        }
-                                        let _z = z_scope(ZIntent::Repair);
-                                        let ok2 = unsafe {
-                                            SetWindowPos(
-                                                h,
-                                                cur,
-                                                0,
-                                                0,
-                                                0,
-                                                0,
-                                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                                            )
-                                            .is_ok()
-                                        };
-                                        if ok2 {
-                                            moved = true;
-                                            shift_used = delta;
-                                            break;
-                                        }
-                                    }
-                                    if moved {
-                                        if shift_used != 0 {
-                                            log(&format!(
-                                                "promote fence {id} anchor shifted {shift_used}"
-                                            ));
-                                        }
-                                        log(&format!(
-                                            "z-guard: fence {id} promoted out of churn zone (depth {} -> below 0x{:x})",
-                                            depth + 1,
-                                            a.0
-                                        ));
-                                    } else if diag {
-                                        log("promote-diag: SetWindowPos failed on all anchors");
-                                    }
-                                }
-                            } else if diag {
-                                log(&format!("promote-diag: fence {id} anchor==self",));
-                            }
-                        } else if diag {
-                            log("promote-diag: no anchor resolved");
-                        }
-                    }
-                }
-            }
-        }
-        if !to_move.is_empty() {
-            let mut moved: Vec<u32> = Vec::new();
-            let mut culprit = String::from("none");
-            for id in &to_move {
-                let Some(h) = s.windows.get(id).copied() else { continue };
-                let frect = s.fences.iter().find(|f| f.id == *id).map(|f| f.rect);
-                let Some(frect) = frect else { continue };
-                let Some(host) = host_for_rect(&frect, &hosts) else { continue };
-                // 纯 z 修复(NOMOVE|NOSIZE):位置由交互/布局路径负责,z 自愈只动
-                // 层叠次序。带位移的同值 SetWindowPos 会让 DWM 连无效区一起重算
-                //=可感知的重排闪底。
-                // 锚点重试:宿主正上方若是高完整性进程的窗口(企业安全软件
-                // 钩子层),以其为锚会被拒(0x80070005;2026-08-28 实测 20 次,
-                // fence4 因此失踪 3350 拍)。失败沿链向上换锚重试,最多 3 个。
-                let _z = z_scope(ZIntent::Repair);
-                let mut attached = false;
-                let mut first_err = None;
-                let mut anchor = band_attach_anchor(host.hwnd, h, false);
-                let mut tried = 0;
-                while let Some(after) = anchor {
-                    if tried >= 3 {
-                        break;
-                    }
-                    tried += 1;
-                    let attempt = unsafe {
-                        SetWindowPos(
-                            h,
-                            after,
-                            frect.x.round() as i32,
-                            frect.y.round() as i32,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                        )
-                    };
-                    match attempt {
-                        Ok(()) => {
-                            attached = true;
-                            bad_anchor_clear(after);
-                            if tried > 1 {
-                                log(&format!(
-                                    "repair fence {id} succeeded on retry #{tried} (anchor 0x{:x})",
-                                    after.0
-                                ));
-                            }
-                            break;
-                        }
-                        Err(e) => {
-                            // 记坏锚:锚解析(含降级路径)下一拍起绕开它,
-                            // 不再撞同一堵 UIPI 墙(WeLink elevated 实测)。
-                            bad_anchor_mark(after);
-                            if first_err.is_none() {
-                                first_err = Some((after, e));
-                            }
-                            let next = unsafe { GetWindow(after, GW_HWNDPREV) };
-                            anchor = if next.0 == 0 { None } else { Some(next) };
-                        }
-                    }
-                }
-                if !attached && moved.is_empty() && to_move.len() <= 6 {
-                    // 首个失败的实证:错误码+锚点,排查"修复静默无效"专用
-                    if let Some((after, e)) = first_err {
-                        log(&format!(
-                            "repair FAILED fence {} h=0x{:x} after=0x{:x} err={:?}",
-                            id, h.0, after.0, e
-                        ));
-                    }
-                }
-                if attached {
-                    s.attached.insert(*id);
-                    moved.push(*id);
-                    // 记录肇事窗口:该栅栏与宿主之间第一个相交的可见外来窗
-                    let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
-                    for _ in 0..64 {
-                        if w.0 == 0 || w == h {
-                            break;
-                        }
-                        let mut wr = RECT::default();
-                        let _ = unsafe { GetWindowRect(w, &mut wr) };
-                        if band_invisible(w, &vs) {
-                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                            continue;
-                        }
-                        if band_aux(w, host1, trayw) {
-                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                            continue;
-                        }
-                        let fx0 = frect.x.round() as i32;
-                        let fy0 = frect.y.round() as i32;
-                        let fx1 = fx0 + frect.w.round() as i32;
-                        let fy1 = fy0 + frect.h.round() as i32;
-                        let overlap =
-                            wr.left < fx1 && wr.right > fx0 && wr.top < fy1 && wr.bottom > fy0;
-                        if overlap {
-                            let mut cls_buf = [0u16; 32];
-                            let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-                            culprit = String::from_utf16_lossy(&cls_buf[..n.max(0) as usize]);
-                        }
-                        break;
-                    }
-                }
-            }
-            if !moved.is_empty() {
-                log(&format!(
-                    "z-chain repair: fences {:?} re-attached (occluder={})",
-                    moved, culprit
-                ));
-            }
-        }
-        s.band_quiet = all_healthy;
-
-        drop(s);
-    }
-    for id in created {
-        refresh_fence(id);
-    }
-    // 显示桌面态 topmost 免疫管理(锁已释放,见 shown_topmost_tick)
-    shown_topmost_tick();
-}
-
 // ---------------- 托盘图标 ----------------
 
-static DESKTOP_ICONS_HIDDEN: AtomicBool = AtomicBool::new(false);
+pub(crate) static DESKTOP_ICONS_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// User explicitly requested native desktop icons to remain visible.
 static NATIVE_DESKTOP_OVERRIDE: AtomicBool = AtomicBool::new(false);
 /// 纯净态:用户主动"隐藏全部栅栏"——栅栏与原生图标都隐藏,桌面只剩壁纸。
 /// 图标协调逻辑在此状态下不因"无栅栏呈现"而恢复原生图标(那正是旧的
 /// "隐藏栅栏=回到原生桌面"重复感的来源)。仅在本次运行内生效,重启回正常态。
-static ZEN_MODE: AtomicBool = AtomicBool::new(false);
+pub(crate) static ZEN_MODE: AtomicBool = AtomicBool::new(false);
 
 /// 图标缓存落盘调度状态(见 global_tick 内说明)
 static ICON_EXTRACT_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -3693,9 +3064,9 @@ fn desktop_listview() -> Option<HWND> {
     }
 }
 
-/// 桌面壳窗口（WorkerW 或 Progman）：栅栏 SetWindowPos 插到它之后，
-/// 即 z-order 位于桌面图标层之上、普通窗口之下（常驻桌面且不遮挡窗口）。
-fn desktop_shell_window() -> Option<HWND> {
+/// 桌面壳窗口(WorkerW 或 Progman),用作顶层栅栏的 owner 和 z 序下界。
+/// SetWindowPos 的锚点必须在其上方;直接锚此窗口表示放在它下面。
+pub(crate) fn desktop_shell_window() -> Option<HWND> {
     let lv = desktop_listview()?;
     unsafe {
         let defview = GetParent(lv);
@@ -3790,7 +3161,7 @@ pub fn env_health_report() -> (bool, String) {
     }
     // 3) 孤儿 DeskFence 窗口(死去实例的遗留)
     let me = std::process::id();
-    let mut orphans = 0usize;
+    let orphans;
     unsafe {
         unsafe extern "system" fn enum_orphan(h: HWND, l: LPARAM) -> BOOL {
             let (me, count) = unsafe {
@@ -3929,7 +3300,7 @@ fn env_repair_internal(reason: &str) {
     log(&format!(
         "env-repair({reason}): restarting explorer to rebuild desktop band"
     ));
-    std::thread::spawn(|| unsafe {
+    std::thread::spawn(|| {
         // 让 UI 先消化掉调用上下文(消息框/自检),再动 Explorer
         std::thread::sleep(std::time::Duration::from_millis(400));
         let remain = shell::terminate_by_name("explorer.exe", 5000);
@@ -4005,7 +3376,7 @@ fn env_watchdog_tick() {
 
 /// 协调原生桌面图标可见性。任何栅栏宿主/呈现状态异常都优先恢复原生图标，
 /// 以保证用户绝不会得到空白桌面。
-fn reconcile_desktop_icons() {
+pub(crate) fn reconcile_desktop_icons() {
     if NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed) {
         let _ = set_desktop_icons_visible(true);
         DESKTOP_ICONS_HIDDEN.store(false, Ordering::Relaxed);
@@ -4074,7 +3445,7 @@ fn reconcile_desktop_icons() {
     }
 }
 
-fn toggle_desktop_icons() {
+pub(crate) fn toggle_desktop_icons() {
     let want_hidden = !DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed);
     if want_hidden && !any_fence_presented_on_desktop() {
         log("refused to hide native desktop: no verified fence presentation");
@@ -4092,7 +3463,7 @@ fn toggle_desktop_icons() {
     }
 }
 
-fn restore_desktop_icons() {
+pub(crate) fn restore_desktop_icons() {
     if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
         set_desktop_icons_visible(true);
         DESKTOP_ICONS_HIDDEN.store(false, Ordering::Relaxed);
@@ -4182,6 +3553,11 @@ unsafe extern "system" fn tray_wndproc(
             zcheck_fences_now();
             return LRESULT(0);
         }
+        if msg == WM_DL3_SCAN_APPLY {
+            // 后台扫描完成:UI 线程应用结果(扫描线程只产数据不碰窗口)
+            apply_pending_scan();
+            return LRESULT(0);
+        }
         if msg == WM_SETTINGCHANGE {
             rebuild_render_resources();
             invalidate_hosts_cache();
@@ -4190,11 +3566,11 @@ unsafe extern "system" fn tray_wndproc(
             show_all_fences();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_GLOBAL as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_GLOBAL {
             global_tick();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_DESKTOP_WATCH as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_DESKTOP_WATCH {
             // 桌面态快速自检:三指手势的窗口扫动不发任何 WinEvent(两轮
             // 实测零触发),恢复过渡只能靠 250ms 轮询兜住;band_quiet 由
             // 1s 走查维护,正常使用时这里什么都不做。
@@ -4203,19 +3579,19 @@ unsafe extern "system" fn tray_wndproc(
             }
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_ANIMATION as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_ANIMATION {
             tick_arrival_animations();
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_CATCHUP as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_CATCHUP {
             wallpaper_catchup_tick(hwnd);
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_FOLLOW as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_WALLPAPER_FOLLOW {
             wallpaper_follow_tick(hwnd);
             return LRESULT(0);
         }
-        if msg == WM_TIMER && wparam.0 == TIMER_RENAME_WATCH as usize {
+        if msg == WM_TIMER && wparam.0 == TIMER_RENAME_WATCH {
             finish_rename_if_clicked_outside();
             let any_edit = state()
                 .lock()
@@ -4319,355 +3695,6 @@ fn init_tray() {
     }
 }
 
-fn show_tray_menu(x: i32, y: i32) {
-    let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
-    let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    // 两个状态感知切换项(用户约定):
-    // 按钮1 栅栏可见性:正常态"隐藏全部栅栏"(→纯净态:只剩壁纸),
-    //                 栅栏隐藏时"显示全部栅栏"(→回正常态);
-    // 按钮2 桌面归属:正常/纯净态"恢复原始桌面"(→原生图标接管),
-    //                原生态"恢复栅栏桌面"(→栅栏回归,图标重新隐藏)。
-    let (all_hidden, icons_hidden) = {
-        let s = state().lock().unwrap();
-        (
-            s.fences.iter().all(|f| f.hidden),
-            DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed),
-        )
-    };
-    if all_hidden {
-        shell::append_menu(menu, MENU_SHOW_ALL, "显示全部栅栏");
-    } else {
-        shell::append_menu(menu, MENU_HIDE_ALL, "隐藏全部栅栏");
-    }
-    shell::append_separator(menu);
-    shell::append_menu(menu, MENU_UNDO, "撤销上次布局调整");
-    shell::append_menu(menu, MENU_RESET_LAYOUT, "恢复默认布局");
-    shell::append_separator(menu);
-    shell::append_menu(
-        menu,
-        MENU_TOGGLE_DESKTOP_ICONS,
-        if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
-            "显示桌面图标"
-        } else {
-            "隐藏桌面图标"
-        },
-    );
-    // 原生图标可见且栅栏全部隐藏 = 原生桌面态,翻转为恢复栅栏
-    let native_mode = all_hidden && !icons_hidden;
-    if native_mode {
-        shell::append_menu(menu, MENU_SHOW_ALL, "恢复栅栏桌面");
-    } else {
-        shell::append_menu(menu, MENU_RESTORE_DESKTOP, "恢复原始桌面");
-    }
-    let align = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let mode = align_mode();
-    let modes = [
-        (MENU_AUTO_ALIGN, "auto", "自动对齐(固定间隔)"),
-        (MENU_ALIGN_GRID, "grid", "网格对齐(图标格倍数)"),
-        (MENU_ALIGN_FREE, "free", "自由移动(不受限)"),
-    ];
-    for (id, key, label) in modes {
-        if mode == key {
-            shell::append_menu_checked(align, id, label);
-        } else {
-            shell::append_menu(align, id, label);
-        }
-    }
-    shell::append_submenu(menu, "对齐方式", align);
-    // 渲染模式:精确(默认,壁纸底+ClearType 与原生一致)在上;
-    // 透明为兜底(动态壁纸不兼容时使用)
-    let render = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let rmode = render_mode();
-    let rmodes = [
-        (MENU_RENDER_PRECISE, "precise", "精确(与原生逐像素一致)"),
-        (
-            MENU_RENDER_TRANSPARENT,
-            "transparent",
-            "透明(兜底:动态壁纸不兼容时)",
-        ),
-    ];
-    for (id, key, label) in rmodes {
-        if rmode == key {
-            shell::append_menu_checked(render, id, label);
-        } else {
-            shell::append_menu(render, id, label);
-        }
-    }
-    shell::append_submenu(menu, "渲染模式", render);
-    if auto_category() {
-        shell::append_menu_checked(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
-    } else {
-        shell::append_menu(menu, MENU_AUTO_CATEGORY, "自动分类(默认8类)");
-    }
-    shell::append_menu(menu, MENU_HELP, "使用说明");
-    // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
-    // 手动入口(用户要求,2026-08-29)。
-    if shell::get_autostart() {
-        shell::append_menu_checked(menu, MENU_AUTOSTART, "开机自启");
-    } else {
-        shell::append_menu(menu, MENU_AUTOSTART, "开机自启");
-    }
-    shell::append_separator(menu);
-    shell::append_menu(menu, MENU_QUIT, "退出");
-    let id = track(menu, hwnd, x, y);
-    unsafe {
-        let _ = DestroyMenu(align);
-        let _ = DestroyMenu(render);
-        let _ = DestroyMenu(menu);
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-    }
-    dispatch_tray_command(id);
-}
-
-fn dispatch_tray_command(id: u32) {
-    match id {
-        MENU_SHOW_ALL => {
-            // "显示全部栅栏"/"恢复栅栏桌面"共用:回到正常态,栅栏回归,
-            // 图标协调随栅栏呈现自动重新隐藏原生图标
-            ZEN_MODE.store(false, Ordering::Relaxed);
-            set_desktop_state_stored("normal");
-            show_all_fences();
-        }
-        MENU_HIDE_ALL => {
-            // 纯净态:栅栏全部隐藏且原生图标保持隐藏(桌面只剩壁纸)
-            ZEN_MODE.store(true, Ordering::Relaxed);
-            set_desktop_state_stored("zen");
-            set_all_hidden(true);
-            log("zen mode: all fences hidden, native icons stay hidden");
-        }
-        MENU_UNDO => undo_layout(),
-        MENU_RESET_LAYOUT => reset_fence_layout(),
-        MENU_TOGGLE_DESKTOP_ICONS => toggle_desktop_icons(),
-        MENU_RESTORE_DESKTOP => restore_original_desktop(),
-        MENU_AUTO_ALIGN => set_align_mode("auto"),
-        MENU_ALIGN_GRID => set_align_mode("grid"),
-        MENU_ALIGN_FREE => set_align_mode("free"),
-        MENU_RENDER_TRANSPARENT => set_render_mode("transparent"),
-        MENU_RENDER_PRECISE => set_render_mode("precise"),
-        MENU_AUTO_CATEGORY => toggle_auto_category(),
-        MENU_HELP => show_help(),
-        MENU_AUTOSTART => toggle_autostart(),
-        MENU_QUIT => quit_app(),
-        _ => log(&format!("unknown tray command: {}", id)),
-    }
-}
-
-/// 设置渲染模式并立即生效(作废壁纸快照,全部栅栏重绘)
-fn set_render_mode(mode: &str) {
-    set_render_mode_stored(mode);
-    invalidate_wallpaper();
-    refresh_all_fences();
-    log(&format!("render_mode={mode}"));
-}
-
-/// 软件内使用说明(托盘/桌面右键菜单"使用说明")
-fn show_help() {
-    let text = "DeskFence 桌面整理 · 使用说明
-
-【默认自动分类(8类)】
-桌面文件按类型自动进入对应栅栏:
-· 软件:exe/msi/lnk/bat 等程序与快捷方式
-· 文件夹:所有目录
-· 文档:txt/md/word/excel/ppt/pdf 等
-· 图片:jpg/png/gif/svg 等
-· 媒体:mp3/wav/mp4/mkv 等音视频
-· 代码:py/js/ts/rs/go/c/cpp/html/json 等
-· 压缩包:zip/rar/7z/tar/gz 等
-· 其他:未识别的类型
-某类栅栏不存在时,首次出现该类文件会自动新建。
-
-【自定义分类模式】
-托盘菜单取消勾选\"自动分类(默认8类)\"即切换为自定义模式:
-· 不再按文件类型归类,文件只属于你拖它进去的栅栏
-· 用\"新建栅栏\"自由创建并命名(右键标题可重命名/删除)
-· 把图标从一个栅栏拖到另一个栅栏上松手即完成分配
-· 未分配的文件集中在\"未分类\"栅栏,不会丢失
-· 重新勾选\"自动分类\"即恢复 8 类默认模式
-
-【其他】
-拖动栅栏经过两个栅栏之间出现插入线,松手即插入;靠近屏幕边/角自动吸附;
-拖到其他栅栏正上/下方自动保持固定间距;Esc 取消拖动;拖图标到\"回收站\"删除;
-右键栅栏标题可折叠/锁定/重命名/删除。";
-    let t = shell::wide(text);
-    let cap = shell::wide("DeskFence 使用说明");
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-            None,
-            PCWSTR::from_raw(t.as_ptr()),
-            PCWSTR::from_raw(cap.as_ptr()),
-            windows::Win32::UI::WindowsAndMessaging::MB_OK
-                | windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
-        );
-    }
-}
-
-/// 切换自动分类:开=固定8类自动归类;关=自定义分类(新建栅栏自由命名,
-/// 文件拖进哪个栅栏就属于它,未分配的集中在"未分类"栅栏)
-fn toggle_auto_category() {
-    let v = !auto_category();
-    set_auto_category_stored(v);
-    log(&format!("auto_category={v}"));
-    if !v {
-        // 自定义模式必须有"未分类"兜底,保证没有文件隐身
-        let need = {
-            let s = state().lock().unwrap();
-            !s.fences.iter().any(|f| f.category == model::UNCATEGORIZED)
-        };
-        if need {
-            let mut s = state().lock().unwrap();
-            let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-            let (dw, dh) = default_fence_size();
-            s.fences.push(Fence {
-                id: max_id,
-                title: model::UNCATEGORIZED.to_string(),
-                category: model::UNCATEGORIZED.to_string(),
-                pinned: Vec::new(),
-                item_order: Vec::new(),
-                rect: Rect {
-                    x: 60.0 + max_id as f32 * 40.0,
-                    y: 60.0,
-                    w: dw,
-                    h: dh,
-                },
-                collapsed: false,
-                scroll_rows: 0,
-                locked: false,
-                hidden: false,
-                manual_size: false,
-                sort_mode: model::default_sort_mode(),
-            });
-            let cfg = s.fences.clone();
-            let _ = model::save_config(&cfg);
-        }
-    }
-    rebuild_pins();
-    settle_preserve_positions();
-    refresh_all_fences();
-}
-
-/// 切换开机自启(HKCU Run)
-fn toggle_autostart() {
-    let on = !shell::get_autostart();
-    let ok = shell::set_autostart(on);
-    log(&format!("autostart={} ok={}", on, ok));
-}
-
-/// 设置对齐模式并立即生效;切到"自动"时按固定间隔重排整组
-fn set_align_mode(mode: &str) {
-    set_align_mode_stored(mode);
-    log(&format!("align_mode={}", mode));
-    if mode == "auto" {
-        let areas = all_work_areas();
-        let mut s = state().lock().unwrap();
-        let mut rects: Vec<Rect> = s.fences.iter().map(|f| f.rect).collect();
-        let (vx, vy, vw, vh) = work_area();
-        // 全组依次链式对齐(以最左为主锚,逐个向右排)实现等距整理
-        let n = rects.len();
-        for anchor in 0..n {
-            model::align_local_chain(&mut rects, anchor, vx, vy, vw, vh);
-        }
-        model::fit_to_monitors(&mut rects, &areas);
-        for (f, r) in s.fences.iter_mut().zip(rects) {
-            f.rect = r;
-        }
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-    }
-    refresh_all_fences();
-}
-
-#[allow(dead_code)]
-/// 一键退出：删除托盘图标、恢复桌面图标、结束消息循环，栅栏窗口随之消失，桌面恢复原样
-pub fn quit_app() {
-    log("quit requested");
-    model::save_usage();
-    // 退出前持久化壁纸快照(此刻栅栏还接管着桌面、原生图标隐藏,快照干净);
-    // 下次启动直接加载,首帧立即可用
-    if let Ok(s) = state().try_lock() {
-        if !s.wallpapers.is_empty() {
-            save_wallpaper_cache(&s.wallpapers);
-        }
-    }
-    restore_desktop_icons();
-    uninstall_keyboard_hook();
-    uninstall_mouse_hook();
-    {
-        let mut s = state().lock().unwrap();
-        if let Some(sf) = s.guide_surface.take() {
-            render::release_surface(sf);
-        }
-        if let Some(h) = s.guide_hwnd.take() {
-            unsafe {
-                let _ = DestroyWindow(h);
-            }
-        }
-    }
-    unsafe {
-        if let Some(&hwnd) = TRAY_HWND.get() {
-            let mut n: NOTIFYICONDATAW = std::mem::zeroed();
-            n.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            n.hWnd = hwnd;
-            n.uID = 1;
-            let _ = Shell_NotifyIconW(NIM_DELETE, &n);
-        }
-        PostQuitMessage(0);
-    }
-}
-
-/// 恢复默认布局：删除所有栅栏并按当前桌面文件重新生成初始布局（文件本身不动）
-fn reset_fence_layout() {
-    push_undo();
-    let ids: Vec<u32> = {
-        let s = state().lock().unwrap();
-        s.fences.iter().map(|f| f.id).collect()
-    };
-    for id in ids {
-        delete_fence(id);
-    }
-    {
-        let mut s = state().lock().unwrap();
-        let base = model::build_global_config(&s.files);
-        let mut fences = if base.is_empty() {
-            let (dw, dh) = default_fence_size();
-            vec![Fence {
-                id: 1,
-                title: "桌面整理".into(),
-                category: String::new(),
-                pinned: Vec::new(),
-                item_order: Vec::new(),
-                rect: Rect {
-                    x: 30.0,
-                    y: 60.0,
-                    w: dw,
-                    h: dh,
-                },
-                collapsed: false,
-                scroll_rows: 0,
-                locked: false,
-                hidden: false,
-                manual_size: false,
-                sort_mode: model::default_sort_mode(),
-            }]
-        } else {
-            base
-        };
-        // 一键恢复：流式左/上对齐排列（自动排列）
-        let (vx, vy, vw, vh) = work_area();
-        let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
-        model::auto_layout(&mut rects, vx, vy, vw, vh);
-        for (f, r) in fences.iter_mut().zip(rects) {
-            f.rect = r;
-        }
-        s.fences = fences;
-    }
-    settle_all_fences();
-    {
-        let s = state().lock().unwrap();
-        let _ = model::save_config(&s.fences);
-    }
-    show_all_fences();
-}
-
 pub fn run_message_loop() -> i32 {
     loop {
         let mut msg = MSG::default();
@@ -4679,6 +3706,10 @@ pub fn run_message_loop() -> i32 {
             if r.0 == -1 {
                 log("getmessage error");
                 break;
+            }
+            // 分类面板的键盘拦截(Esc=关闭,Enter=提交),命中则跳过默认分发
+            if crate::cats_panel::panel_message(&msg) {
+                continue;
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -4696,7 +3727,7 @@ fn undo_stack() -> &'static Mutex<Vec<Vec<Fence>>> {
 }
 
 /// 压入当前布局快照(布局类操作前调用,支持撤销)
-fn push_undo() {
+pub(crate) fn push_undo() {
     let snap = state().lock().unwrap().fences.clone();
     let mut u = undo_stack().lock().unwrap();
     if u.last().map(|l| *l == snap).unwrap_or(false) {
@@ -4710,7 +3741,7 @@ fn push_undo() {
 
 /// 拖动/缩放前压入"拖动前"快照(拖动过程中矩形已被实时更新)。
 /// 调用方已持有 state 锁时传入其克隆的快照,避免同线程重复加锁死锁。
-fn push_undo_snapshot(mut snap: Vec<Fence>, fence_id: u32, rect: Rect) {
+pub(crate) fn push_undo_snapshot(mut snap: Vec<Fence>, fence_id: u32, rect: Rect) {
     if let Some(f) = snap.iter_mut().find(|f| f.id == fence_id) {
         f.rect = rect;
     }
@@ -4724,7 +3755,7 @@ fn push_undo_snapshot(mut snap: Vec<Fence>, fence_id: u32, rect: Rect) {
     }
 }
 
-fn undo_layout() {
+pub(crate) fn undo_layout() {
     let snap = undo_stack().lock().unwrap().pop();
     if let Some(fences) = snap {
         if fences.is_empty() {
@@ -4747,225 +3778,6 @@ fn undo_layout() {
 }
 
 /// 方向键微调栅栏位置(光标悬停在栅栏上时生效;Ctrl = 1px 微调,否则按图标网格步进)
-fn nudge_fence(fence_id: u32, vk: u32) {
-    let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-    let step_x = if ctrl { 1.0 } else { model::grid_x() };
-    let step_y = if ctrl { 1.0 } else { model::grid_y() };
-    let (dx, dy) = if vk == VK_LEFT.0 as u32 {
-        (-step_x, 0.0)
-    } else if vk == VK_RIGHT.0 as u32 {
-        (step_x, 0.0)
-    } else if vk == VK_UP.0 as u32 {
-        (0.0, -step_y)
-    } else if vk == VK_DOWN.0 as u32 {
-        (0.0, step_y)
-    } else {
-        return;
-    };
-    push_undo();
-    {
-        let mut s = state().lock().unwrap();
-        let nr = {
-            let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) else {
-                return;
-            };
-            if f.locked {
-                return;
-            }
-            f.rect.x += dx;
-            f.rect.y += dy;
-            f.rect
-        };
-        let others: Vec<Rect> = s
-            .fences
-            .iter()
-            .filter(|x| x.id != fence_id)
-            .map(|x| x.rect)
-            .collect();
-        let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-            f.rect = model::avoid_overlap(&nr, &others, vx, vy, vw, vh);
-        }
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-    }
-    refresh_fence(fence_id);
-}
-
-fn dispatch_file_key(fence_id: u32, packed: usize) {
-    let vk = (packed & 0xffff) as u32;
-    let ctrl = packed & (1 << 16) != 0;
-    let shift = packed & (1 << 24) != 0;
-    // Esc 取消拖拽预览:回滚原始顺序并结束拖拽(与原生桌面一致)
-    if vk == VK_ESCAPE.0 as u32 {
-        let mut s = state().lock().unwrap();
-        if s.drag_ghost.is_some() {
-            s.drag_ghost = None;
-            s.insert_line = None;
-            rollback_ghost_preview(&mut s);
-            drop(s);
-            refresh_fence(fence_id);
-            update_guides(None, None);
-            unsafe {
-                let _ = ReleaseCapture();
-            }
-            log("icon drag cancelled by Esc: rolled back");
-            return;
-        }
-        // Esc 取消栅栏拖动/缩放:恢复按下快照的全体位置(未保存配置,天然回退)
-        let geom_drag = matches!(s.drag.as_ref(), Some(d) if d.fence_id == fence_id
-            && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
-        if geom_drag {
-            s.insert_line = None;
-            if let Some(drag) = s.drag.take() {
-                let snaps: HashMap<u32, Rect> =
-                    drag.start_layout.iter().map(|f| (f.id, f.rect)).collect();
-                for f in s.fences.iter_mut() {
-                    if let Some(r) = snaps.get(&f.id) {
-                        f.rect = *r;
-                    }
-                }
-                s.marquee = None;
-                drop(s);
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
-                refresh_all_fences();
-                update_guides(None, None);
-                log("fence drag cancelled by Esc: restored snapshot");
-            }
-        }
-        return;
-    }
-    let mut open_paths = Vec::new();
-    let mut rename = None;
-    let mut delete_paths = Vec::new();
-    let mut redraw = false;
-    {
-        let mut s = state().lock().unwrap();
-        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id).cloned() else {
-            return;
-        };
-        let items = model::display_list(&fence, &s.files);
-        let focused_idx = s
-            .focused_path
-            .as_ref()
-            .and_then(|p| items.iter().position(|it| &it.path == p));
-        if ctrl && vk == 'A' as u32 {
-            s.selected_paths = items.iter().map(|it| it.path.clone()).collect();
-            s.focused_path = items.first().map(|it| it.path.clone());
-            s.selection_anchor = s.focused_path.clone();
-            redraw = true;
-        } else if vk == VK_RETURN.0 as u32 {
-            open_paths = items
-                .iter()
-                .filter(|it| s.selected_paths.contains(&it.path))
-                .map(|it| it.path.clone())
-                .collect();
-        } else if vk == 0x71 {
-            // VK_F2
-            if s.selected_paths.len() == 1 {
-                rename = s
-                    .selected_paths
-                    .iter()
-                    .next()
-                    .filter(|p| !model::is_recycle_bin(p))
-                    .cloned();
-            }
-        } else if vk == 0x2E {
-            // VK_DELETE(回收站虚拟条目不可删除)
-            delete_paths = items
-                .iter()
-                .filter(|it| {
-                    s.selected_paths.contains(&it.path) && !model::is_recycle_bin(&it.path)
-                })
-                .map(|it| it.path.clone())
-                .collect();
-        } else if vk == VK_LEFT.0 as u32
-            || vk == VK_RIGHT.0 as u32
-            || vk == VK_UP.0 as u32
-            || vk == VK_DOWN.0 as u32
-        {
-            if let Some(current) = focused_idx {
-                let lay = model::layout(&fence, items.len());
-                let target = if vk == VK_LEFT.0 as u32 {
-                    current.saturating_sub(1)
-                } else if vk == VK_RIGHT.0 as u32 {
-                    (current + 1).min(items.len().saturating_sub(1))
-                } else if vk == VK_UP.0 as u32 {
-                    current.saturating_sub(lay.cols)
-                } else {
-                    (current + lay.cols).min(items.len().saturating_sub(1))
-                };
-                if let Some(next) = items.get(target) {
-                    let path = next.path.clone();
-                    if shift {
-                        let anchor = s
-                            .selection_anchor
-                            .as_ref()
-                            .and_then(|p| items.iter().position(|it| &it.path == p))
-                            .unwrap_or(current);
-                        s.selected_paths.clear();
-                        for idx in model::indices_between(&lay, anchor, target, items.len()) {
-                            if let Some(it) = items.get(idx) {
-                                s.selected_paths.insert(it.path.clone());
-                            }
-                        }
-                    } else {
-                        s.selected_paths.clear();
-                        s.selected_paths.insert(path.clone());
-                        s.selection_anchor = Some(path.clone());
-                    }
-                    s.focused_path = Some(path);
-                    redraw = true;
-                }
-            }
-        }
-    }
-    if let Some(path) = rename {
-        log("TRIGGER f2");
-        start_file_rename(path);
-    }
-    if ctrl && matches!(vk, 0x43 | 0x58) {
-        let paths: Vec<String> = {
-            let s = state().lock().unwrap();
-            s.selected_paths.iter().cloned().collect()
-        };
-        let _ = ole::clipboard_set_files(&paths);
-    }
-    if ctrl && vk == 0x56 {
-        let paths = ole::clipboard_get_files();
-        let hwnd = state()
-            .lock()
-            .unwrap()
-            .windows
-            .get(&fence_id)
-            .copied()
-            .unwrap_or(HWND(0));
-        if shell::copy_files_to_desktop(hwnd, &paths) {
-            ole::clipboard_clear();
-            rescan();
-        }
-    }
-    if !delete_paths.is_empty() {
-        let hwnd = state()
-            .lock()
-            .unwrap()
-            .windows
-            .get(&fence_id)
-            .copied()
-            .unwrap_or(HWND(0));
-        shell::delete_to_recycle_bin_many(hwnd, &delete_paths);
-        rescan();
-    }
-    for path in open_paths.into_iter().take(32) {
-        open_item(&path);
-    }
-    if redraw {
-        refresh_fence(fence_id);
-    }
-}
-
 static LL_HOOK: OnceLock<HHOOK> = OnceLock::new();
 
 fn fence_id_for_hwnd(hwnd: HWND) -> Option<u32> {
@@ -5058,7 +3870,7 @@ fn install_keyboard_hook() {
     }
 }
 
-fn uninstall_keyboard_hook() {
+pub(crate) fn uninstall_keyboard_hook() {
     if let Some(h) = LL_HOOK.get() {
         unsafe {
             let _ = UnhookWindowsHookEx(*h);
@@ -5104,7 +3916,7 @@ fn install_mouse_hook() {
     }
 }
 
-fn uninstall_mouse_hook() {
+pub(crate) fn uninstall_mouse_hook() {
     if let Some(h) = LL_MOUSE_HOOK.get() {
         unsafe {
             let _ = UnhookWindowsHookEx(*h);
@@ -5205,257 +4017,7 @@ pub fn desktop_host_ready() -> bool {
 
 // ---------------- 菜单与操作 ----------------
 
-fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
-    unsafe {
-        mark_interaction();
-        // 菜单模态循环期间不会可靠投递 WM_MOUSELEAVE。清状态之外必须
-        // 立即熄灭悬停卡片:否则卡片(整面淡色背景)残留到菜单关闭后,
-        // 才被模态循环延迟的 MOUSELEAVE 熄灭——那次大面积重绘表现为
-        // "点桌面关闭菜单时栅栏闪一下"。打开菜单瞬间熄灭=点击反馈,
-        // 与原生一致;菜单关闭后 leave 到达时 was=false,零重绘。
-        let mut lit: Vec<u32> = Vec::new();
-        if let Ok(mut s) = state().try_lock() {
-            for v in s.hover.values_mut() {
-                *v = None;
-            }
-            s.hover_hit.clear();
-            s.hover_pending.clear();
-            s.fence_hover_pending.clear();
-            for (id, was) in s.fence_hover.iter_mut() {
-                if *was {
-                    *was = false;
-                    lit.push(*id);
-                }
-            }
-        }
-        for id in lit {
-            refresh_fence(id);
-        }
-        // 默认左键选择 + 返回命令 id。
-        // TPM_RIGHTBUTTON 与 Explorer 一致：右键菜单允许左键或右键选择菜单项
-        // （原生桌面右键菜单支持右键点选项目）。
-        // 菜单模态循环期间持有前台权,防止立即退出变僵尸菜单。
-        // owner 用隐形菜单宿主而不是栅栏窗口:前台化栅栏会把它提到前台
-        // z-band,自愈定时器拉回桌面层时分层窗口跨 band 移动引发整体
-        // 重合成闪屏(表面内容并没有变)。
-        let _guard = shell::menu_foreground(menu_host_or(hwnd));
-        // 前台权诊断:TrackPopupMenu 无前台会立即返回 0(zombie 菜单)。正常应
-        // 打印 host match=true;出现其他类名即可定位是谁抢的前台。
-        {
-            let fg = unsafe { GetForegroundWindow() };
-            let mut fb = [0u16; 32];
-            let fn_ = unsafe { GetClassNameW(fg, &mut fb) };
-            log(&format!(
-                "menu open: foreground={} (host match={})",
-                String::from_utf16_lossy(&fb[..fn_.max(0) as usize]),
-                menu_host_or(hwnd) == fg
-            ));
-        }
-        let r = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, menu_host_or(hwnd), None);
-        if r.0 == 0 {
-            log("track: menu dismissed without selection");
-        }
-        // 说明:菜单遮挡期间 DWM 会丢弃分层窗口被遮区域的颜色转换缓存,
-        // 菜单移走后的重转换存在 ~4% 舍入差——实测低于人眼感知阈值
-        // (并排对比不可辨),且 ULW 重呈现也无法合并它,故不做任何处理。
-        if r.0 != 0 {
-            r.0 as u32
-        } else {
-            0
-        }
-    }
-}
-
-fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
-    let (locked, collapsed, sort_mode) = {
-        let s = state().lock().unwrap();
-        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-            return;
-        };
-        (fence.locked, fence.collapsed, fence.sort_mode.clone())
-    };
-    let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let sort = unsafe { CreatePopupMenu().unwrap_or_default() };
-    let pairs = [
-        (MENU_SORT_FREQ, "常用", "常用(默认)"),
-        (MENU_SORT_TIME, "时间", "时间(最近修改)"),
-        (MENU_SORT_NAME, "名称", "名称"),
-        (MENU_SORT_MANUAL, "手动", "手动(拖拽自定义)"),
-    ];
-    for (id, key, label) in pairs {
-        if sort_mode == key {
-            shell::append_menu_checked(sort, id, label);
-        } else {
-            shell::append_menu(sort, id, label);
-        }
-    }
-    shell::append_menu(menu, MENU_ADD_FENCE, "新建栅栏");
-    shell::append_menu(menu, MENU_RENAME, "重命名");
-    shell::append_menu(
-        menu,
-        MENU_TOGGLE_COLLAPSE,
-        if collapsed { "展开" } else { "折叠" },
-    );
-    shell::append_menu(
-        menu,
-        MENU_LOCK,
-        if locked {
-            "解除锁定位置与大小"
-        } else {
-            "锁定位置与大小"
-        },
-    );
-    shell::append_submenu(menu, "排序方式", sort);
-    shell::append_separator(menu);
-    shell::append_menu(menu, MENU_DELETE_FENCE, "删除栅栏");
-    shell::append_separator(menu);
-    shell::append_menu(menu, MENU_REFRESH, "刷新");
-    let id = track(menu, hwnd, x, y);
-    unsafe {
-        let _ = DestroyMenu(sort);
-        let _ = DestroyMenu(menu);
-    }
-    match id {
-        MENU_SORT_FREQ => set_fence_sort(fence_id, "常用"),
-        MENU_SORT_TIME => set_fence_sort(fence_id, "时间"),
-        MENU_SORT_NAME => set_fence_sort(fence_id, "名称"),
-        MENU_SORT_MANUAL => set_fence_sort(fence_id, "手动"),
-        MENU_ADD_FENCE => {
-            let _ = add_fence_after(fence_id);
-        }
-        MENU_RENAME => start_rename(fence_id),
-        MENU_TOGGLE_COLLAPSE => toggle_collapse(fence_id),
-        MENU_LOCK => toggle_lock(fence_id),
-        MENU_DELETE_FENCE => delete_fence(fence_id),
-        MENU_REFRESH => rescan(),
-        _ => {}
-    }
-}
-
-pub fn add_fence_after(base_id: u32) -> u32 {
-    push_undo();
-    let max_id = {
-        let mut s = state().lock().unwrap();
-        let max_id = s.fences.iter().map(|f| f.id).max().unwrap_or(0) + 1;
-        let (x, y) = match s.fences.iter().find(|f| f.id == base_id) {
-            Some(b) => (b.rect.x + 40.0, b.rect.y + 40.0),
-            None => (200.0, 200.0),
-        };
-        s.fences.push(Fence {
-            id: max_id,
-            title: "新栅栏".into(),
-            category: String::new(),
-            pinned: Vec::new(),
-            item_order: Vec::new(),
-            rect: {
-                let (dw, dh) = default_fence_size();
-                Rect { x, y, w: dw, h: dh }
-            },
-            collapsed: false,
-            scroll_rows: 0,
-            locked: false,
-            hidden: false,
-            manual_size: false,
-            sort_mode: model::default_sort_mode(),
-        });
-        max_id
-    };
-    settle_all_fences();
-    {
-        let s = state().lock().unwrap();
-        let _ = model::save_config(&s.fences);
-    }
-    ensure_fence_window(max_id);
-    refresh_all_fences();
-    max_id
-}
-
-fn toggle_collapse(fence_id: u32) {
-    let collapsed = {
-        let mut s = state().lock().unwrap();
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-            f.collapsed = !f.collapsed;
-        }
-        let collapsed = s
-            .fences
-            .iter()
-            .find(|f| f.id == fence_id)
-            .is_some_and(|f| f.collapsed);
-        if collapsed {
-            clear_fence_interaction(&mut s, fence_id);
-        }
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-        collapsed
-    };
-    if collapsed {
-        finish_interaction_cleanup();
-    }
-    refresh_fence(fence_id);
-}
-
-/// 切换栏内排序模式并持久化;"手动"模式沿用用户拖拽出的 item_order
-fn set_fence_sort(fence_id: u32, mode: &str) {
-    {
-        let mut s = state().lock().unwrap();
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-            f.sort_mode = mode.to_string();
-        }
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-    }
-    log(&format!("fence {} sort mode = {}", fence_id, mode));
-    refresh_fence(fence_id);
-}
-
-fn toggle_lock(fence_id: u32) {
-    let mut s = state().lock().unwrap();
-    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-        f.locked = !f.locked;
-    }
-    let cfg = s.fences.clone();
-    let _ = model::save_config(&cfg);
-}
-
-fn delete_fence(fence_id: u32) {
-    if !state()
-        .lock()
-        .unwrap()
-        .fences
-        .iter()
-        .any(|f| f.id == fence_id)
-    {
-        return;
-    }
-    push_undo();
-    let hwnd = {
-        let mut s = state().lock().unwrap();
-        clear_fence_interaction(&mut s, fence_id);
-        let removed = s.windows.remove(&fence_id);
-        s.metrics.remove(&fence_id);
-        s.presented.remove(&fence_id);
-        s.attached.remove(&fence_id);
-        if let Some(sf) = s.surfaces.remove(&fence_id) {
-            render::release_surface(sf);
-        }
-        s.fences.retain(|f| f.id != fence_id);
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-        removed
-    };
-    if let Some(h) = hwnd {
-        unsafe {
-            let _ = RevokeDragDrop(h);
-            let _ = DestroyWindow(h);
-        }
-    }
-    finish_interaction_cleanup();
-    reconcile_desktop_icons();
-}
-
-/// 离开 DeskFence 桌面模式：先恢复 Explorer 原生图标，再隐藏本程序窗口。
-/// 不修改原始图标位置、文件或 Explorer 布局；用户可通过“显示全部栅栏”再次接管。
-fn restore_original_desktop() {
+pub(crate) fn restore_original_desktop() {
     ZEN_MODE.store(false, Ordering::Relaxed);
     set_desktop_state_stored("native");
     let _ = restore_desktop_now();
@@ -5463,7 +4025,7 @@ fn restore_original_desktop() {
     log("returned to original desktop without changing files or icon layout");
 }
 
-fn set_all_hidden(hidden: bool) {
+pub(crate) fn set_all_hidden(hidden: bool) {
     let ids: Vec<u32> = {
         let mut s = state().lock().unwrap();
         if hidden {
@@ -5487,1005 +4049,8 @@ fn set_all_hidden(hidden: bool) {
     }
 }
 
-// ---------------- 显示桌面态 topmost 免疫(2026-08-29 终修,勿回退) ----------------
-// 机制:ToggleDesktop/三指把栅栏纳入"停泊批"(静默沉底,无法否决),此后
-// 每次菜单关闭系统都把批内成员重新停泊=栅栏被拖下再拉回=菜单后点空白
-// 闪屏(60ms zwatch 实测:沉底块=栅栏簇+菜单宿主,parked 窗不被波及)。
-// 逐个最小化回桌面的路径不碰停泊批→栅栏不动→不闪(用户 Case B 实测)。
-// topmost 窗口不参与停泊(SPW ScW 钩子层与隐形垃圾丛林在每次切换中
-// 纹丝不动)→显示桌面态(无任何可见非 topmost 外来窗=应用全部停泊/
-// 最小化)给栅栏上 HWND_TOPMOST 获得同款豁免;出现可见应用窗(回应用)
-// 立即 HWND_NOTOPMOST,由既有走查/下压机制送回最低应用窗之下的深位。
-/// 免疫模式当前是否生效
-static SHOWN_TOPMOST: AtomicBool = AtomicBool::new(false);
-/// 显示桌面态连续稳定拍数(防过渡期抖动)
-static SHOWN_STABLE: AtomicU32 = AtomicU32::new(0);
-/// 沉底检测时记录的"待激活免疫"时间戳(0=无)。快速通道不在沉底瞬间
-/// 立即上 topmost——那时应用缩小动画还在播,topmost 栅栏会渲染在动画
-/// 之上=用户看到"栅栏比桌面先冒出来"(2026-08-29 用户实测);改为等
-/// 450ms(动画播完,而人手点开+关闭菜单至少要 1s)后由 zcheck 批量
-/// 一次性激活,五个栅栏同帧同现(逐栅栏激活会出现"一个比其他慢很多")。
-static SHOWN_PENDING_MS: AtomicU64 = AtomicU64::new(0);
 
-/// 全带是否存在"可见且非 topmost 的外来窗"(=有可见应用窗)。
-/// 与 band_attach_anchor 主规则同源判定。
-fn band_has_live_foreign() -> bool {
-    let Some(host) = desktop_shell_window() else {
-        return true; // 宿主未知时保守视为有(不开免疫)
-    };
-    let vs = virtual_screen_rect();
-    let mh = MENU_HOST_HWND.get().copied();
-    let tr = TRAY_HWND.get().copied();
-    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-    for _ in 0..1000 {
-        if w.0 == 0 {
-            break;
-        }
-        if is_own_fence_window(w)
-            || is_topmost_window(w)
-            || band_aux(w, mh, tr)
-            || band_invisible(w, &vs)
-        {
-            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-            continue;
-        }
-        return true;
-    }
-    false
-}
-
-/// 免疫模式切换:SetWindowPos(HWND_TOPMOST/NOTOPMOST) 是唯一可靠的
-/// topmost 位操作方式(SetWindowLongW 改不动,实测)。
-fn fence_apply_shown_topmost(on: bool) -> usize {
-    let hwnds: Vec<HWND> = state()
-        .lock()
-        .unwrap()
-        .windows
-        .values()
-        .copied()
-        .collect();
-    let mut n = 0usize;
-    for h in hwnds {
-        if !on && !is_topmost_window(h) {
-            continue; // 摘除模式:只动真正 topmost 的(避免把已归位栅栏再抬高)
-        }
-        let after = if on {
-            HWND_TOPMOST
-        } else {
-            // 摘除=直接重归位到最低可见外来窗之下。HWND_NOTOPMOST 会先把
-            // 栅栏抬到非 topmost 带顶部=浮在应用窗上再等人压(用户实测
-            // "回应用偶现栅栏浮在应用上"的根源),只留作锚解析失败的兜底。
-            match desktop_shell_window().and_then(|host| band_attach_anchor(host, h, false)) {
-                Some(a) if a != h => a,
-                _ => HWND_NOTOPMOST,
-            }
-        };
-        let _z = z_scope(ZIntent::Repair);
-        let ok = unsafe {
-            SetWindowPos(
-                h,
-                after,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            )
-        }
-        .is_ok();
-        if ok {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// 每秒走查末尾驱动的免疫模式管理:进入需"无可见应用窗"稳定 2 拍,
-/// 退出(出现可见应用窗)立即。切换本身在上一拍的过渡动画之后——
-/// 首次进入的 TOPMOST 跳变若可感知,再前移到 reanchor 路径(待用户实测)。
-fn shown_topmost_tick() {
-    if !z_guard_setting() || desktop_state() != "normal" {
-        if SHOWN_TOPMOST.swap(false, Ordering::Relaxed) {
-            let _ = fence_apply_shown_topmost(false);
-            log("shown-topmost: mode off (guard/state)");
-        }
-        return;
-    }
-    let shown = !band_has_live_foreign();
-    let prev = SHOWN_TOPMOST.load(Ordering::Relaxed);
-    if shown {
-        let s = SHOWN_STABLE.fetch_add(1, Ordering::Relaxed) + 1;
-        if !prev && s >= 2 {
-            // 栅栏全部隐藏(zen 瞬态)时不切
-            let any_visible = {
-                let st = state().lock().unwrap();
-                st.fences.iter().any(|f| !f.hidden)
-            };
-            if any_visible {
-                let n = fence_apply_shown_topmost(true);
-                SHOWN_TOPMOST.store(true, Ordering::Relaxed);
-                SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
-                log(&format!("shown-topmost: mode ON ({n} fences immune)"));
-            }
-        }
-    } else {
-        SHOWN_STABLE.store(0, Ordering::Relaxed);
-        if prev {
-            let n = fence_apply_shown_topmost(false);
-            SHOWN_TOPMOST.store(false, Ordering::Relaxed);
-            log(&format!("shown-topmost: mode OFF ({n} fences back to band)"));
-            // 立即触发高速自检:把摘除后高位悬浮的栅栏下压到最低可见
-            // 应用窗之下(发生在恢复扫动动画内=被遮蔽;勿改为递归调用
-            // ensure_all_attached——走查不可重入)。
-            zcheck_fences_now();
-        }
-    }
-}
-
-// ---------------- 重命名 ----------------
-
-static RENAME_OLD_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 static INTENTIONAL_HIDE: AtomicBool = AtomicBool::new(false);
-
-// ---------------- z 序意图守卫 ----------------
-
-/// 窗口定位意图:标记"自家发起的 z 序/显示操作",让 fence_wndproc 的
-/// WM_WINDOWPOSCHANGING 拦截只针对外部改动。区分依据:自家 SetWindowPos/
-/// ShowWindow 在 UI 线程同步触发该消息(嵌套在调用栈内);外部进程(Shell
-/// 显示桌面/最小化批次)的调用经消息泵派发,到达时意图必为 None——线程
-/// 局部即可精确区分,无需跨进程握手(后台线程只做文件 IO,不碰窗口)。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ZIntent {
-    /// 创建栅栏窗口并插入底带
-    Create,
-    /// 主动显示/刷新呈现
-    Show,
-    /// 拖拽提升/落点归位
-    Drag,
-    /// z 自愈修复
-    Repair,
-    /// 最小化兜底恢复
-    Restore,
-}
-
-thread_local! {
-    static Z_INTENT: std::cell::Cell<Option<ZIntent>> = const { std::cell::Cell::new(None) };
-}
-
-/// RAII 守卫:作用域内的窗口定位操作被拦截逻辑放行。嵌套时恢复前值。
-struct ZScope(Option<ZIntent>);
-
-fn z_scope(intent: ZIntent) -> ZScope {
-    let prev = Z_INTENT.with(|c| c.replace(Some(intent)));
-    ZScope(prev)
-}
-
-impl Drop for ZScope {
-    fn drop(&mut self) {
-        Z_INTENT.with(|c| c.set(self.0));
-    }
-}
-
-fn z_intent_active() -> bool {
-    Z_INTENT.with(|c| c.get().is_some())
-}
-
-/// 外部定位变更后的自检:若窗口被压到桌面宿主之下(显示桌面批次的实际
-/// 行为,且该操作不经可否决的 WM_WINDOWPOSCHANGING——2026-08-28 wdprobe
-/// 实测 veto 零命中、栅栏在宿主下方 vis=1),立即重挂回宿主正上方,不等
-/// 3 拍自愈。判据:从本窗口向上(GW_HWNDPREV)走能遇到宿主=自己在宿主
-/// 之下;正常在带内时向上走只会到栈顶。无状态锁,可在窗口过程直接调用。
-fn fence_reanchor_if_below_host(hwnd: HWND) {
-    let Some(shell) = desktop_shell_window() else { return };
-    if shell == hwnd {
-        return;
-    }
-    let mut w = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
-    for _ in 0..400 {
-        if w.0 == 0 {
-            return; // 到顶未遇宿主:窗口在宿主上方,无需处理
-        }
-        if w == shell {
-            // 显示桌面态快速免疫(2026-08-29):沉底时若已无可见应用窗,
-            // 记录待激活时间戳,由 zcheck 在 450ms 后批量上 topmost
-            // (勿在此立即上——应用缩小动画还在播,栅栏会渲染在动画之上
-            // ="栅栏比桌面先出来";误判由 zcheck 的可见窗检查自纠)。
-            if z_guard_setting() && desktop_state() == "normal" && !band_has_live_foreign() {
-                SHOWN_PENDING_MS.store(resize_now_ms(), Ordering::Relaxed);
-            }
-            // 锚点=最低可见外来窗正下方(带内绝缘位,2026-08-29;带底=菜单
-            // 关闭静默沉底的扰动区,勿回退,详见 band_attach_anchor)。
-            let Some(after) = band_attach_anchor(shell, hwnd, false) else { return };
-            let _z = z_scope(ZIntent::Repair);
-            let attempt = unsafe {
-                SetWindowPos(
-                    hwnd,
-                    after,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                )
-            };
-            if let Err(e) = attempt {
-                bad_anchor_mark(after);
-                log(&format!(
-                    "z-guard: re-anchor FAILED after=0x{:x} err={e:?} (anchor blacklisted)",
-                    after.0
-                ));
-                return;
-            }
-            bad_anchor_clear(after);
-            log(&format!(
-                "z-guard: fence re-anchored above host after external move (after=0x{:x})",
-                after.0
-            ));
-            return;
-        }
-        w = unsafe { GetWindow(w, GW_HWNDPREV) };
-    }
-}
-
-// ---- 全局 z 序事件触发的高速自检 ----
-// 显示桌面把栅栏压到宿主之下的操作既不发 WM_WINDOWPOSCHANGING 也不发
-// WM_WINDOWPOSCHANGED(2026-08-28 两轮 wdprobe 实测:两类拦截零命中),
-// 进程内消息通道完全探测不到。改用全局 WinEvent 钩子做触发器:桌面切换
-// 必然伴随成批的 HIDE/REORDER/MINIMIZE 事件(事件按窗口属主过滤,
-// SKIPOWNPROCESS 会滤掉自家栅栏的 z 事件,所以靠"其他窗口被批量操作"
-// 的事件当信号),回调只做原子标记+合并投递,实查在 UI 线程执行
-// fence_reanchor_if_below_host——2026-08-28 实测切换后 <165ms 即归位,
-// 走查 3 拍自愈全程零参与。
-static ZCHECK_PENDING: AtomicBool = AtomicBool::new(false);
-static ZORDER_HOOKS: std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK)> =
-    std::sync::OnceLock::new();
-
-unsafe extern "system" fn zorder_event_cb(
-    _hook: HWINEVENTHOOK,
-    _event: u32,
-    _hwnd: HWND,
-    _idobject: i32,
-    _idchild: i32,
-    _idthread: u32,
-    _time: u32,
-) {
-    // 桌面切换时该事件成批到达,回调必须 O(1):抢到标记者负责投递一条
-    // 合并消息,其余事件全部被吞掉。
-    if !ZCHECK_PENDING.swap(true, Ordering::Relaxed) {
-        let tray = TRAY_HWND.get().copied().unwrap_or(HWND(0));
-        if tray.0 != 0 {
-            let _ = PostMessageW(tray, WM_DL3_ZCHECK, WPARAM(0), LPARAM(0));
-        } else {
-            ZCHECK_PENDING.store(false, Ordering::Relaxed);
-        }
-    }
-}
-
-/// 安装两组全局事件钩子(out-of-context:回调经本线程消息泵派发):
-/// ① EVENT_SYSTEM_MINIMIZESTART..END(0x0016-0x0017)
-/// ② EVENT_OBJECT_SHOW..REORDER(0x8002-0x8004)
-/// 覆盖桌面切换双向:隐藏方向发 MINIMIZESTART/HIDE/REORDER,恢复方向的
-/// 窗口重现发 SHOW(2026-08-28 补,缺它恢复过渡完全无触发)。范围取舍:
-/// LOCATIONCHANGE(0x800b)正常使用中过于高频(拖动任何窗口即风暴),不采用。
-fn install_zorder_hooks() {
-    let h1 = unsafe {
-        SetWinEventHook(
-            0x0016,
-            0x0017,
-            HMODULE(0),
-            Some(zorder_event_cb),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
-    let h2 = unsafe {
-        SetWinEventHook(
-            0x8002,
-            0x8004,
-            HMODULE(0),
-            Some(zorder_event_cb),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
-    if h1.0 == 0 || h2.0 == 0 {
-        log("z-guard: winevent hook install failed");
-    } else {
-        let _ = ZORDER_HOOKS.set((h1, h2));
-    }
-}
-
-/// 高速自检:① 栅栏在宿主之下→立即重挂;② 栅栏上方有可见外来窗→
-/// 限速下压(桌面切换过渡期,应用窗被插到低位再逐个升起,栅栏会压在
-/// 已渲染窗口上直到走查 3 拍修复=用户看到的"回应用后栅栏浮几秒",
-/// 2026-08-28 实测)。收集 HWND 与 SetWindowPos 分两步,不持状态锁嵌套。
-static LOWER_RATE_MS: u64 = 600;
-static LAST_LOWER_MS: AtomicU64 = AtomicU64::new(0);
-
-fn zcheck_fences_now() {
-    // 待激活免疫结算(2026-08-29):沉底后 450ms(应用缩小动画播完,而
-    // 人手开+关菜单至少 1s)仍无可见应用窗 → 批量一次性上 topmost,
-    // 五个栅栏同帧同现;期间出现可见应用窗则取消(误判自纠)。
-    let pend = SHOWN_PENDING_MS.load(Ordering::Relaxed);
-    if pend != 0 {
-        if band_has_live_foreign() || SHOWN_TOPMOST.load(Ordering::Relaxed) {
-            SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
-        } else if resize_now_ms().saturating_sub(pend) > 450 {
-            SHOWN_PENDING_MS.store(0, Ordering::Relaxed);
-            let n = fence_apply_shown_topmost(true);
-            SHOWN_TOPMOST.store(true, Ordering::Relaxed);
-            SHOWN_STABLE.store(2, Ordering::Relaxed);
-            log(&format!("shown-topmost: mode ON ({n} fences immune)"));
-        }
-    }
-    // 免疫模式快速退出(2026-08-29):恢复扫动的第一批 WinEvent 到达时
-    // (毫秒级,被扫动动画遮蔽),topmost 栅栏还浮在上升的应用窗上——
-    // 立即摘除+重归位,不等 1s 走查(用户实测"回应用偶现浮窗"的主潜伏期)。
-    if SHOWN_TOPMOST.load(Ordering::Relaxed) && band_has_live_foreign() {
-        let n = fence_apply_shown_topmost(false);
-        SHOWN_TOPMOST.store(false, Ordering::Relaxed);
-        SHOWN_STABLE.store(0, Ordering::Relaxed);
-        log(&format!("shown-topmost: fast OFF ({n} reseated)"));
-    }
-    let (hwnds, menu_host, tray) = {
-        let s = state().lock().unwrap();
-        (
-            s.windows.values().copied().collect::<Vec<HWND>>(),
-            MENU_HOST_HWND.get().copied(),
-            TRAY_HWND.get().copied(),
-        )
-    };
-    // 下压限速:额度只在**真正发生下压**时消耗(每次过门都消耗会让杂散
-    // 事件吃光额度,关键时刻反而被挡)。600ms:恢复过渡约 2s 内可跟手
-    // 2-3 次(动作均被扫动动画遮蔽),同时把 SPES 插队类对抗封顶。
-    let now = resize_now_ms();
-    let last = LAST_LOWER_MS.load(Ordering::Relaxed);
-    let may_lower = last == 0 || now.saturating_sub(last) >= LOWER_RATE_MS;
-    let mut acted = false;
-    // 免疫模式下不下压:停泊 live 窗迟到出现时把 topmost 栅栏拖下去会
-    // 掉出免疫→模式抖动;1s 内走查会让位给模式退出+重归位。
-    let shown_mode = SHOWN_TOPMOST.load(Ordering::Relaxed);
-    for h in hwnds {
-        fence_reanchor_if_below_host(h);
-        if !shown_mode && may_lower && fence_lower_if_blocked(h, &menu_host, &tray) {
-            acted = true;
-        }
-    }
-    if acted {
-        LAST_LOWER_MS.store(resize_now_ms(), Ordering::Relaxed);
-    }
-}
-
-/// 快速下压:从宿主向上走,遇到第一个可见外来窗 B 先于本栅栏
-/// (=栅栏压在已渲染窗口上面)时,把栅栏压到 B 正下方;已紧贴 B 之下则不动。
-/// 判据与主走查完全同源(band_invisible/band_aux/自家栅栏),由全局限速节流。
-/// 返回是否发生了下压(限速额度据此消耗)。
-fn fence_lower_if_blocked(hwnd: HWND, menu_host: &Option<HWND>, tray: &Option<HWND>) -> bool {
-    let Some(shell) = desktop_shell_window() else { return false };
-    if shell == hwnd {
-        return false;
-    }
-    let vs = virtual_screen_rect();
-    let own: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
-    let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) };
-    for _ in 0..400 {
-        if w.0 == 0 || w == hwnd {
-            return false; // 到顶或先遇到自己:上方没有可见外来窗,无需处理
-        }
-        if own.contains(&w) || band_invisible(w, &vs) || band_aux(w, *menu_host, *tray) {
-            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-            continue;
-        }
-        // 坏锚(UIPI 拒锚,elevated 进程窗口):下压必败,跳过不试也不刷
-        // 日志;归位由走查 repair 经 band_attach_anchor 的降级锚完成。
-        if bad_anchor_recent(w) {
-            return false;
-        }
-        let below = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
-        if below != w {
-            let _z = z_scope(ZIntent::Repair);
-            // 必须检查返回值:曾用 let _ = 丢弃,被 UIPI 拒时也打"lowered"
-            // 假成功日志+消耗限速额度,排查时无下手处(2026-08-31 教训)。
-            let attempt = unsafe {
-                SetWindowPos(
-                    hwnd,
-                    w,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                )
-            };
-            if let Err(e) = attempt {
-                bad_anchor_mark(w);
-                log(&format!(
-                    "z-guard: fence lower FAILED below 0x{:x} err={e:?} (anchor blacklisted)",
-                    w.0
-                ));
-                return false;
-            }
-            bad_anchor_clear(w);
-            log(&format!(
-                "z-guard: fence lowered below visible window 0x{:x} (desktop transition)",
-                w.0
-            ));
-            return true;
-        }
-        return false;
-    }
-    false
-}
-
-unsafe extern "system" fn default_edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-// ---------------- 重命名点击外部提交(与 Explorer 行为一致) ----------------
-// Explorer 的就地重命名在"点击编辑框以外的任何地方"时提交。栅栏窗口是
-// WS_EX_NOACTIVATE、壁纸宿主也不抢焦点，WM_KILLFOCUS 不会到来，因此用
-// 三条互补路径保证真实点击一定能退出：
-// 1) 栅栏窗口内的按下(handle_lbuttondown/rbuttonup 直接提交)
-// 2) 重命名期间安装的 WH_MOUSE_LL 钩子：任何真实鼠标按下(含壁纸/其它应用)
-// 3) 全局定时器兜底：检测到左键按下且光标在编辑框外
-
-static RENAME_MOUSE_HOOK: Mutex<Option<HHOOK>> = Mutex::new(None);
-const TIMER_RENAME_WATCH: usize = 4;
-
-fn point_in_window_rect(hwnd: HWND, x: i32, y: i32) -> bool {
-    let mut r = RECT::default();
-    unsafe {
-        let _ = GetWindowRect(hwnd, &mut r);
-    }
-    x >= r.left && x < r.right && y >= r.top && y < r.bottom
-}
-
-/// 编辑框外的鼠标按下 → 提交。fence_title=true 提交栅栏标题编辑框。
-fn rename_click_outside_hit(x: i32, y: i32, _src: &str) -> bool {
-    let (fence_edit, file_edit) = {
-        let s = state().lock().unwrap();
-        (s.rename_edit, s.file_rename_edit)
-    };
-    let mut handled = false;
-    if let Some(edit) = fence_edit {
-        if point_in_window_rect(edit, x, y) {
-            return false;
-        }
-        unsafe {
-            let _ = PostMessageW(edit, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-        }
-        handled = true;
-    }
-    if let Some(edit) = file_edit {
-        if point_in_window_rect(edit, x, y) {
-            return handled;
-        }
-        unsafe {
-            let _ = PostMessageW(edit, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-        }
-        handled = true;
-    }
-    handled
-}
-
-unsafe extern "system" fn rename_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        if ncode as u32 == HC_ACTION {
-            let down = wparam.0 as u32 == WM_LBUTTONDOWN || wparam.0 as u32 == WM_RBUTTONDOWN;
-            if down {
-                let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-                rename_click_outside_hit(ms.pt.x, ms.pt.y, "llhook");
-            }
-        }
-        CallNextHookEx(None, ncode, wparam, lparam)
-    }
-}
-
-fn install_rename_mouse_hook() {
-    unsafe {
-        {
-            let mut slot = RENAME_MOUSE_HOOK.lock().unwrap();
-            if slot.is_some() {
-                return;
-            }
-            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(rename_mouse_proc), hinstance(), 0) {
-                if h.0 != 0 {
-                    *slot = Some(h);
-                }
-            }
-        }
-        // 高频兜底:40ms 轮询真实按键状态(钩子被系统摘除/事件被安全软件
-        // 吞掉时仍能检测到"点击外部"并提交,与 Explorer 行为一致)
-        if let Some(tray) = TRAY_HWND.get().copied() {
-            let _ = SetTimer(tray, TIMER_RENAME_WATCH, 40, None);
-        }
-    }
-}
-
-fn uninstall_rename_mouse_hook() {
-    {
-        let mut slot = RENAME_MOUSE_HOOK.lock().unwrap();
-        if let Some(h) = slot.take() {
-            unsafe {
-                let _ = UnhookWindowsHookEx(h);
-            }
-        }
-    }
-    // 无任何重命名编辑框时停掉轮询定时器
-    let any_edit = {
-        let s = state().lock().unwrap();
-        s.rename_edit.is_some() || s.file_rename_edit.is_some()
-    };
-    if !any_edit {
-        if let Some(tray) = TRAY_HWND.get().copied() {
-            unsafe {
-                let _ = KillTimer(tray, TIMER_RENAME_WATCH);
-            }
-        }
-    }
-}
-
-/// 栅栏标题重命名也需要同样的钩子保护（原逻辑只靠定时器光标判断，行为偏差）
-fn start_rename(fence_id: u32) {
-    let (title, rect) = {
-        let s = state().lock().unwrap();
-        if s.rename_fence.is_some() {
-            return;
-        }
-        let title = s
-            .fences
-            .iter()
-            .find(|f| f.id == fence_id)
-            .map(|f| f.title.clone())
-            .unwrap_or_else(|| "栅栏".to_string());
-        let rect = s
-            .fences
-            .iter()
-            .find(|f| f.id == fence_id)
-            .map(|f| f.rect)
-            .unwrap_or(Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 200.0,
-                h: 60.0,
-            });
-        (title, rect)
-    };
-    unsafe {
-        // 用独立 popup 窗口代替子控件：分层窗口上的子控件渲染不可靠
-        // 类名必须是合法的宽字符串（窄字节强转会变乱码导致找不到 EDIT 类）
-        let edit_cls = shell::wide("EDIT");
-        let edit = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            PCWSTR::from_raw(edit_cls.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | WS_VISIBLE.0 | ES_AUTOHSCROLL as u32),
-            rect.x as i32 + 14,
-            rect.y as i32 + 3,
-            150,
-            20,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
-            None,
-        );
-        if edit.0 == 0 {
-            return;
-        }
-        let w = shell::wide(&title);
-        let _ = SetWindowTextW(edit, PCWSTR::from_raw(w.as_ptr()));
-        let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, rename_edit_proc as *const () as isize);
-        let _ = RENAME_OLD_PROC.set(old);
-        SetWindowLongPtrW(edit, GWLP_USERDATA, fence_id as isize);
-        {
-            let mut s = state().lock().unwrap();
-            s.rename_fence = Some(fence_id);
-            s.rename_edit = Some(edit);
-        }
-        install_rename_mouse_hook();
-        let _ = SetForegroundWindow(edit);
-        SetFocus(edit);
-        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
-        let _ = SetWindowPos(
-            edit,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
-}
-
-unsafe extern "system" fn rename_edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    let old = RENAME_OLD_PROC
-        .get()
-        .copied()
-        .unwrap_or(default_edit_proc as *const () as isize);
-    match msg {
-        WM_KEYDOWN => {
-            if wparam.0 == VK_RETURN.0 as usize {
-                let _ = PostMessageW(hwnd, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-                return LRESULT(0);
-            }
-            if wparam.0 == VK_ESCAPE.0 as usize {
-                let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
-                return LRESULT(0);
-            }
-        }
-        WM_KILLFOCUS => {
-            let _ = PostMessageW(hwnd, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-            return LRESULT(0);
-        }
-        WM_CANCELMODE => {
-            let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
-            return LRESULT(0);
-        }
-        WM_ACTIVATE => {
-            if (wparam.0 as u32 & 0xFFFF) == 0 {
-                let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
-            }
-            return LRESULT(0);
-        }
-        RENAME_COMMIT_MSG => {
-            commit_rename(hwnd);
-            return LRESULT(0);
-        }
-        RENAME_CANCEL_MSG => {
-            cancel_rename(hwnd);
-            return LRESULT(0);
-        }
-        WM_DESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-            return LRESULT(0);
-        }
-        _ => {}
-    }
-    CallWindowProcW(
-        Some(std::mem::transmute::<
-            isize,
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        >(old)),
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-    )
-}
-
-fn commit_rename(edit: HWND) {
-    let fence_id = unsafe { GetWindowLongPtrW(edit, GWLP_USERDATA) as u32 };
-    let mut buf = [0u16; 128];
-    unsafe {
-        let _ = GetWindowTextW(edit, &mut buf);
-    }
-    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let new_title = String::from_utf16_lossy(&buf[..end]).trim().to_string();
-    let new_title = if new_title.is_empty() {
-        "栅栏".to_string()
-    } else {
-        new_title
-    };
-    {
-        let mut s = state().lock().unwrap();
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-            f.title = new_title;
-        }
-        s.rename_fence = None;
-        s.rename_edit = None;
-        let cfg = s.fences.clone();
-        let _ = model::save_config(&cfg);
-    }
-    uninstall_rename_mouse_hook();
-    unsafe {
-        let _ = DestroyWindow(edit);
-    }
-    refresh_fence(fence_id);
-}
-
-fn cancel_rename(edit: HWND) {
-    {
-        let mut s = state().lock().unwrap();
-        s.rename_fence = None;
-        s.rename_edit = None;
-    }
-    uninstall_rename_mouse_hook();
-    unsafe {
-        let _ = DestroyWindow(edit);
-    }
-}
-
-// ---------------- 文件就地重命名 ----------------
-// 系统右键菜单里的"重命名"被拦截后在这里完成:一个 EDIT 覆盖在图标名标签上,
-// 字体/预选行为与 Explorer 一致,回车或失焦提交,Esc 取消。
-
-const FILE_RENAME_COMMIT_MSG: u32 = WM_USER + 3;
-const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
-static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
-static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
-
-/// 系统菜单"重命名"拦截回调(shell.rs 在 init 时注册)
-fn on_shell_rename_request(path: &str) {
-    start_file_rename(path.to_string());
-}
-
-fn start_file_rename(path: String) {
-    // 回收站虚拟条目不可重命名
-    if model::is_recycle_bin(&path) {
-        return;
-    }
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    // 定位该文件所在栅栏的格子,把编辑框盖在名字标签上;找不到就放光标旁。
-    // 宽度与 Explorer 一致:随文件名文本自适应增长(不小于一个图标格宽)。
-    let (edit_x, edit_y, edit_w) = {
-        let s = state().lock().unwrap();
-        let text_w = s.renderer.as_ref().and_then(|r| {
-            let w16 = shell::wide(&name);
-            unsafe {
-                r.dw.CreateTextLayout(
-                    &w16[..w16.len().saturating_sub(1)],
-                    &r.name_fmt,
-                    4096.0,
-                    64.0,
-                )
-                .ok()
-                .map(|lay| {
-                    let mut m = Default::default();
-                    let _ = lay.GetMetrics(&mut m);
-                    m.width
-                })
-            }
-        });
-        let text_w = text_w.unwrap_or(0.0);
-        let mut pos = None;
-        'outer: for f in &s.fences {
-            let items = model::display_list(f, &s.files);
-            for (i, it) in items.iter().enumerate() {
-                if it.path == path {
-                    let lay = model::layout(f, items.len());
-                    let (cx, cy) = model::cell_pos(&lay, i);
-                    let cs = model::icon_size();
-                    let cw = model::cell_w();
-                    pos = Some((
-                        (f.rect.x + cx - 6.0).round() as i32,
-                        (f.rect.y + cy + cs + 4.0).round() as i32,
-                        (cw + 12.0).max(text_w + 24.0).round() as i32,
-                    ));
-                    break 'outer;
-                }
-            }
-        }
-        pos.unwrap_or_else(|| {
-            let (sx, sy) = screen_cursor();
-            (sx as i32 - 80, sy as i32 - 12, 180)
-        })
-    };
-    unsafe {
-        let edit_cls = shell::wide("EDIT");
-        let edit = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            PCWSTR::from_raw(edit_cls.as_ptr()),
-            PCWSTR::null(),
-            WINDOW_STYLE(WS_POPUP.0 | WS_BORDER.0 | WS_VISIBLE.0 | (ES_CENTER as u32)),
-            edit_x,
-            edit_y,
-            edit_w,
-            24,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
-            None,
-        );
-        if edit.0 == 0 {
-            return;
-        }
-        // desktop_icon_font 已返回按系统 DPI 换算后的像素高度，这里只应用一次。
-        let (family, px, weight) = shell::desktop_icon_font();
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfHeight = -(px.round() as i32);
-        lf.lfWeight = weight;
-        for (i, c) in family.encode_utf16().take(31).enumerate() {
-            lf.lfFaceName[i] = c;
-        }
-        let font = CreateFontIndirectW(&lf);
-        if !font.is_invalid() {
-            let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-        }
-        let w = shell::wide(&name);
-        let _ = SetWindowTextW(edit, PCWSTR::from_raw(w.as_ptr()));
-        // 与 Explorer 一致:预选扩展名之前的部分
-        let sel_end = name
-            .rfind('.')
-            .filter(|&p| p > 0)
-            .map(|p| p as isize)
-            .unwrap_or(-1);
-        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(sel_end));
-        *FILE_RENAME_PATH.lock().unwrap() = Some(path);
-        let old = SetWindowLongPtrW(
-            edit,
-            GWLP_WNDPROC,
-            file_rename_edit_proc as *const () as isize,
-        );
-        let _ = FILE_RENAME_OLD_PROC.set(old);
-        SetFocus(edit);
-        let _ = SetWindowPos(
-            edit,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        state().lock().unwrap().file_rename_edit = Some(edit);
-        install_rename_mouse_hook();
-        log("file rename edit created");
-        // 前台化编辑框:栅栏窗口是 WS_EX_NOACTIVATE,不抢焦点;若不前台化,
-        // 真实键盘输入(Esc/回车/文字)会进到其它前台窗口,用户无法编辑
-        let _ = SetForegroundWindow(edit);
-        SetFocus(edit);
-    }
-}
-
-unsafe extern "system" fn file_rename_edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    let old = FILE_RENAME_OLD_PROC
-        .get()
-        .copied()
-        .unwrap_or(default_edit_proc as *const () as isize);
-    match msg {
-        WM_KEYDOWN => {
-            if wparam.0 == VK_RETURN.0 as usize {
-                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-                return LRESULT(0);
-            }
-            if wparam.0 == VK_ESCAPE.0 as usize {
-                let _ = PostMessageW(hwnd, FILE_RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
-                return LRESULT(0);
-            }
-        }
-        WM_KILLFOCUS | WM_CANCELMODE => {
-            let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-            return LRESULT(0);
-        }
-        WM_ACTIVATE => {
-            // 仅失活时提交;编辑框被激活(前台化)不能当作"点击外部"
-            if (wparam.0 as u32 & 0xFFFF) == 0 {
-                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-            }
-            return LRESULT(0);
-        }
-        FILE_RENAME_COMMIT_MSG => {
-            commit_file_rename(hwnd);
-            return LRESULT(0);
-        }
-        FILE_RENAME_CANCEL_MSG => {
-            cancel_file_rename(hwnd);
-            return LRESULT(0);
-        }
-        WM_DESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-            return LRESULT(0);
-        }
-        _ => {}
-    }
-    CallWindowProcW(
-        Some(std::mem::transmute::<
-            isize,
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        >(old)),
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-    )
-}
-
-fn commit_file_rename(edit: HWND) {
-    log("file rename commit");
-    let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
-    if !old_path.is_empty() {
-        let mut buf = [0u16; 512];
-        unsafe {
-            let _ = GetWindowTextW(edit, &mut buf);
-        }
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let new_name = String::from_utf16_lossy(&buf[..end]).trim().to_string();
-        let old_name = std::path::Path::new(&old_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        // 与 Explorer 相同的非法字符集合;空名/原名不动
-        let invalid = new_name.is_empty()
-            || new_name == old_name
-            || new_name
-                .chars()
-                .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
-        let mut renamed = false;
-        if !invalid {
-            renamed = shell::rename_path(&old_path, &new_name);
-        }
-        if renamed {
-            // 同步被拖入栅栏的 pinned 引用,指向新路径
-            let new_path = std::path::Path::new(&old_path)
-                .parent()
-                .map(|p| p.join(&new_name).to_string_lossy().to_string())
-                .unwrap_or_else(|| old_path.clone());
-            let mut s = state().lock().unwrap();
-            for f in s.fences.iter_mut() {
-                for p in f.pinned.iter_mut().chain(f.item_order.iter_mut()) {
-                    if *p == old_path {
-                        *p = new_path.clone();
-                    }
-                }
-            }
-            if s.selected_paths.remove(&old_path) {
-                s.selected_paths.insert(new_path.clone());
-            }
-            if s.focused_path.as_deref() == Some(&old_path) {
-                s.focused_path = Some(new_path.clone());
-            }
-            if s.selection_anchor.as_deref() == Some(&old_path) {
-                s.selection_anchor = Some(new_path);
-            }
-        } else if !invalid {
-            log(&format!("file rename failed: {} -> {}", old_path, new_name));
-            let title = shell::wide("重命名失败");
-            let text = shell::wide("无法重命名该项目。目标名称可能已存在，或者文件正在使用中。");
-            unsafe {
-                let _ = MessageBoxW(
-                    edit,
-                    PCWSTR::from_raw(text.as_ptr()),
-                    PCWSTR::from_raw(title.as_ptr()),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
-        }
-    }
-    *FILE_RENAME_PATH.lock().unwrap() = None;
-    {
-        let mut s = state().lock().unwrap();
-        s.file_rename_edit = None;
-    }
-    uninstall_rename_mouse_hook();
-    unsafe {
-        let _ = DestroyWindow(edit);
-    }
-    rescan();
-}
-
-fn cancel_file_rename(edit: HWND) {
-    log("file rename cancel");
-    *FILE_RENAME_PATH.lock().unwrap() = None;
-    {
-        let mut s = state().lock().unwrap();
-        s.file_rename_edit = None;
-    }
-    uninstall_rename_mouse_hook();
-    unsafe {
-        let _ = DestroyWindow(edit);
-    }
-}
 
 // ---------------- WndProc ----------------
 
@@ -6513,7 +4078,14 @@ unsafe extern "system" fn fence_wndproc(
             // (光标早已移走)。放行会"无中生有"点亮悬停高亮再熄灭——
             // 两次无意义整面重绘,表现为点桌面关闭菜单时栅栏闪一下。
             // 消息坐标与真实光标偏差超过阈值即视为陈旧。
-            let stale = {
+            // 拖动中豁免(2026-09-01):跟随位置一律取 GetCursorPos 实时值,
+            // 陈旧消息无副作用;而拖动重渲染积压时丢消息正是"拖动一卡一卡
+            // 不跟手"的来源——积压消息被整批丢弃,只剩零星更新。
+            let dragging = state()
+                .try_lock()
+                .map(|g| g.drag.is_some())
+                .unwrap_or(false);
+            let stale = !dragging && {
                 let mut real = POINT::default();
                 unsafe {
                     let _ = GetCursorPos(&mut real);
@@ -6713,6 +4285,11 @@ unsafe extern "system" fn fence_wndproc(
             return LRESULT(0);
         }
         WM_WINDOWPOSCHANGING => {
+            // 调整 owned 栅栏不能带动 Explorer owner 的层级。
+            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0 {
+                let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+                wp.flags |= SWP_NOOWNERZORDER;
+            }
             // 阻止 Win+D / Win+M 对栅栏的摆布:栅栏常驻桌面,不参与窗口管理。
             // 我们自己主动隐藏(隐藏全部栅栏)时 INTENTIONAL_HIDE 为真,放行;
             // 自家定位操作(创建/拖拽/修复/呈现)以 Z_INTENT 标记放行。
@@ -6791,7 +4368,7 @@ unsafe extern "system" fn fence_wndproc(
 // ---------------- 输入处理 ----------------
 
 /// 屏幕工作区（不含任务栏）
-fn work_area() -> (f32, f32, f32, f32) {
+pub(crate) fn work_area() -> (f32, f32, f32, f32) {
     let mut r: RECT = unsafe { std::mem::zeroed() };
     unsafe {
         let _ = SystemParametersInfoW(
@@ -6810,7 +4387,7 @@ fn work_area() -> (f32, f32, f32, f32) {
 }
 
 /// 矩形所在显示器的工作区(多显示器:磁吸/含屏按各自屏幕进行)
-fn work_area_for_rect(r: &Rect) -> (f32, f32, f32, f32) {
+pub(crate) fn work_area_for_rect(r: &Rect) -> (f32, f32, f32, f32) {
     unsafe {
         let rc = RECT {
             left: r.x.round() as i32,
@@ -6856,7 +4433,7 @@ unsafe extern "system" fn enum_monitor_cb(
 }
 
 /// 所有显示器的工作区(settle/含屏用)
-fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
+pub(crate) fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
     let mut areas: Vec<(f32, f32, f32, f32)> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(
@@ -6872,2217 +4449,29 @@ fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
     areas
 }
 
-/// 拖动/缩放目标吸附：自动对齐开启时，先把目标矩形磁吸到其它栅栏的边
-/// 与屏幕边缘（保持 GAP），再吸附到网格；关闭时原样返回（纯自由拖动）。
-/// 返回 (吸附后矩形, 竖参考线坐标, 横参考线坐标)。
-fn compact_neighbors_after_resize(fences: &mut [Fence], anchor_id: u32) {
-    let Some(anchor) = fences.iter().find(|f| f.id == anchor_id).map(|f| f.rect) else {
-        return;
-    };
-    let (vx, vy, vw, vh) = work_area_for_rect(&anchor);
-    let max_x = (vx + vw).max(0.0);
-    let max_y = (vy + vh).max(0.0);
-    let mut right: Vec<usize> = fences
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| {
-            f.id != anchor_id
-                && f.rect.x >= anchor.x
-                && f.rect.y < anchor.y + anchor.h
-                && f.rect.y + f.rect.h > anchor.y
-        })
-        .map(|(i, _)| i)
-        .collect();
-    right.sort_by(|a, b| {
-        fences[*a]
-            .rect
-            .x
-            .partial_cmp(&fences[*b].rect.x)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut cursor = (anchor.x + anchor.w + model::GAP).min(max_x - model::min_w());
-    for i in right {
-        fences[i].rect.x = cursor.min(max_x - fences[i].rect.w);
-        cursor = fences[i].rect.x + fences[i].rect.w + model::GAP;
-    }
-    let mut below: Vec<usize> = fences
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| {
-            f.id != anchor_id
-                && f.rect.y >= anchor.y
-                && f.rect.x < anchor.x + anchor.w
-                && f.rect.x + f.rect.w > anchor.x
-        })
-        .map(|(i, _)| i)
-        .collect();
-    below.sort_by(|a, b| {
-        fences[*a]
-            .rect
-            .y
-            .partial_cmp(&fences[*b].rect.y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut cursor = (anchor.y + anchor.h + model::GAP).min(max_y - model::min_h());
-    for i in below {
-        fences[i].rect.y = cursor.min(max_y - fences[i].rect.h);
-        cursor = fences[i].rect.y + fences[i].rect.h + model::GAP;
-    }
-    // Clamp all displaced fences back into the work area.
-    for f in fences.iter_mut() {
-        if f.id == anchor_id {
-            continue;
-        }
-        let mut tmp = [f.rect];
-        model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
-        f.rect = tmp[0];
-    }
-}
+#[cfg(test)]
+mod presentation_tests {
+    use super::fence_needs_presentation;
 
-/// 从按下快照推演「锚点跟随鼠标」后的全体栅栏布局(纯函数:快照+光标 → 布局)。
-/// 每帧都从快照重算,拖回即还原,可逆性不依赖算法性质;
-/// 拖动预览与松手提交共用同一管线,保证所见即所得(松手不再二次跳变)。
-/// 栅栏插入计划:基于按下快照(其余栅栏拖动中不动),按视觉顺序(行带+列)给出
-/// 插入下标、其余栅栏顺序与指示线矩形(屏幕坐标)。光标远离群体包围盒时 None
-/// (松手=原地自由放置,不拼接)。
-fn fence_insertion_plan(
-    drag: &Drag,
-    cx: f32,
-    cy: f32,
-) -> Option<(usize, Vec<u32>, (f32, f32, f32, f32))> {
-    let mut others: Vec<(u32, Rect)> = drag
-        .start_layout
-        .iter()
-        .filter(|f| f.id != drag.fence_id && !f.hidden && !f.collapsed)
-        .map(|f| (f.id, f.rect))
-        .collect();
-    if others.is_empty() {
-        return None;
+    #[test]
+    fn healthy_surface_does_not_depend_on_z_attachment() {
+        assert!(!fence_needs_presentation(false, true, true));
     }
-    // 群体包围盒(外扩被拖栅栏的宽高);光标不在其中则不显示插入线
-    let mut bx0 = f32::MAX;
-    let mut by0 = f32::MAX;
-    let mut bx1 = f32::MIN;
-    let mut by1 = f32::MIN;
-    for (_, r) in &others {
-        bx0 = bx0.min(r.x);
-        by0 = by0.min(r.y);
-        bx1 = bx1.max(r.x + r.w);
-        by1 = by1.max(r.y + r.h);
-    }
-    let mx = drag.start_rect.w.max(0.0);
-    let my = drag.start_rect.h.max(0.0);
-    if cx < bx0 - mx || cx > bx1 + mx || cy < by0 - my || cy > by1 + my {
-        return None;
-    }
-    // 行带聚类:按 y 中心排序,间距 > 0.6*min(高) 开新带;带内按 x 排
-    others.sort_by(|a, b| {
-        (a.1.y + a.1.h * 0.5)
-            .partial_cmp(&(b.1.y + b.1.h * 0.5))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut bands: Vec<Vec<(u32, Rect)>> = Vec::new();
-    for item in others {
-        let start_new = match bands.last() {
-            Some(band) => {
-                let prev = &band[0].1;
-                let tol = 0.6 * prev.h.min(item.1.h).max(24.0);
-                (item.1.y + item.1.h * 0.5) - (prev.y + prev.h * 0.5) > tol
-            }
-            None => true,
-        };
-        if start_new {
-            bands.push(vec![item]);
-        } else {
-            bands.last_mut().unwrap().push(item);
-        }
-    }
-    let mut visual: Vec<(u32, Rect, usize)> = Vec::new();
-    let mut band_mids: Vec<f32> = Vec::new();
-    for (bi, band) in bands.iter_mut().enumerate() {
-        band.sort_by(|a, b| {
-            a.1.x
-                .partial_cmp(&b.1.x)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mid = band.iter().map(|(_, r)| r.y + r.h * 0.5).sum::<f32>() / band.len() as f32;
-        band_mids.push(mid);
-        visual.extend(band.iter().map(|(id, r)| (*id, *r, bi)));
-    }
-    // 光标所在带:最近带中心的 |cy - band_mid| <= 半高容差,否则超出的全部算"之前/之后"
-    let (cursor_band, in_band) = {
-        let mut best = 0usize;
-        let mut best_d = f32::MAX;
-        for (i, mid) in band_mids.iter().enumerate() {
-            let d = (cy - mid).abs();
-            if d < best_d {
-                best_d = d;
-                best = i;
-            }
-        }
-        let half = visual
-            .iter()
-            .map(|(_, r, _)| r.h * 0.5)
-            .fold(0f32, f32::max)
-            .max(48.0);
-        (best, best_d <= half)
-    };
-    // 光标不在任何行带内(明显在群体上方/下方)= 自由放置区,不做插入
-    if !in_band {
-        return None;
-    }
-    // 该栅栏所在带 < 光标带,或同带且中心在光标左侧 → 位于插入点之前
-    let idx = {
-        let mut count = 0;
-        for (i, (_, r, fence_band)) in visual.iter().enumerate() {
-            let before =
-                *fence_band < cursor_band || (*fence_band == cursor_band && r.x + r.w * 0.5 < cx);
-            if before {
-                count = i + 1;
-            }
-        }
-        count
-    };
-    let ids: Vec<u32> = visual.iter().map(|(id, _, _)| *id).collect();
-    // 恒等插入(拼接后顺序不变)或光标仍在被拖栅栏原矩形内(刚拿起/原地)不画线,
-    // 否则原位会出现一条多余的竖线
-    let ocx = drag.start_rect.x + drag.start_rect.w * 0.5;
-    let orig_idx = visual
-        .iter()
-        .filter(|(_, r, fb)| *fb < cursor_band || (*fb == cursor_band && r.x + r.w * 0.5 < ocx))
-        .count();
-    if in_band && idx == orig_idx {
-        return None;
-    }
-    if in_band
-        && drag.start_rect.x <= cx
-        && cx <= drag.start_rect.x + drag.start_rect.w
-        && drag.start_rect.y <= cy
-        && cy <= drag.start_rect.y + drag.start_rect.h
-    {
-        return None;
-    }
-    // 指示线几何:竖线=水平相邻之间,横线=行带之间
-    let gap = model::GAP;
-    let line = if idx == 0 {
-        let r = &visual[0].1;
-        (r.x - gap * 0.5 - 1.25, r.y, 2.5, r.h)
-    } else if idx >= visual.len() {
-        let r = &visual[visual.len() - 1].1;
-        (r.x + r.w + gap * 0.5 - 1.25, r.y, 2.5, r.h)
-    } else {
-        let a = &visual[idx - 1].1;
-        let b = &visual[idx].1;
-        let same_row =
-            ((a.y + a.h * 0.5) - (b.y + b.h * 0.5)).abs() <= 0.6 * a.h.min(b.h).max(24.0);
-        if same_row {
-            let x = ((a.x + a.w + b.x) * 0.5 - 1.25).max(bx0 - gap);
-            let y0 = a.y.min(b.y);
-            let y1 = (a.y + a.h).max(b.y + b.h);
-            (x, y0, 2.5, y1 - y0)
-        } else {
-            let y = ((a.y + a.h + b.y) * 0.5 - 1.25).max(by0 - gap);
-            let x0 = a.x.min(b.x);
-            let x1 = (a.x + a.w).max(b.x + b.w);
-            (x0, y, x1 - x0, 2.5)
-        }
-    };
-    Some((idx, ids, line))
-}
 
-/// 邻居等距吸附(上下左右对称):左右贴齐/紧邻保持 GAP,上下同理。
-/// 只在对应方向有重叠时生效,取距离最近的候选一次应用。
-fn snap_rect_to_neighbors(nr: &mut Rect, others: &[Rect]) {
-    const SNAP: f32 = 16.0;
-    let mut best: Option<(f32, f32, f32)> = None; // (总距离, dx, dy)
-    for r in others {
-        let x_ov = nr.x < r.x + r.w && nr.x + nr.w > r.x;
-        let y_ov = nr.y < r.y + r.h && nr.y + nr.h > r.y;
-        let mut cands: Vec<(f32, f32)> = Vec::new();
-        if y_ov {
-            cands.push(((r.x + r.w + model::GAP) - nr.x, 0.0)); // 紧贴右侧
-            cands.push((r.x - nr.x, 0.0)); // 左缘对齐
-            cands.push(((r.x - nr.w) - nr.x, 0.0)); // 紧贴左侧
-        }
-        if x_ov {
-            cands.push((0.0, (r.y + r.h + model::GAP) - nr.y)); // 紧贴下方
-            cands.push((0.0, r.y - nr.y)); // 顶边对齐
-            cands.push((0.0, (r.y - nr.h) - nr.y)); // 紧贴上方
-        }
-        for (dx, dy) in cands {
-            let d = dx.abs() + dy.abs();
-            if d < SNAP && best.is_none_or(|(bd, _, _)| d < bd) {
-                best = Some((d, dx, dy));
-            }
-        }
+    #[test]
+    fn missing_presentation_or_surface_is_recovered() {
+        assert!(fence_needs_presentation(false, false, true));
+        assert!(fence_needs_presentation(false, true, false));
+        assert!(fence_needs_presentation(false, false, false));
     }
-    if let Some((_, dx, dy)) = best {
-        nr.x += dx;
-        nr.y += dy;
-    }
-}
 
-fn snap_drag(s: &UiState, fence_id: u32, nr: Rect) -> (Rect, Option<f32>, Option<f32>) {
-    // 三档对齐的拖动吸附:
-    // 网格档 = 图标格整数倍 + 靠近邻居磁吸到固定间距;
-    // 自由档 = 完全跟手,仅靠近邻居时磁吸到固定间距;
-    // 自动档 = 不吸附(链式对齐实时保证间距)。
-    if auto_align_on() {
-        return (nr, None, None);
-    }
-    let others: Vec<Rect> = s
-        .fences
-        .iter()
-        .filter(|f| f.id != fence_id)
-        .map(|f| f.rect)
-        .collect();
-    let mut x = nr.x;
-    let mut y = nr.y;
-    if grid_align_on() {
-        let (vx, vy, _, _) = work_area_for_rect(&nr);
-        x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
-        y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
-    }
-    // 靠近邻居 -> 磁吸到恰好 GAP 间距(优先于网格格点)
-    let probe = Rect { x, y, ..nr };
-    let (sx, snapped) = model::snap_gap_to_neighbors(&probe, &others, model::SNAP_THRESHOLD * 1.5);
-    if snapped {
-        x = sx;
-    }
-    (Rect { x, y, ..nr }, None, None)
-}
-
-/// 虚拟桌面(所有显示器的包围盒,屏幕坐标)
-fn virtual_screen() -> (f32, f32, f32, f32) {
-    unsafe {
-        let x = GetSystemMetrics(SM_XVIRTUALSCREEN) as f32;
-        let y = GetSystemMetrics(SM_YVIRTUALSCREEN) as f32;
-        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN) as f32;
-        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN) as f32;
-        if w > 0.0 && h > 0.0 {
-            (x, y, w, h)
-        } else {
-            work_area()
-        }
-    }
-}
-
-/// 确保全屏对齐参考线 overlay 窗口存在（懒创建）。
-fn ensure_guide_window(s: &mut UiState) {
-    if s.guide_hwnd
-        .is_some_and(|hwnd| unsafe { IsWindow(hwnd).as_bool() })
-    {
-        return;
-    }
-    s.guide_hwnd = None;
-    let (vx, vy, vw, vh) = virtual_screen();
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            guide_class_name(),
-            PCWSTR::null(),
-            WS_POPUP,
-            vx as i32,
-            vy as i32,
-            vw as i32,
-            vh as i32,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
-            None,
-        )
-    };
-    if hwnd.0 != 0 {
-        s.guide_hwnd = Some(hwnd);
-    }
-}
-
-/// 绘制并显示对齐参考线 overlay（s.guide_x / s.guide_y 为当前参考线）。
-fn refresh_guide(s: &mut UiState) {
-    let Some(hwnd) = s.guide_hwnd else { return };
-    let factory = match &s.renderer {
-        Some(r) => r.factory.clone(),
-        None => return,
-    };
-    let (vx, vy, vw, vh) = virtual_screen();
-    let w = vw as u32;
-    let h = vh as u32;
-    if w < 2 || h < 2 {
-        return;
-    }
-    let needs_new = match &s.guide_surface {
-        Some(sf) => sf.w != w || sf.h != h,
-        None => true,
-    };
-    if needs_new {
-        if let Some(old) = s.guide_surface.take() {
-            render::release_surface(old);
-        }
-        match render::create_surface(&factory, w, h) {
-            Some(sf) => s.guide_surface = Some(sf),
-            None => return,
-        }
-    }
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            vx as i32,
-            vy as i32,
-            vw as i32,
-            vh as i32,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-    // 先取出残影数据(需要 &mut icon_cache 取图标,不能与 surface 借用并存)
-    // 截断/换行与静态 draw_item 完全同源:同一 trim_to_lines、同一标签宽
-    // (cell_w-2*scale)、同一 2 行上限——两行的名字拖动中依旧两行,一行依旧一行。
-    let trim_ctx = s
-        .renderer
-        .as_ref()
-        .map(|r| (r.dw.clone(), r.name_fmt.clone()));
-    let guide_metrics = s
-        .active_fence
-        .and_then(|id| s.metrics.get(&id))
-        .cloned()
-        .unwrap_or_else(model::DpiMetrics::system);
-    let ghost = {
-        let g = s.drag_ghost.clone();
-        g.and_then(|(paths, gx, gy)| {
-            let path = paths.first()?.clone();
-            let name = s
-                .files
-                .iter()
-                .find(|f| f.path == path)
-                .map(|f| render::display_name(&f.name))
-                .unwrap_or_default();
-            let name = match &trim_ctx {
-                Some((dw, fmt)) => render::trim_to_lines(
-                    dw,
-                    &name,
-                    fmt,
-                    guide_metrics.cell_w - 2.0 * guide_metrics.scale,
-                    (2.0 * 24.0 + 6.0) * guide_metrics.scale,
-                    2,
-                ),
-                None => name,
-            };
-            let icon = render::get_icon_buffer(&mut s.icon_cache, &path, guide_metrics.icon_px);
-            Some((icon, name, gx - vx, gy - vy))
-        })
-    };
-    let now = resize_now_ms();
-    s.arrival_animations.retain(|animation| {
-        now.saturating_sub(animation.started_ms) <= animation.duration_ms + 180
-    });
-    let animation_meta = s.arrival_animations.clone();
-    let mut animation_icons = Vec::with_capacity(animation_meta.len());
-    for animation in &animation_meta {
-        let target_px = s
-            .metrics
-            .get(&animation.fence_id)
-            .map(|m| m.icon_px)
-            .unwrap_or_else(model::icon_size);
-        animation_icons.push(render::get_icon_buffer(
-            &mut s.icon_cache,
-            &animation.path,
-            target_px,
-        ));
-    }
-    let mut frames = Vec::with_capacity(animation_meta.len());
-    for (animation, icon) in animation_meta.iter().zip(animation_icons.into_iter()) {
-        let elapsed = now.saturating_sub(animation.started_ms);
-        let progress = (elapsed as f32 / animation.duration_ms.max(1) as f32).clamp(0.0, 1.0);
-        let point = model::interpolate_point(animation.from, animation.to, progress);
-        let mut trail = Vec::new();
-        // 拖尾 7 帧渐隐(比 4 帧更长,轨迹"尾流"更明显)
-        for step in 1..=7 {
-            let previous = (progress - step as f32 * 0.055).max(0.0);
-            let p = model::interpolate_point(animation.from, animation.to, previous);
-            trail.push((p.0 - vx, p.1 - vy, 0.22 / step as f32));
-        }
-        let name = match (&trim_ctx, s.metrics.get(&animation.fence_id)) {
-            (Some((dw, fmt)), Some(m)) => render::trim_to_lines(
-                dw,
-                &animation.name,
-                fmt,
-                m.cell_w - 2.0 * m.scale,
-                (2.0 * 24.0 + 6.0) * m.scale,
-                2,
-            ),
-            _ => animation.name.clone(),
-        };
-        frames.push(render::ArrivalFrame {
-            icon,
-            name,
-            x: point.0 - vx,
-            y: point.1 - vy,
-            target_x: animation.to.0 - vx,
-            target_y: animation.to.1 - vy,
-            trail,
-        });
-    }
-    let insert_line_local = s.insert_line.map(|(x, y, w, h)| (x - vx, y - vy, w, h));
-    if let Some(surf) = s.guide_surface.as_ref() {
-        // 参考线是屏幕坐标,换算到虚拟桌面原点
-        // 残影(内部图标拖拽):同样换算到 overlay 本地坐标
-        let label_scale = frames
-            .first()
-            .and_then(|_| animation_meta.first())
-            .and_then(|a| s.metrics.get(&a.fence_id))
-            .or_else(|| s.active_fence.and_then(|id| s.metrics.get(&id)))
-            .map(|m| m.scale)
-            .unwrap_or_else(|| model::DpiMetrics::system().scale);
-        let jobs = render::draw_guides(
-            &surf.target,
-            vw,
-            vh,
-            frames
-                .first()
-                .and_then(|_| animation_meta.first())
-                .and_then(|a| s.metrics.get(&a.fence_id))
-                .map(|m| m.icon_px)
-                .or_else(|| {
-                    s.active_fence
-                        .and_then(|id| s.metrics.get(&id))
-                        .map(|m| m.icon_px)
-                })
-                .unwrap_or_else(model::icon_size),
-            label_scale,
-            guide_metrics.cell_w - 2.0 * guide_metrics.scale,
-            s.guide_x.map(|g| g - vx),
-            s.guide_y.map(|g| g - vy),
-            insert_line_local,
-            ghost
-                .as_ref()
-                .map(|(a, b, x, y)| (a.as_slice(), b.as_str(), *x, *y)),
-            &frames,
-        );
-        // 残影/入场图标名走与静态一致的 GDI ClearType(几何=图标底+2逻辑px)
-        render::gdi_draw_labels_transparent(surf, &jobs);
-        let pos = POINT {
-            x: vx as i32,
-            y: vy as i32,
-        };
-        let _ = render::present_surface(surf, hwnd, pos.x, pos.y);
-    }
-}
-
-/// 更新参考线状态并刷新 overlay；拖动结束后传入 (None, None) 隐藏。
-/// 内部图标拖拽残影存在时 overlay 保持显示。
-fn update_guides(gx: Option<f32>, gy: Option<f32>) {
-    let mut s = state().lock().unwrap();
-    s.guide_x = gx;
-    s.guide_y = gy;
-    if gx.is_none()
-        && gy.is_none()
-        && s.drag_ghost.is_none()
-        && s.arrival_animations.is_empty()
-        && s.insert_line.is_none()
-    {
-        if let Some(h) = s.guide_hwnd {
-            unsafe {
-                let _ = ShowWindow(h, SW_HIDE);
-            }
-        }
-        return;
-    }
-    ensure_guide_window(&mut s);
-    refresh_guide(&mut s);
-}
-
-/// 更新内部图标拖拽残影位置(屏幕坐标)并重绘 overlay
-fn update_ghost(x: f32, y: f32) {
-    let mut s = state().lock().unwrap();
-    match s.drag_ghost.as_mut() {
-        Some((_, gx, gy)) => {
-            *gx = x;
-            *gy = y;
-        }
-        None => return,
-    }
-    ensure_guide_window(&mut s);
-    refresh_guide(&mut s);
-}
-
-/// 让所有栅栏相互保持间距且全部落在屏幕内（新建/加载/恢复布局后调用）。
-/// 统一为链式推挤 + 夹回屏幕(多显示器感知),保留栅栏的相对位置/顺序(自由组合模型)。
-
-/// 高度自适应内容：未手动缩放过的栅栏，高度收敛到内容所需行数
-/// （空栅栏至少 2 行，保证拖放目标可见），上限为所在工作区可容纳的最大
-/// 整行数（超出保持滚动）。只调高度，位置由随后的 settle 夹回并解重叠。
-fn refit_auto_fence_heights() {
-    let areas = all_work_areas();
-    let mut changed = false;
-    {
-        let mut s = state().lock().unwrap();
-        // 尺寸策略:默认 2列×5行,高度不随内容自适应(超出滚动);
-        // 这里只算"屏幕可容纳的最大高度"用于把超屏栅栏夹回。
-        let targets: Vec<(u32, f32)> = s
-            .fences
-            .iter()
-            .filter(|f| !f.collapsed && !f.hidden)
-            .map(|f| {
-                let metrics = s
-                    .metrics
-                    .get(&f.id)
-                    .copied()
-                    .unwrap_or_else(model::DpiMetrics::system);
-                let (_, _, _, vh) = work_area_for_rect(&f.rect);
-                let max_rows = (((vh - metrics.title_h - metrics.pad * 2.0) / metrics.cell_h)
-                    .floor() as usize)
-                    .max(1);
-                let target_h =
-                    metrics.title_h + max_rows as f32 * metrics.cell_h + metrics.pad * 2.0 + 2.0;
-                (f.id, target_h)
-            })
-            .collect();
-        for (id, target_h) in targets {
-            if let Some(f) = s.fences.iter_mut().find(|f| f.id == id) {
-                // 只把超出屏幕的夹回,不放大、不随内容变化(默认 5 行,用户可调)
-                if f.rect.h > target_h + 0.5 {
-                    f.rect.h = target_h;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            let mut rects: Vec<Rect> = s.fences.iter().map(|f| f.rect).collect();
-            model::fit_to_monitors(&mut rects, &areas);
-            for (f, r) in s.fences.iter_mut().zip(rects) {
-                f.rect = r;
-            }
-            let cfg = s.fences.clone();
-            let _ = model::save_config(&cfg);
-        }
-    }
-    if changed {
-        refresh_all_fences();
-    }
-}
-
-fn settle_all_fences() {
-    let areas = all_work_areas();
-    let mut s = state().lock().unwrap();
-    push_settle(&mut s.fences, &areas);
-}
-
-/// 仅推挤解除重叠 + 夹回屏幕，不改变栅栏顺序/相对位置。
-/// 两两收敛：反复检查每一对栅栏，按最小位移推开重叠。
-fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
-    let n = fences.len();
-    if n == 0 {
-        return;
-    }
-    // Normalize every fence to the icon-cell grid so fences always fit an
-    // integer number of icon columns/rows without wasted padding.
-    for f in fences.iter_mut() {
-        let (w, h) = model::snap_fence_size(f.rect.w, f.rect.h);
-        f.rect.w = w;
-        f.rect.h = h;
-    }
-    let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
-    for _ in 0..24 {
-        let mut moved = false;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let old = rects[j];
-                rects[j] = model::push_away(&rects[i], &old);
-                if rects[j] != old {
-                    moved = true;
-                }
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    model::fit_to_monitors(&mut rects, areas);
-    for (f, r) in fences.iter_mut().zip(rects) {
-        f.rect = r;
-    }
-}
-
-/// 周期性 rescan 用的收敛：只推挤 + 夹回屏幕，保留用户手动摆放的相对位置，
-/// 避免自动对齐模式下每 30 秒把所有栅栏流式重排回左上角。
-fn settle_preserve_positions() {
-    let areas = all_work_areas();
-    let mut s = state().lock().unwrap();
-    push_settle(&mut s.fences, &areas);
-}
-
-/// 追踪鼠标离开(用于隐藏悬停卡片)
-fn track_mouse_leave(hwnd: HWND) {
-    unsafe {
-        let mut tme = TRACKMOUSEEVENT {
-            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-            dwFlags: TRACKMOUSEEVENT_FLAGS(TME_LEAVE.0),
-            hwndTrack: hwnd,
-            dwHoverTime: 0,
-        };
-        let _ = TrackMouseEvent(&mut tme);
-    }
-}
-
-fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
-    let mut s = match state().try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    if let Some(drag) = s.drag.clone() {
-        if drag.fence_id == fence_id {
-            let dx = x - drag.start_x;
-            let dy = y - drag.start_y;
-            match drag.mode {
-                DragMode::Move => {
-                    // 屏幕坐标算位移,客户区坐标随窗口移动会来回震荡(抖动/拖不动)
-                    let (cx, cy) = screen_cursor();
-                    // 时间节流(~120fps):逐像素跟手,同时避免事件风暴下
-                    // 同步 GDI/D2D 工作堆积;布局每帧从按下快照重算,天然可逆。
-                    let now = resize_now_ms();
-                    if now.saturating_sub(s.last_move_ms) < 8 {
-                        return;
-                    }
-                    s.last_move_ms = now;
-                    // 插入式拖动(原生/启动器风格):被拖栅栏自由跟手并置顶,
-                    // 其余栅栏完全不动;插入点只以指示线提示,松手才拼接重排。
-                    let mut nr = Rect {
-                        x: drag.start_rect.x + (cx - drag.start_sx),
-                        y: drag.start_rect.y + (cy - drag.start_sy),
-                        w: drag.start_rect.w,
-                        h: drag.start_rect.h,
-                    };
-                    // 自由/网格档保留原吸附手感;自动/网格档同时启用插入线
-                    if !auto_align_on() {
-                        let others: Vec<Rect> = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| f.id != fence_id)
-                            .map(|f| f.rect)
-                            .collect();
-                        let mut x = nr.x;
-                        let mut y = nr.y;
-                        if grid_align_on() {
-                            let (vx, vy, _, _) = work_area_for_rect(&nr);
-                            x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
-                            y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
-                        }
-                        let probe = Rect { x, y, ..nr };
-                        let (sx, snapped) = model::snap_gap_to_neighbors(
-                            &probe,
-                            &others,
-                            model::SNAP_THRESHOLD * 1.5,
-                        );
-                        if snapped {
-                            x = sx;
-                        }
-                        nr = Rect { x, y, ..nr };
-                    }
-                    let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-                    let mut tmp = [nr];
-                    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
-                    nr = tmp[0];
-                    let chain = auto_align_on() || grid_align_on();
-                    let insert = if chain {
-                        fence_insertion_plan(&drag, cx, cy)
-                    } else {
-                        None
-                    };
-                    // 四边/四角吸附:距任一边小于栅栏固定间距即贴齐(角=两轴同时)
-                    const EDGE: f32 = model::GAP * 1.25;
-                    if nr.x - vx < EDGE {
-                        nr.x = vx;
-                    }
-                    if vx + vw - (nr.x + nr.w) < EDGE {
-                        nr.x = vx + vw - nr.w;
-                    }
-                    if nr.y - vy < EDGE {
-                        nr.y = vy;
-                    }
-                    if vy + vh - (nr.y + nr.h) < EDGE {
-                        nr.y = vy + vh - nr.h;
-                    }
-                    // 无插入线(上下方自由放置/自由档):邻居固定间隔吸附
-                    if insert.is_none() {
-                        let others: Vec<Rect> = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| f.id != fence_id && !f.hidden)
-                            .map(|f| f.rect)
-                            .collect();
-                        snap_rect_to_neighbors(&mut nr, &others);
-                        // 抗重叠:任何位置都不允许覆盖其他栅栏(最小位移推开,保持 GAP)
-                        nr = model::avoid_overlap(&nr, &others, vx, vy, vw, vh);
-                    }
-                    let line = insert.map(|(_, _, l)| l);
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                        f.rect = nr;
-                    }
-                    s.insert_line = line;
-                    // 被拖栅栏需压过其他兄弟栅栏(穿过邻居时不被盖住),但
-                    // 任何时候都不得高于正常窗口:提升锚点=最高兄弟栅栏
-                    // (仍在桌面 band 内)。旧的 HWND_TOP 曾把它顶到整个 z 栈
-                    // 顶端,拖完浮在所有窗口上方。
-                    if let Some(&h) = s.windows.get(&fence_id) {
-                        let hosts = desktop_hosts();
-                        let anchor = s
-                            .fences
-                            .iter()
-                            .find(|f| f.id == fence_id)
-                            .and_then(|f| host_for_rect(&f.rect, &hosts))
-                            .and_then(|host| drag_elevate_anchor(host.hwnd, h));
-                        if let Some(anchor) = anchor {
-                            let _z = z_scope(ZIntent::Drag);
-                            unsafe {
-                                let _ = SetWindowPos(
-                                    h,
-                                    anchor,
-                                    0,
-                                    0,
-                                    0,
-                                    0,
-                                    SWP_NOACTIVATE
-                                        | SWP_NOSIZE
-                                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
-                                );
-                            }
-                        }
-                    }
-                    drop(s);
-                    // 两模式统一(2026-08-26):透明模式同样用快照种子,栅栏
-                    // 移动到新壁纸区域必须重渲染(重新取该处壁纸作种子)
-                    refresh_fence(fence_id);
-                    update_guides(None, None);
-                    return;
-                }
-                DragMode::Resize { edges } => {
-                    let (cx, cy) = screen_cursor();
-                    if (cx - s.drag_settle_x).abs() + (cy - s.drag_settle_y).abs() < 2.0 {
-                        return;
-                    }
-                    s.drag_settle_x = cx;
-                    s.drag_settle_y = cy;
-                    // 时间节流:表面重建(含 D2D 重绘)最多 ~80fps,
-                    // 尺寸仍然 1:1 跟随鼠标(吸附整格只在松手时做,拖动手感保持灵敏)
-                    let now = resize_now_ms();
-                    if now - s.last_resize_ms < 12 {
-                        return;
-                    }
-                    s.last_resize_ms = now;
-                    let chars: Vec<char> = edges.iter().filter(|c| **c != '\0').copied().collect();
-                    let nr = model::apply_resize(
-                        &drag.start_rect,
-                        &chars,
-                        cx - drag.start_sx,
-                        cy - drag.start_sy,
-                    );
-                    let (nr, gx, gy) = snap_drag(&s, fence_id, nr);
-                    let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-                    let mut tmp = [nr];
-                    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
-                    let cur = s.fences.iter().find(|f| f.id == fence_id).map(|f| f.rect);
-                    let unchanged = cur.is_some_and(|c| c == tmp[0]);
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                        f.rect = tmp[0];
-                    }
-                    if unchanged {
-                        drop(s);
-                        update_guides(gx, gy);
-                        return;
-                    }
-                    drop(s);
-                    refresh_fence(fence_id);
-                    update_guides(gx, gy);
-                    return;
-                }
-                DragMode::ScrollThumb { grab } => {
-                    let calc = {
-                        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-                            return;
-                        };
-                        let items = model::display_list(fence, &s.files);
-                        let metrics = s
-                            .metrics
-                            .get(&fence_id)
-                            .copied()
-                            .unwrap_or_else(model::DpiMetrics::system);
-                        let la = model::layout_with_metrics(fence, items.len(), &metrics);
-                        let max = la.total_rows.saturating_sub(la.rows);
-                        if max == 0 {
-                            None
-                        } else {
-                            let track_top = metrics.title_h + metrics.pad;
-                            let track_h =
-                                (fence.rect.h - metrics.pad * 2.0 - metrics.title_h).max(1.0);
-                            let thumb_h = (track_h * la.rows as f32 / la.total_rows as f32)
-                                .clamp(12.0 * metrics.scale, track_h);
-                            let avail = (track_h - thumb_h).max(1.0);
-                            let pos = ((y - track_top - grab) / avail).clamp(0.0, 1.0);
-                            Some((pos * max as f32).round() as usize)
-                        }
-                    };
-                    if let Some(scroll) = calc {
-                        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                            f.scroll_rows = scroll;
-                        }
-                    }
-                    drop(s);
-                    refresh_fence(fence_id);
-                    return;
-                }
-                DragMode::Marquee => {
-                    s.marquee = Some((drag.start_x, drag.start_y, x, y));
-                    drop(s);
-                    refresh_fence(fence_id);
-                    return;
-                }
-                DragMode::Icon(idx) => {
-                    // 残影拖拽进行中:更新残影位置 + 实时预览重排(其他图标即时让位,
-                    // 与原生桌面一致;不松手不生效,松手在栅栏外/按 Esc 则回滚)
-                    if s.drag_ghost.is_some() {
-                        let (sx, sy) = screen_cursor();
-                        let preview_changed = update_ghost_preview(&mut s, fence_id, x, y);
-                        drop(s);
-                        if preview_changed {
-                            refresh_fence(fence_id);
-                        }
-                        update_ghost(sx - model::icon_size() / 2.0, sy - model::icon_size() / 2.0);
-                        return;
-                    }
-                    if !drag.dragged_out && (dx * dx + dy * dy) > 64.0 {
-                        // 判断拖拽目标:仍在当前栅栏内 → 内部残影拖拽(松手重排);
-                        // 拖出栅栏 → OLE 拖拽(可与资源管理器互拖)
-                        let inside = {
-                            let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
-                            x >= 0.0 && y >= 0.0 && x <= fence.rect.w && y <= fence.rect.h
-                        };
-                        let paths: Vec<String> = {
-                            let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
-                            let items = model::display_list(fence, &s.files);
-                            let pressed = items.get(idx).map(|it| it.path.clone());
-                            if pressed
-                                .as_ref()
-                                .is_some_and(|p| s.selected_paths.contains(p))
-                            {
-                                items
-                                    .iter()
-                                    .filter(|it| s.selected_paths.contains(&it.path))
-                                    .map(|it| it.path.clone())
-                                    .collect()
-                            } else {
-                                pressed.into_iter().collect()
-                            }
-                        };
-                        if let Some(d) = s.drag.as_mut() {
-                            d.dragged_out = true;
-                        }
-                        if inside && !paths.is_empty() {
-                            // 内部拖拽:启动残影 + 实时预览;记录原始顺序与排序模式用于回滚
-                            let (sx, sy) = screen_cursor();
-                            let hx = sx - model::icon_size() / 2.0;
-                            let hy = sy - model::icon_size() / 2.0;
-                            let (original, original_sort_mode) = {
-                                let fence = s.fences.iter().find(|f| f.id == fence_id).unwrap();
-                                (
-                                    model::display_list(fence, &s.files)
-                                        .into_iter()
-                                        .map(|it| it.path)
-                                        .collect::<Vec<String>>(),
-                                    fence.sort_mode.clone(),
-                                )
-                            };
-                            let dragged_paths: Vec<String> = original
-                                .iter()
-                                .filter(|path| paths.contains(path))
-                                .cloned()
-                                .collect();
-                            let dragged_set: HashSet<&str> =
-                                dragged_paths.iter().map(String::as_str).collect();
-                            // 初始槽位=块首在当前顺序中的位置(第一帧即恒等,不跳动)
-                            let first_dragged = original
-                                .iter()
-                                .position(|p| dragged_set.contains(p.as_str()))
-                                .unwrap_or(0);
-                            let remaining = original.len().saturating_sub(dragged_paths.len());
-                            let target = first_dragged.min(remaining);
-                            // 预览要求 item_order 生效:立即切"手动"并令 item_order=
-                            // 当前显示顺序,保证第一帧与按下时完全一致(否则
-                            // "常用"/"时间"排序下 item_order 不参与排序,预览不可见)
-                            if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                                f.item_order = original.clone();
-                                f.sort_mode = "手动".into();
-                            }
-                            s.ghost_preview = Some(GhostPreview {
-                                fence_id,
-                                original,
-                                original_sort_mode,
-                                dragged_paths: dragged_paths.clone(),
-                                target,
-                            });
-                            s.drag_ghost = Some((dragged_paths.clone(), hx, hy));
-                            log(&format!(
-                                "icon ghost drag started at ({sx},{sy}); items={} slot={target}",
-                                dragged_paths.len()
-                            ));
-                            drop(s);
-                            update_ghost(hx, hy);
-                            return;
-                        }
-                        drop(s);
-                        if !paths.is_empty() {
-                            do_drag_out(paths);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
-    }
-    // 悬停更新
-    let (hit, n) = {
-        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-            return;
-        };
-        let items = model::display_list(fence, &s.files);
-        let n = items.len();
-        let metrics = s
-            .metrics
-            .get(&fence_id)
-            .copied()
-            .unwrap_or_else(model::DpiMetrics::system);
-        let lay = model::layout_with_metrics(fence, n, &metrics);
-        (
-            model::hit_test_with_metrics(fence, &lay, x, y, n, &metrics),
-            n,
-        )
-    };
-    let _ = n;
-    let new_hover = match hit {
-        Hit::Icon(i) => Some(i),
-        _ => None,
-    };
-    let prev = *s.hover.get(&fence_id).unwrap_or(&None);
-    s.hover_hit.insert(fence_id, hit);
-    // 卡片浮现与图标高亮一致走延迟提交:进入栅栏先记 pending,鼠标停留
-    // 满悬停时间才点亮。立即点亮会让"快速划过/点击倒三角/移向托盘"路径
-    // 产生亮-灭两次大面积重绘;菜单模态循环还会把熄灭推迟到关菜单之后
-    // 才显示——表现为点桌面关闭菜单时栅栏闪一下。
-    if !s.fence_hover.get(&fence_id).copied().unwrap_or(false)
-        && !s
-            .fence_hover_pending
-            .get(&fence_id)
-            .copied()
-            .unwrap_or(false)
-    {
-        s.fence_hover_pending.insert(fence_id, true);
-        unsafe {
-            let _ = SetTimer(
-                hwnd,
-                TIMER_HOVER,
-                mouse_hover_time_ms().max(50) as u32,
-                None,
-            );
-        }
-    }
-    if prev != new_hover {
-        // 原生桌面悬停高亮有延迟：先记入 pending，鼠标停留满悬停时间后才提交绘制
-        let changed = *s.hover_pending.get(&fence_id).unwrap_or(&prev) != new_hover;
-        s.hover_pending.insert(fence_id, new_hover);
-        if changed {
-            drop(s);
-            unsafe {
-                let _ = SetTimer(
-                    hwnd,
-                    TIMER_HOVER,
-                    mouse_hover_time_ms().max(50) as u32,
-                    None,
-                );
-            }
-            return;
-        }
-    } else {
-        // 回到已提交的图标：取消未到期的延迟提交
-        if s.hover_pending.remove(&fence_id).is_some() {
-            unsafe {
-                let _ = KillTimer(hwnd, TIMER_HOVER);
+    #[test]
+    fn hidden_fences_are_not_represented() {
+        for presented in [false, true] {
+            for has_surface in [false, true] {
+                assert!(!fence_needs_presentation(true, presented, has_surface));
             }
         }
     }
 }
 
-/// 单调毫秒时钟(resize 时间节流用)
-fn resize_now_ms() -> u64 {
-    use std::time::Instant;
-    static T0: OnceLock<Instant> = OnceLock::new();
-    T0.get_or_init(Instant::now).elapsed().as_millis() as u64
-}
-
-/// 系统悬停时间(SPI_GETMOUSEHOVERTIME,毫秒,默认 400)
-fn mouse_hover_time_ms() -> i32 {
-    unsafe {
-        let mut v: u32 = 0;
-        let ok = SystemParametersInfoW(
-            SPI_GETMOUSEHOVERTIME,
-            std::mem::size_of::<u32>() as u32,
-            Some(&mut v as *mut u32 as *mut std::ffi::c_void),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-        .is_ok();
-        if ok && v > 0 {
-            v as i32
-        } else {
-            400
-        }
-    }
-}
-
-fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
-    let (rename_edit, file_edit) = {
-        let s = state().lock().unwrap();
-        (s.rename_edit, s.file_rename_edit)
-    };
-    if let Some(edit) = rename_edit {
-        unsafe {
-            let _ = PostMessageW(edit, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-        }
-    }
-    if let Some(edit) = file_edit {
-        // 点击编辑框本身则交由 EDIT 处理，点击栅栏其它位置提交重命名
-        let mut p = POINT {
-            x: x as i32,
-            y: y as i32,
-        };
-        let sp = unsafe {
-            let _ = ClientToScreen(hwnd, &mut p);
-            p
-        };
-        if !point_in_window_rect(edit, sp.x, sp.y) {
-            log("COMMIT via lbuttondown");
-            unsafe {
-                let _ = PostMessageW(edit, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
-            }
-        }
-    }
-    let mut s = match state().try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    s.active_fence = Some(fence_id);
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id).cloned() else {
-        return;
-    };
-    if fence.locked {
-        return;
-    }
-    let (sx, sy) = screen_cursor();
-    let items = model::display_list(&fence, &s.files);
-    let n = items.len();
-    let metrics = s
-        .metrics
-        .get(&fence_id)
-        .copied()
-        .unwrap_or_else(model::DpiMetrics::system);
-    let lay = model::layout_with_metrics(&fence, n, &metrics);
-    let hit = model::hit_test_with_metrics(&fence, &lay, x, y, n, &metrics);
-    match hit {
-        Hit::Collapse => {
-            log(&format!("collapse clicked fence {fence_id}"));
-            // 点击箭头 = 弹出本栏操作菜单(菜单里含折叠/展开),菜单位置在箭头正下方
-            let hwnd_menu = hwnd;
-            let ax = fence.rect.x + fence.rect.w - metrics.collapse_w * 0.5;
-            let ay = fence.rect.y + metrics.title_h + 6.0;
-            drop(s);
-            fence_menu(hwnd_menu, fence_id, ax as i32, ay as i32);
-            return;
-        }
-        Hit::Icon(i) => {
-            let mut icon_was_selected = false;
-            let mut icon_path = String::new();
-            let mut is_bin = false;
-            if let Some(item) = items.get(i) {
-                let path = item.path.clone();
-                is_bin = model::is_recycle_bin(&path);
-                icon_was_selected = s.selected_paths.contains(&path);
-                icon_path = path.clone();
-                let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-                let shift = (unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) } as u16 & 0x8000) != 0;
-                if shift {
-                    let anchor = s.selection_anchor.clone();
-                    let anchor_index = anchor
-                        .as_ref()
-                        .and_then(|p| items.iter().position(|it| &it.path == p))
-                        .unwrap_or(i);
-                    if !ctrl {
-                        s.selected_paths.clear();
-                    }
-                    let lo = anchor_index.min(i);
-                    let hi = anchor_index.max(i);
-                    for it in &items[lo..=hi] {
-                        s.selected_paths.insert(it.path.clone());
-                    }
-                } else if ctrl {
-                    if !s.selected_paths.remove(&path) {
-                        s.selected_paths.insert(path.clone());
-                    }
-                    s.selection_anchor = Some(path.clone());
-                } else {
-                    s.selected_paths.clear();
-                    s.selected_paths.insert(path.clone());
-                    s.selection_anchor = Some(path.clone());
-                }
-                s.focused_path = Some(path);
-            }
-            // 回收站图标固定第一位:可选中/可右键,但不可拖动重排
-            if !is_bin {
-                s.drag = Some(Drag {
-                    fence_id,
-                    mode: DragMode::Icon(i),
-                    start_x: x,
-                    start_y: y,
-                    start_sx: sx,
-                    start_sy: sy,
-                    start_rect: fence.rect,
-                    start_layout: s.fences.clone(),
-                    dragged_out: false,
-                    icon_was_selected,
-                    icon_path,
-                });
-                unsafe {
-                    SetCapture(hwnd);
-                }
-            }
-        }
-        Hit::Scrollbar => {
-            let max = lay.total_rows.saturating_sub(lay.rows);
-            if max > 0 {
-                let track_top = metrics.title_h + metrics.pad;
-                let track_h = (fence.rect.h - metrics.pad * 2.0 - metrics.title_h).max(1.0);
-                let thumb_h = (track_h * lay.rows as f32 / lay.total_rows as f32)
-                    .clamp(12.0 * metrics.scale, track_h);
-                let pos = (fence.scroll_rows as f32 / max as f32).min(1.0);
-                let thumb_top = track_top + pos * (track_h - thumb_h);
-                let grab = (y - thumb_top).clamp(0.0, thumb_h);
-                s.drag = Some(Drag {
-                    fence_id,
-                    mode: DragMode::ScrollThumb { grab },
-                    start_x: x,
-                    start_y: y,
-                    start_sx: sx,
-                    start_sy: sy,
-                    start_rect: fence.rect,
-                    start_layout: s.fences.clone(),
-                    dragged_out: false,
-                    icon_was_selected: false,
-                    icon_path: String::new(),
-                });
-                unsafe {
-                    SetCapture(hwnd);
-                }
-            }
-        }
-        Hit::Title | Hit::Blank => {
-            if matches!(hit, Hit::Blank) {
-                let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-                if !ctrl {
-                    s.selected_paths.clear();
-                    s.focused_path = None;
-                    s.selection_anchor = None;
-                }
-                s.marquee = Some((x, y, x, y));
-            }
-            s.drag = Some(Drag {
-                fence_id,
-                mode: if matches!(hit, Hit::Blank) {
-                    DragMode::Marquee
-                } else {
-                    DragMode::Move
-                },
-                start_x: x,
-                start_y: y,
-                start_sx: sx,
-                start_sy: sy,
-                start_rect: fence.rect,
-                start_layout: s.fences.clone(),
-                dragged_out: false,
-                icon_was_selected: false,
-                icon_path: String::new(),
-            });
-            unsafe {
-                SetCapture(hwnd);
-            }
-        }
-        h if is_edge(&h) => {
-            s.drag = Some(Drag {
-                fence_id,
-                mode: DragMode::Resize { edges: edges_of(h) },
-                start_x: x,
-                start_y: y,
-                start_sx: sx,
-                start_sy: sy,
-                start_rect: fence.rect,
-                start_layout: s.fences.clone(),
-                dragged_out: false,
-                icon_was_selected: false,
-                icon_path: String::new(),
-            });
-            unsafe {
-                SetCapture(hwnd);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_edge(h: &Hit) -> bool {
-    matches!(
-        *h,
-        Hit::EdgeW
-            | Hit::EdgeE
-            | Hit::EdgeN
-            | Hit::EdgeS
-            | Hit::CornerNW
-            | Hit::CornerNE
-            | Hit::CornerSW
-            | Hit::CornerSE
-    )
-}
-
-fn edges_of(h: Hit) -> [char; 2] {
-    match h {
-        Hit::EdgeW => ['w', '\0'],
-        Hit::EdgeE => ['e', '\0'],
-        Hit::EdgeN => ['n', '\0'],
-        Hit::EdgeS => ['s', '\0'],
-        Hit::CornerNW => ['n', 'w'],
-        Hit::CornerNE => ['n', 'e'],
-        Hit::CornerSW => ['s', 'w'],
-        Hit::CornerSE => ['s', 'e'],
-        _ => ['\0', '\0'],
-    }
-}
-
-/// 拖拽实时预览:根据当前鼠标客户区坐标计算目标格。
-/// - 网格坐标双向 clamp(右/下越界映射到最后一列/行),消除边缘死区;
-/// - 槽位=悬停格在当前预览顺序中的序号(块落点=鼠标所在格),
-///   左右对称、无"慢一拍"滞后;
-/// - 始终从 original 快照删除拖动块再插入,幂等可逆。
-/// 返回是否发生了变化(调用方据此重绘);悬停在回收站上时不重排(松手即删除)。
-fn update_ghost_preview(s: &mut UiState, fence_id: u32, x: f32, y: f32) -> bool {
-    let Some(prev) = s.ghost_preview.clone() else {
-        return false;
-    };
-    if prev.fence_id != fence_id || prev.dragged_paths.is_empty() {
-        return false;
-    }
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id).cloned() else {
-        return false;
-    };
-    let metrics = s
-        .metrics
-        .get(&fence_id)
-        .copied()
-        .unwrap_or_else(model::DpiMetrics::system);
-    if prev.original.is_empty() {
-        return false;
-    }
-    let dragged: HashSet<&str> = prev.dragged_paths.iter().map(String::as_str).collect();
-    // 当前显示顺序(预览期间=已按预览槽位重排的顺序)
-    let items = model::display_list(&fence, &s.files);
-    let lay = model::layout_with_metrics(&fence, items.len(), &metrics);
-    // 回收站图标是固定删除目标:拖到它上方时不重排,松手删除拖动的文件
-    {
-        let hit = model::hit_test_with_metrics(&fence, &lay, x, y, items.len(), &metrics);
-        let over_bin = matches!(hit, Hit::Icon(j)
-            if items
-                .get(j)
-                .is_some_and(|it| model::is_recycle_bin(&it.path)));
-        if over_bin != s.trash_target {
-            s.trash_target = over_bin;
-        }
-        if over_bin {
-            return false;
-        }
-    }
-    let remaining = items.len().saturating_sub(dragged.len());
-    // 悬停格序号(当前显示顺序);越界 clamp 到有效网格与列表末尾
-    let cx = x - metrics.pad;
-    let cy = y - metrics.title_h - metrics.pad;
-    let col = ((cx / metrics.cell_w).floor().max(0.0) as usize).min(lay.cols.saturating_sub(1));
-    let row = ((cy / metrics.cell_h).floor().max(0.0) as usize).min(lay.rows.saturating_sub(1));
-    let target = (lay.first_index + row.saturating_mul(lay.cols) + col).min(remaining);
-    if let Some(p) = s.ghost_preview.as_mut() {
-        p.target = target;
-    }
-    // 插入式指示线(与原生"出现横线松手插入"一致):其余图标不动,
-    // 只在目标槽左缘画竖线;行首(跨行插入)画横线。屏幕坐标存入 insert_line。
-    let slot = target.min(lay.first_index + lay.rows.saturating_mul(lay.cols).saturating_sub(1));
-    let srow = (slot - lay.first_index) / lay.cols.max(1);
-    let scol = (slot - lay.first_index) % lay.cols.max(1);
-    let gx0 = fence.rect.x + metrics.pad + scol as f32 * metrics.cell_w;
-    let gy0 = fence.rect.y + metrics.title_h + metrics.pad + srow as f32 * metrics.cell_h;
-    let line = if scol == 0 && srow > 0 {
-        // 横线:插到上一行与本行之间
-        let y = gy0 - (metrics.cell_h - metrics.icon_px) * 0.2;
-        (
-            fence.rect.x + metrics.pad * 0.5,
-            y,
-            fence.rect.w - metrics.pad,
-            2.5,
-        )
-    } else {
-        // 竖线:插到该槽左侧
-        let x = gx0 - (metrics.cell_w - metrics.icon_px) * 0.2;
-        (x, gy0 + 2.0, 2.5, metrics.icon_px + 4.0)
-    };
-    let changed = s.insert_line != Some(line);
-    s.insert_line = Some(line);
-    // 图标不动 → 无需刷新栅栏,只刷新 overlay 指示线
-    let _ = changed;
-    false
-}
-
-/// 回滚拖拽预览到原始顺序与排序模式(拖出释放/取消)
-fn rollback_ghost_preview(s: &mut UiState) {
-    if let Some(prev) = s.ghost_preview.take() {
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == prev.fence_id) {
-            f.item_order = prev.original;
-            f.sort_mode = prev.original_sort_mode;
-        }
-    }
-}
-
-/// 拖出释放点(屏幕坐标)是否落在某个非源栅栏的回收站图标上。
-fn release_on_recycle_bin_screen(s: &UiState, sx: f32, sy: f32, source_fence: u32) -> bool {
-    for fence in &s.fences {
-        if fence.id == source_fence || fence.hidden || fence.collapsed {
-            continue;
-        }
-        let cx = sx - fence.rect.x;
-        let cy = sy - fence.rect.y;
-        if cx < 0.0 || cy < 0.0 || cx > fence.rect.w || cy > fence.rect.h {
-            continue;
-        }
-        let items = model::display_list(fence, &s.files);
-        let metrics = s
-            .metrics
-            .get(&fence.id)
-            .copied()
-            .unwrap_or_else(model::DpiMetrics::system);
-        let lay = model::layout_with_metrics(fence, items.len(), &metrics);
-        if let Hit::Icon(j) =
-            model::hit_test_with_metrics(&fence, &lay, cx, cy, items.len(), &metrics)
-        {
-            let hit_bin = items
-                .get(j)
-                .is_some_and(|it| model::is_recycle_bin(&it.path));
-            log(&format!(
-                "[dbg] trash-release probe fence={} client=({:.0},{:.0}) hit=Icon({}) bin={}",
-                fence.id, cx, cy, j, hit_bin
-            ));
-            if hit_bin {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
-    let mut s = match state().try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    if let Some(drag) = s.drag.take() {
-        let mut changed_final: Vec<u32> = Vec::new();
-        // 内部图标残影拖拽收尾:松手在栅栏内 = 预览顺序生效(落格重排已实时完成,
-        // 只需持久化);松手在栅栏外 = 未移动,回滚到原始顺序
-        if s.drag_ghost.is_some() {
-            s.drag_ghost = None;
-            let inside = {
-                let fence = s.fences.iter().find(|f| f.id == fence_id);
-                match fence {
-                    Some(f) => x >= 0.0 && y >= 0.0 && x <= f.rect.w && y <= f.rect.h,
-                    None => false,
-                }
-            };
-            // 拖到回收站图标上松手 → 删除拖动的文件(回滚重排预览,rescan 移除图标)
-            if inside && s.trash_target {
-                let paths: Vec<String> = s
-                    .ghost_preview
-                    .as_ref()
-                    .map(|p| p.dragged_paths.clone())
-                    .unwrap_or_default();
-                s.trash_target = false;
-                rollback_ghost_preview(&mut s);
-                s.marquee = None;
-                let hwnd = s.windows.get(&fence_id).copied().unwrap_or(HWND(0));
-                log(&format!(
-                    "drop onto recycle bin: deleting {} items",
-                    paths.len()
-                ));
-                drop(s);
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
-                if !paths.is_empty() {
-                    shell::delete_to_recycle_bin_many(hwnd, &paths);
-                    rescan();
-                } else {
-                    refresh_fence(fence_id);
-                }
-                update_guides(None, None);
-                return;
-            }
-            s.trash_target = false;
-            s.insert_line = None;
-            if inside && s.ghost_preview.is_some() {
-                let (target, count, original, dragged) = s
-                    .ghost_preview
-                    .as_ref()
-                    .map(|p| {
-                        (
-                            p.target,
-                            p.dragged_paths.len(),
-                            p.original.clone(),
-                            p.dragged_paths.clone(),
-                        )
-                    })
-                    .unwrap_or((0, 0, Vec::new(), Vec::new()));
-                s.ghost_preview = None;
-                // 松手才拼接:按指示线位置把拖动块插入目标槽(其余项顺移)
-                let order = model::reorder_paths_as_block(&original, &dragged, target);
-                if !order.is_empty() {
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                        f.item_order = order;
-                        f.sort_mode = "手动".into();
-                    }
-                }
-                log(&format!(
-                    "icon drag committed: items={count} -> slot={target}"
-                ));
-                let cfg = s.fences.clone();
-                if let Err(err) = model::save_config(&cfg) {
-                    log(&format!("icon drag save failed: {err}"));
-                }
-            } else if !inside && {
-                // 拖出栅栏后客户区坐标为负,WM 消息里以无符号解码会变成 ~65k;
-                // 用真实屏幕光标位置做命中才可靠
-                let mut pt = POINT::default();
-                unsafe {
-                    let _ = GetCursorPos(&mut pt);
-                }
-                release_on_recycle_bin_screen(&s, pt.x as f32, pt.y as f32, fence_id)
-            } {
-                // 拖出本栅栏释放:落点在其它栅栏的回收站图标上 → 删除(用户拖文件进回收站)
-                let paths: Vec<String> = s
-                    .ghost_preview
-                    .as_ref()
-                    .map(|p| p.dragged_paths.clone())
-                    .unwrap_or_default();
-                rollback_ghost_preview(&mut s);
-                s.marquee = None;
-                let hwnd = s.windows.get(&fence_id).copied().unwrap_or(HWND(0));
-                log(&format!(
-                    "cross-fence drop onto recycle bin: deleting {} items",
-                    paths.len()
-                ));
-                drop(s);
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
-                if !paths.is_empty() {
-                    shell::delete_to_recycle_bin_many(hwnd, &paths);
-                    rescan();
-                } else {
-                    refresh_fence(fence_id);
-                }
-                update_guides(None, None);
-                return;
-            } else {
-                // 松手在其他栅栏上 = 把拖动的文件分配给那个栅栏
-                // (自定义分类模式的核心入口;自动分类下也可用来"收藏"到自建栅栏)
-                let mut pt = POINT::default();
-                unsafe {
-                    let _ = GetCursorPos(&mut pt);
-                }
-                let target = s
-                    .fences
-                    .iter()
-                    .find(|f| {
-                        f.id != fence_id
-                            && !f.hidden
-                            && !f.collapsed
-                            && pt.x as f32 >= f.rect.x
-                            && pt.y as f32 >= f.rect.y
-                            && pt.x as f32 <= f.rect.x + f.rect.w
-                            && pt.y as f32 <= f.rect.y + f.rect.h
-                    })
-                    .map(|f| f.id);
-                let dragged: Vec<String> = s
-                    .ghost_preview
-                    .as_ref()
-                    .map(|p| p.dragged_paths.clone())
-                    .unwrap_or_default();
-                let mut assigned: Option<u32> = None;
-                if let (Some(tid), false) = (target, dragged.is_empty()) {
-                    // 从其他栅栏的收纳表中移除(一个文件只属于一个栅栏)
-                    for f in s.fences.iter_mut() {
-                        f.pinned.retain(|p| !dragged.contains(p));
-                    }
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == tid) {
-                        for path in &dragged {
-                            if !f.pinned.contains(path) {
-                                f.pinned.push(path.clone());
-                            }
-                        }
-                    }
-                    assigned = Some(tid);
-                }
-                rollback_ghost_preview(&mut s);
-                if let Some(tid) = assigned {
-                    log(&format!(
-                        "assigned {} items to fence {tid} (custom category)",
-                        dragged.len()
-                    ));
-                    let cfg = s.fences.clone();
-                    let _ = model::save_config(&cfg);
-                    let _ = tid;
-                } else if !inside {
-                    log("icon drag released outside fence: rolled back");
-                }
-            }
-            s.marquee = None;
-            drop(s);
-            rebuild_pins();
-            refresh_all_fences();
-            update_guides(None, None);
-            unsafe {
-                let _ = ReleaseCapture();
-            }
-            return;
-        }
-        if drag.fence_id == fence_id && !drag.dragged_out {
-            let (cx, cy) = screen_cursor();
-            let dx = cx - drag.start_sx;
-            let dy = cy - drag.start_sy;
-            // Explorer 慢双击重命名:第一次点击选中图标,稍后再次点击"已选中"的
-            // 同一图标(非双击、无拖动、无Ctrl)→ 原位进入重命名
-            if let DragMode::Icon(_) = drag.mode {
-                let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-                let moved = (dx * dx + dy * dy) > 64.0;
-                if drag.icon_was_selected
-                    && !ctrl
-                    && !moved
-                    && !drag.icon_path.is_empty()
-                    && !model::is_recycle_bin(&drag.icon_path)
-                {
-                    let path = drag.icon_path.clone();
-                    s.marquee = None;
-                    drop(s);
-                    refresh_fence(fence_id);
-                    start_file_rename(path);
-                    unsafe {
-                        let _ = ReleaseCapture();
-                    }
-                    return;
-                }
-            }
-            let others: Vec<Rect> = s
-                .fences
-                .iter()
-                .filter(|f| f.id != fence_id)
-                .map(|f| f.rect)
-                .collect();
-            if matches!(drag.mode, DragMode::Move | DragMode::Resize { .. }) {
-                // s 已被本函数持有,直接用克隆快照入撤销栈,避免重复加锁
-                // The live mouse-move path may have already changed the anchor.
-                // Store the complete pre-operation snapshot captured at button-up entry
-                // only as a fallback; the real snapshot is captured on button-down below.
-                push_undo_snapshot(drag.start_layout.clone(), fence_id, drag.start_rect);
-            }
-            match drag.mode {
-                DragMode::Marquee => {
-                    if let Some(fence) = s.fences.iter().find(|f| f.id == fence_id).cloned() {
-                        let items = model::display_list(&fence, &s.files);
-                        let lay = model::layout(&fence, items.len());
-                        let m = s
-                            .marquee
-                            .take()
-                            .unwrap_or((drag.start_x, drag.start_y, x, y));
-                        let mr = Rect {
-                            x: m.0,
-                            y: m.1,
-                            w: m.2 - m.0,
-                            h: m.3 - m.1,
-                        };
-                        let ctrl =
-                            (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-                        if !ctrl {
-                            s.selected_paths.clear();
-                        }
-                        for idx in model::indices_in_rect(&lay, &mr, items.len()) {
-                            if let Some(it) = items.get(idx) {
-                                s.selected_paths.insert(it.path.clone());
-                            }
-                        }
-                        if let Some(path) = s.selected_paths.iter().next().cloned() {
-                            s.focused_path = Some(path);
-                        }
-                    } else {
-                        s.marquee = None;
-                    }
-                }
-                DragMode::Move => {
-                    // 插入式提交:有指示线 → 其余栅栏按视觉顺序拼接被拖者,
-                    // 整链从首槽紧凑重排(1 插到 2/3 之间 → 2,1,3;放不下换行,
-                    // 出屏由 fit_to_monitors 夹回);无指示线 → 原地自由放置。
-                    let (cx, cy) = screen_cursor();
-                    let moved = (cx - drag.start_sx) * (cx - drag.start_sx)
-                        + (cy - drag.start_sy) * (cy - drag.start_sy)
-                        > 64.0;
-                    let plan = if moved && (auto_align_on() || grid_align_on()) {
-                        fence_insertion_plan(&drag, cx, cy)
-                    } else {
-                        None
-                    };
-                    // 纯点击(无拖动)不做任何拼接重排,位置保持原样
-                    if !moved {
-                        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                            f.rect = drag.start_rect;
-                        }
-                        s.insert_line = None;
-                    } else if let Some((idx, order_ids, _)) = plan {
-                        let snapshot: HashMap<u32, Rect> =
-                            drag.start_layout.iter().map(|f| (f.id, f.rect)).collect();
-                        // 首槽 = 原布局(含被拖者)最左者的位置,链锚点不因移除被拖者而右移
-                        let first = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| !f.hidden && !f.collapsed)
-                            .min_by(|a, b| {
-                                let ka = (a.rect.y + a.rect.h * 0.5, a.rect.x);
-                                let kb = (b.rect.y + b.rect.h * 0.5, b.rect.x);
-                                ka.0.partial_cmp(&kb.0)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                                    .then(
-                                        ka.1.partial_cmp(&kb.1)
-                                            .unwrap_or(std::cmp::Ordering::Equal),
-                                    )
-                            })
-                            .map(|f| f.rect)
-                            .unwrap_or(drag.start_rect);
-                        let x0 = first.x;
-                        let y0 = first.y;
-                        let (vx0, vy0, vw0, vh0) = work_area_for_rect(&Rect {
-                            x: x0,
-                            y: y0,
-                            w: drag.start_rect.w,
-                            h: drag.start_rect.h,
-                        });
-                        // 起点夹进工作区;换行右缘用绝对工作区右缘,链不排到屏外
-                        let x0 = x0.max(vx0).min(vx0 + vw0 - drag.start_rect.w.max(1.0));
-                        let y0 = y0.max(vy0).min(vy0 + vh0 - drag.start_rect.h.max(1.0));
-                        let row_right = vx0 + vw0;
-                        // 拼接后的顺序与其尺寸
-                        let mut ordered_ids = order_ids;
-                        let insert_at = idx.min(ordered_ids.len());
-                        ordered_ids.insert(insert_at, fence_id);
-                        let sizes: Vec<(f32, f32)> = ordered_ids
-                            .iter()
-                            .map(|id| {
-                                let r = snapshot.get(id).copied().unwrap_or(drag.start_rect);
-                                (r.w, r.h)
-                            })
-                            .collect();
-                        let slots = model::chain_positions(&sizes, x0, y0, row_right);
-                        let by_id: HashMap<u32, Rect> = ordered_ids
-                            .into_iter()
-                            .zip(slots.into_iter())
-                            .map(|(id, (x, y))| {
-                                let r = snapshot.get(&id).copied().unwrap_or(drag.start_rect);
-                                (
-                                    id,
-                                    Rect {
-                                        x,
-                                        y,
-                                        w: r.w,
-                                        h: r.h,
-                                    },
-                                )
-                            })
-                            .collect();
-                        let areas = all_work_areas();
-                        let mut final_rects: Vec<Rect> = s.fences.iter().map(|f| f.rect).collect();
-                        for (i, f) in s.fences.iter_mut().enumerate() {
-                            if let Some(nr) = by_id.get(&f.id) {
-                                final_rects[i] = *nr;
-                                f.rect = *nr;
-                            }
-                        }
-                        model::fit_to_monitors(&mut final_rects, &areas);
-                        for (f, r) in s.fences.iter_mut().zip(final_rects.into_iter()) {
-                            f.rect = r;
-                        }
-                    } else {
-                        // 原地放置(与拖动预览同式:跟手位置 + 夹屏)
-                        let mut nr = Rect {
-                            x: drag.start_rect.x + (cx - drag.start_sx),
-                            y: drag.start_rect.y + (cy - drag.start_sy),
-                            w: drag.start_rect.w,
-                            h: drag.start_rect.h,
-                        };
-                        if !auto_align_on() {
-                            let others: Vec<Rect> = drag
-                                .start_layout
-                                .iter()
-                                .filter(|f| f.id != fence_id)
-                                .map(|f| f.rect)
-                                .collect();
-                            let mut x = nr.x;
-                            let mut y = nr.y;
-                            if grid_align_on() {
-                                let (vx, vy, _, _) = work_area_for_rect(&nr);
-                                x = vx + ((nr.x - vx) / model::cell_w()).round() * model::cell_w();
-                                y = vy + ((nr.y - vy) / model::cell_h()).round() * model::cell_h();
-                            }
-                            let probe = Rect { x, y, ..nr };
-                            let (sx, snapped) = model::snap_gap_to_neighbors(
-                                &probe,
-                                &others,
-                                model::SNAP_THRESHOLD * 1.5,
-                            );
-                            if snapped {
-                                x = sx;
-                            }
-                            nr = Rect { x, y, ..nr };
-                        }
-                        let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-                        let mut tmp = [nr];
-                        model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
-                        let mut fr = tmp[0];
-                        const EDGE: f32 = model::GAP * 1.25;
-                        if fr.x - vx < EDGE {
-                            fr.x = vx;
-                        }
-                        if vx + vw - (fr.x + fr.w) < EDGE {
-                            fr.x = vx + vw - fr.w;
-                        }
-                        if fr.y - vy < EDGE {
-                            fr.y = vy;
-                        }
-                        if vy + vh - (fr.y + fr.h) < EDGE {
-                            fr.y = vy + vh - fr.h;
-                        }
-                        let others: Vec<Rect> = drag
-                            .start_layout
-                            .iter()
-                            .filter(|f| f.id != fence_id && !f.hidden)
-                            .map(|f| f.rect)
-                            .collect();
-                        snap_rect_to_neighbors(&mut fr, &others);
-                        fr = model::avoid_overlap(&fr, &others, vx, vy, vw, vh);
-                        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                            f.rect = fr;
-                        }
-                    }
-                    s.insert_line = None;
-                    changed_final = s.fences.iter().map(|f| f.id).collect();
-                }
-                DragMode::Resize { edges } => {
-                    // 用户手动缩放：此后高度不再自动收敛到内容（尊重用户意图）
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                        f.manual_size = true;
-                    }
-                    let chars: Vec<char> = edges.iter().filter(|c| **c != '\0').copied().collect();
-                    let nr0 = model::apply_resize(&drag.start_rect, &chars, dx, dy);
-                    let (nr0, _, _) = snap_drag(&s, fence_id, nr0);
-                    let w_inv = chars.contains(&'w');
-                    let n_inv = chars.contains(&'n');
-                    // Snap the final content area to the icon-cell grid so the
-                    // fence always fits exactly N×M icons.
-                    let (sw, sh) = model::snap_fence_size(nr0.w, nr0.h);
-                    let mut nr = nr0;
-                    nr.w = sw;
-                    nr.h = sh;
-                    if w_inv {
-                        let far = drag.start_rect.x + drag.start_rect.w;
-                        nr.x = (far - sw).max(0.0);
-                    }
-                    if n_inv {
-                        let bot = drag.start_rect.y + drag.start_rect.h;
-                        nr.y = (bot - sh).max(0.0);
-                    }
-                    let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-                    let mut tmp = [nr];
-                    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
-                    // 保留用户缩放的尺寸，只解除重叠（其它栅栏不动）
-                    let final_r = if auto_align_on() {
-                        tmp[0]
-                    } else {
-                        model::avoid_overlap(&tmp[0], &others, vx, vy, vw, vh)
-                    };
-                    if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-                        f.rect = final_r;
-                    }
-                    changed_final = vec![fence_id];
-                }
-                _ => {}
-            }
-            if auto_align_on() && matches!(drag.mode, DragMode::Resize { .. }) {
-                compact_neighbors_after_resize(&mut s.fences, fence_id);
-                changed_final = s.fences.iter().map(|f| f.id).collect();
-            }
-            let cfg = s.fences.clone();
-            let _ = model::save_config(&cfg);
-        }
-        s.marquee = None;
-        drop(s);
-        if changed_final.is_empty() {
-            refresh_fence(fence_id);
-        } else {
-            for id in changed_final {
-                refresh_fence(id);
-            }
-        }
-        // 松手后清除对齐参考线和框选矩形
-        update_guides(None, None);
-        unsafe {
-            let _ = ReleaseCapture();
-        }
-        // 拖拽期间被拖栅栏被提升到兄弟栅栏之上(仅 band 内);拖拽结束立即
-        // 归位带内绝缘位(最低可见外来窗正下方,与整链同位;勿回退到宿主
-        // 正上方——带底扰动区)。若等自愈兜底,栅栏会在其他窗口上方漂移=
-        // 用户看到的"栅栏浮在别的窗口上方"。
-        {
-            let s = state().lock().unwrap();
-            let hosts = desktop_hosts();
-            let target = s.fences.iter().find(|f| f.id == fence_id).map(|f| {
-                (f.hidden, f.rect)
-            });
-            if let Some((hidden, rect)) = target {
-                if !hidden {
-                    if let Some(host) = host_for_rect(&rect, &hosts) {
-                        if let Some(after) = band_attach_anchor(host.hwnd, HWND(0), false) {
-                            if let Some(fh) = s.windows.get(&fence_id) {
-                                let _z = z_scope(ZIntent::Drag);
-                                unsafe {
-                                    let _ = SetWindowPos(
-                                        *fh,
-                                        after,
-                                        rect.x.round() as i32,
-                                        rect.y.round() as i32,
-                                        0,
-                                        0,
-                                        SWP_NOSIZE | SWP_NOACTIVATE,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
-    let s = match state().try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-        return;
-    };
-    let items = model::display_list(fence, &s.files);
-    let n = items.len();
-    let metrics = s
-        .metrics
-        .get(&fence_id)
-        .copied()
-        .unwrap_or_else(model::DpiMetrics::system);
-    let lay = model::layout_with_metrics(fence, n, &metrics);
-    let hit = model::hit_test_with_metrics(fence, &lay, x, y, n, &metrics);
-    if let Hit::Icon(i) = hit {
-        if let Some(it) = items.get(i) {
-            let p = it.path.clone();
-            drop(s);
-            open_item(&p);
-            return;
-        }
-    }
-}
-
-fn handle_rbuttonup(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
-    // 客户区坐标 → 屏幕坐标(TrackPopupMenu 要屏幕坐标,否则菜单弹到错误位置)
-    let (sx, sy) = unsafe {
-        let mut p = POINT {
-            x: x as i32,
-            y: y as i32,
-        };
-        let _ = ClientToScreen(hwnd, &mut p);
-        (p.x, p.y)
-    };
-    // 右键同样先退出进行中的重命名(与原生一致:右键编辑框外部提交)
-    rename_click_outside_hit(sx, sy, "rbutton");
-    {
-        let s = match state().try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-            return;
-        };
-        let items = model::display_list(fence, &s.files);
-        let n = items.len();
-        let metrics = s
-            .metrics
-            .get(&fence_id)
-            .copied()
-            .unwrap_or_else(model::DpiMetrics::system);
-        let lay = model::layout_with_metrics(fence, n, &metrics);
-        let hit = model::hit_test_with_metrics(fence, &lay, x, y, n, &metrics);
-        match hit {
-            Hit::Icon(i) => {
-                if let Some(it) = items.get(i) {
-                    let p = it.path.clone();
-                    drop(s);
-                    {
-                        let mut s = state().lock().unwrap();
-                        if !s.selected_paths.contains(&p) {
-                            s.selected_paths.clear();
-                            s.selected_paths.insert(p.clone());
-                        }
-                        s.focused_path = Some(p.clone());
-                        s.selection_anchor = Some(p.clone());
-                    }
-                    refresh_fence(fence_id);
-                    let menu_paths = {
-                        let s = state().lock().unwrap();
-                        let selected: Vec<String> = s.selected_paths.iter().cloned().collect();
-                        if selected.len() > 1 && selected.iter().any(|path| path == &p) {
-                            selected
-                        } else {
-                            vec![p.clone()]
-                        }
-                    };
-                    // 与 Explorer 一致：右键已选中的多个项目时，按完整选区构造 Shell 菜单。
-                    shell::show_shell_context_menu_paths(hwnd, &menu_paths, sx, sy);
-                    return;
-                }
-            }
-            // 空白内容区:与原生桌面一致,弹桌面右键菜单(查看/排序方式/刷新/
-            // 粘贴/新建/显示设置/个性化…),DeskLens 命令挂在子菜单里
-            Hit::Blank => {
-                drop(s);
-                let cmd =
-                    shell::show_desktop_context_menu(hwnd, sx, sy, &align_mode(), &render_mode());
-                if cmd == 0 {
-                    // 桌面菜单链路不可用时退化为栅栏管理菜单
-                    fence_menu(hwnd, fence_id, sx, sy);
-                } else {
-                    dispatch_desktop_command(cmd);
-                }
-                return;
-            }
-            // 标题栏/折叠钮/滚动条:栅栏管理菜单
-            _ => {}
-        }
-    }
-    fence_menu(hwnd, fence_id, sx, sy);
-}
-
-/// 桌面背景右键菜单里 DeskFence 子菜单的命令分派
-fn dispatch_desktop_command(id: u32) {
-    match id {
-        shell::DL_CMD_ADD_FENCE => {
-            let base = state()
-                .lock()
-                .unwrap()
-                .fences
-                .iter()
-                .map(|f| f.id)
-                .next()
-                .unwrap_or(0);
-            if base != 0 {
-                let _ = add_fence_after(base);
-            }
-        }
-        shell::DL_CMD_SHOW_ALL => show_all_fences(),
-        shell::DL_CMD_HIDE_ALL => set_all_hidden(true),
-        shell::DL_CMD_UNDO => undo_layout(),
-        shell::DL_CMD_AUTO_ALIGN => {
-            // 桌面菜单入口:循环切换三档
-            let next = match align_mode().as_str() {
-                "auto" => "grid",
-                "grid" => "free",
-                _ => "auto",
-            };
-            set_align_mode(next);
-        }
-        shell::DL_CMD_RENDER_MODE => {
-            // 渲染模式切换:透明(动态壁纸兼容) ↔ 精确(壁纸底+ClearType)
-            let next = if render_mode() == "precise" {
-                "transparent"
-            } else {
-                "precise"
-            };
-            set_render_mode(next);
-        }
-        shell::DL_CMD_HELP => show_help(),
-        shell::DL_CMD_REFRESH => rescan(),
-        shell::DL_CMD_QUIT => quit_app(),
-        _ => {}
-    }
-}
-
-fn handle_wheel(fence_id: u32, delta: i32) {
-    let mut s = match state().try_lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let (total_rows, rows) = {
-        let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-            return;
-        };
-        if fence.locked {
-            return;
-        }
-        let items = model::display_list(fence, &s.files);
-        let lay = model::layout(fence, items.len());
-        (lay.total_rows, lay.rows)
-    };
-    if total_rows <= rows {
-        return;
-    }
-    let max = total_rows.saturating_sub(rows);
-    let Some(fence) = s.fences.iter_mut().find(|f| f.id == fence_id) else {
-        return;
-    };
-    if delta > 0 {
-        fence.scroll_rows = fence.scroll_rows.saturating_sub(1);
-    } else {
-        fence.scroll_rows = fence.scroll_rows.saturating_add(1).min(max);
-    }
-    let cfg = s.fences.clone();
-    let _ = model::save_config(&cfg);
-    drop(s);
-    refresh_fence(fence_id);
-}
-
-fn handle_setcursor(hwnd: HWND, fence_id: u32) {
-    let hit = {
-        let s = match state().try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let locked = s
-            .fences
-            .iter()
-            .find(|f| f.id == fence_id)
-            .map(|f| f.locked)
-            .unwrap_or(false);
-        if locked {
-            // 锁定后不再显示缩放光标
-            Hit::None
-        } else {
-            s.hover_hit.get(&fence_id).copied().unwrap_or(Hit::None)
-        }
-    };
-    let cid: usize = match hit {
-        Hit::CornerNW | Hit::CornerSE => 32642,
-        Hit::CornerNE | Hit::CornerSW => 32643,
-        Hit::EdgeW | Hit::EdgeE => 32644,
-        Hit::EdgeN | Hit::EdgeS => 32645,
-        _ => 32512,
-    };
-    unsafe {
-        if let Ok(hc) = LoadCursorW(None, PCWSTR::from_raw(cid as usize as *const u16)) {
-            SetCursor(hc);
-        }
-    }
-    let _ = hwnd;
-}
-
-// ---------------- 对外回调 ----------------
-
-/// OLE 拖入栅栏(跨栅栏/从资源管理器拖入)。落点在回收站图标上 → 删除文件;
-/// 否则固定(pin)到该栅栏。screen_x/screen_y 为屏幕坐标。
-pub fn on_fence_drop_cb(fence_id: u32, paths: Vec<String>, screen_x: i32, screen_y: i32) {
-    // 先换算成栅栏客户区坐标做命中测试
-    let (cx, cy) = {
-        let s = state().lock().unwrap();
-        match s.windows.get(&fence_id).copied() {
-            Some(hwnd) if hwnd.0 != 0 => unsafe {
-                let mut q = POINT {
-                    x: screen_x,
-                    y: screen_y,
-                };
-                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut q);
-                (q.x as f32, q.y as f32)
-            },
-            _ => (-1.0, -1.0),
-        }
-    };
-    let mut delete_to_bin = false;
-    if cx >= 0.0 && cy >= 0.0 {
-        let s = state().lock().unwrap();
-        if let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) {
-            let items = model::display_list(fence, &s.files);
-            let lay = model::layout(fence, items.len());
-            if let Hit::Icon(j) = model::hit_test(fence, &lay, cx, cy, items.len()) {
-                delete_to_bin = items
-                    .get(j)
-                    .is_some_and(|it| model::is_recycle_bin(&it.path));
-            }
-        }
-    }
-    if delete_to_bin {
-        let hwnd = state()
-            .lock()
-            .unwrap()
-            .windows
-            .get(&fence_id)
-            .copied()
-            .unwrap_or(HWND(0));
-        log(&format!(
-            "OLE drop onto recycle bin: deleting {} items",
-            paths.len()
-        ));
-        shell::delete_to_recycle_bin_many(hwnd, &paths);
-        rescan();
-        return;
-    }
-    {
-        let mut s = state().lock().unwrap();
-        if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
-            for p in &paths {
-                if model::is_recycle_bin(p) {
-                    continue;
-                }
-                if !f.pinned.contains(p) {
-                    f.pinned.push(p.clone());
-                }
-            }
-            let cfg = s.fences.clone();
-            let _ = model::save_config(&cfg);
-        }
-    }
-    refit_auto_fence_heights();
-    refresh_fence(fence_id);
-}
-
-fn open_item(path: &str) {
-    if model::is_recycle_bin(path) {
-        shell::open_recycle_bin();
-        return;
-    }
-    shell::open_path(path);
-    // 记录打开次数/时间(常用排序依据)
-    model::record_open(path);
-    model::save_usage();
-}
-
-fn do_drag_out(paths: Vec<String>) {
-    ole::drag_out_files(&paths, |_target| {});
-}

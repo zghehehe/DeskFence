@@ -16,7 +16,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
     FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, GetFileAttributesW,
     FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
@@ -277,6 +277,7 @@ fn shell_display_name(path: &std::path::Path, fallback: &str) -> String {
 /// 1) 永远排除 desktop.ini 与 Office 锁文件(~$ 开头,仅在文档打开期间存在);
 /// 2) 按用户设置排除隐藏/受保护的系统文件;
 /// 3) 用户桌面与公共桌面同名冲突时只显示用户桌面的那份(Explorer 同名只显一条)。
+///
 /// 显示名解析(SHGFI_DISPLAYNAME)是逐文件 shell 调用(每个 ~15-25ms),
 /// 54 个文件串行要 ~1.3s,这里按 4 线程并行缩到 ~300ms;各线程独立 STA COM。
 pub fn scan_desktop() -> Vec<FileItem> {
@@ -338,7 +339,16 @@ fn scan_desktop_dir(dir: &std::path::Path) -> Vec<FileItem> {
     };
     for entry in entries.flatten() {
         let raw_name = entry.file_name().to_string_lossy().to_string();
-        let Ok(md) = entry.metadata() else { continue };
+        // 元数据可能被创建方进程短暂锁住(刚新建的文件):目录项侧失败时
+        // 用路径侧重试一次,仍失败才跳过——跳过=该轮 rescan 认为文件不存在,
+        // 会把刚新建的文件当"消失"处理(2026-09-03 用户实测位置漂移)
+        let md = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => match std::fs::metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            },
+        };
         let attrs = md.file_attributes();
         if raw_name.eq_ignore_ascii_case("desktop.ini") {
             continue;
@@ -396,7 +406,7 @@ pub fn resolve_display_names(
         return;
     }
     let threads = THREADS.min(n);
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     std::thread::scope(|scope| {
         let mut rest = files;
         let mut handles = Vec::new();
@@ -453,7 +463,7 @@ pub fn prewarm_icon_cache(
         return merged;
     }
     let threads = THREADS.min(n);
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for t in 0..threads {
@@ -542,7 +552,7 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
     let raw = sfi2.iIcon as u32;
     let image_index = (raw & 0x00FF_FFFF) as i32;
     let overlay_index = (raw >> 24) & 0xFF;
-    let draw_flags = ILD_TRANSPARENT.0 as u32 | (overlay_index << 8); // INDEXTOOVERLAYMASK
+    let draw_flags = ILD_TRANSPARENT.0 | (overlay_index << 8); // INDEXTOOVERLAYMASK
     const KINDS: [u32; 4] = [
         windows::Win32::UI::Shell::SHIL_LARGE,
         windows::Win32::UI::Shell::SHIL_EXTRALARGE,
@@ -580,7 +590,7 @@ pub fn icon_dump(path: &str, prefix: &str) {
 
     fn save_dump(stem: &str, bgra: &[u8], w: u32, h: u32) {
         use std::io::Write;
-        let data = (w * h * 4) as u32;
+        let data = w * h * 4;
         if let Ok(mut f) = std::fs::File::create(format!("{stem}.bmp")) {
             let _ = f.write_all(&[0x42u8, 0x4D]);
             let _ = f.write_all(&(14u32 + 40 + data).to_le_bytes());
@@ -686,14 +696,14 @@ pub fn icon_dump(path: &str, prefix: &str) {
             if cx.max(cy) as u32 != px {
                 continue; // 只 dump 与桌面图标同档位的结果
             }
-            let flags_overlay = ILD_TRANSPARENT.0 as u32 | (overlay << 8);
+            let flags_overlay = ILD_TRANSPARENT.0 | (overlay << 8);
             if let Ok(icon2) = list.GetIcon(image_index, flags_overlay) {
                 if let Some(b) = crate::render::icon_pixels(icon2, px) {
                     save_dump(&format!("{prefix}_v2_imglist_ovl"), &b, px, px);
                 }
                 let _ = DestroyIcon(icon2);
             }
-            if let Ok(icon3) = list.GetIcon(image_index, ILD_TRANSPARENT.0 as u32) {
+            if let Ok(icon3) = list.GetIcon(image_index, ILD_TRANSPARENT.0) {
                 if let Some(b) = crate::render::icon_pixels(icon3, px) {
                     save_dump(&format!("{prefix}_v3_imglist_base"), &b, px, px);
                 }
@@ -760,7 +770,7 @@ pub fn open_path(path: &str) {
         // SEE_MASK_INVOKEIDLIST(0x0C = DEFAULT|INVOKEIDLIST):用默认动词激活
         info.fMask = 0x000C;
         info.lpFile = PCWSTR::from_raw(w.as_ptr());
-        info.nShow = SW_SHOWNORMAL.0 as i32;
+        info.nShow = SW_SHOWNORMAL.0;
         let _ = ShellExecuteExW(&mut info);
     }
 }
@@ -799,6 +809,23 @@ pub fn open_in_explorer(path: &str) {
     }
 }
 
+/// 用系统默认浏览器打开 URL("检查更新"用):应用进程自身不发起任何
+/// 网络请求,零联网承诺不受影响
+pub fn open_url(url: &str) {
+    let verb = wide("open");
+    let target = wide(url);
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND(0),
+            PCWSTR::from_raw(verb.as_ptr()),
+            PCWSTR::from_raw(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// 追加一个菜单项
 pub fn append_menu(menu: HMENU, id: u32, text: &str) {
     let w = wide(text);
@@ -823,6 +850,20 @@ pub fn append_menu_checked(menu: HMENU, id: u32, text: &str) {
 pub fn append_separator(menu: HMENU) {
     unsafe {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+}
+
+/// 追加一个带勾选标记的弹出式子菜单父项(对钩显示状态+右侧箭头,
+/// 如"✓ 自动分类 ▸"):父项点击只能展开子菜单,不承载命令(Win32 语义)
+pub fn append_submenu_checked(menu: HMENU, text: &str, submenu: HMENU) {
+    let w = wide(text);
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP | MF_CHECKED,
+            submenu.0 as usize,
+            PCWSTR::from_raw(w.as_ptr()),
+        );
     }
 }
 
@@ -871,7 +912,7 @@ fn inject_rename_item(menu: HMENU, ctx: &IContextMenu) {
             return;
         }
         for i in 0..count {
-            let id = GetMenuItemID(menu, i as i32);
+            let id = GetMenuItemID(menu, i);
             if id == DL_ITEM_RENAME_ID {
                 return;
             }
@@ -954,7 +995,6 @@ pub const DL_CMD_REFRESH: u32 = 0x6006;
 pub const DL_CMD_QUIT: u32 = 0x6007;
 /// 渲染模式切换(透明 ↔ 精确)
 pub const DL_CMD_RENDER_MODE: u32 = 0x6009;
-pub const DL_CMD_HELP: u32 = 0x600A;
 
 /// 系统"图标标题"原始 LOGFONT(与 Explorer 桌面文字同源;精确模式 GDI 绘制用)
 pub fn icon_title_logfont() -> Option<LOGFONTW> {
@@ -1104,7 +1144,8 @@ fn verb_is_rename(ctx: &IContextMenu, verb_idx: u32) -> bool {
 /// 用 Unicode 扩展结构执行菜单命令(兼容 Win10+ 现代 verb 与第三方扩展菜单项)。
 /// 优先取字符串 verb(GCS_VERBW,如 "open"/"delete"),跨 shell 版本比数字偏移稳;
 /// 取不到时回退 MAKEINTRESOURCEW(verb_idx)。HRESULT 落盘便于诊断。
-fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32) {
+/// 返回实际下发的 verb 字符串(取不到时 "#idx"),供调用方识别删除类动词。
+fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32) -> String {
     unsafe {
         // 取字符串 verb
         let mut wverb = [0u16; 64];
@@ -1121,7 +1162,7 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
         info.cbSize = size_of::<CMINVOKECOMMANDINFOEX>() as u32;
         info.fMask = CMIC_MASK_UNICODE;
         info.hwnd = hwnd;
-        info.nShow = SW_SHOWNORMAL.0 as i32;
+        info.nShow = SW_SHOWNORMAL.0;
         if has_str {
             info.lpVerbW = PCWSTR::from_raw(wverb.as_ptr());
         } else {
@@ -1142,13 +1183,13 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
             format!("#{}", verb_idx)
         };
         log(&format!("invoke verb '{}' -> hr={:?}", verb_desc, hr));
+        verb_desc
     }
 }
 
 /// 构建与原生桌面一致的"项目"菜单源。优先走桌面 DefView 选中项路线(与
 /// Explorer 右键桌面图标 100% 同源,含视图层"重命名");不可用时退回桌面文件
 /// 夹 GetUIObjectOf(此时补注入"重命名"保持条目一致)。
-
 fn build_item_menu(hwnd: HWND, paths: &[String]) -> Option<(IContextMenu, Vec<*mut ITEMIDLIST>)> {
     // 注:Explorer 的 WM_GETOBJECT 跨进程不回 IShellView,无法直接取 DefView
     // 选中项菜单;走桌面文件夹 GetUIObjectOf 路线 + 注入"重命名"对齐原生。
@@ -1353,7 +1394,15 @@ pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
                 request_rename(path);
             } else {
                 log(&format!("invoking verb_idx={} for {:?}", verb_idx, path));
-                invoke_command(hwnd, &ctx, verb_idx, x, y);
+                let verb = invoke_command(hwnd, &ctx, verb_idx, x, y);
+                // shell 动词在应用背后改动了桌面(典型 delete:文件已被 shell
+                // 移入回收站,2026-09-09 用户实测 hr=Ok 但栅栏图标滞留不散):
+                // 主动重扫让栅栏跟上;删除类再走"主动删除"标记,扫描宽恕当轮
+                // 放行。其余动词经 rescan 的无变化早退,不会引发无谓重绘。
+                if verb.eq_ignore_ascii_case("delete") {
+                    crate::rename::mark_scan_removed(&[path.to_string()]);
+                }
+                crate::ui::rescan();
             }
         }
         free_item_pidls(pidls);
@@ -1492,7 +1541,6 @@ pub fn show_desktop_context_menu(
             return 0;
         };
         append_menu(sub, DL_CMD_ADD_FENCE, "新建栅栏");
-        append_menu(sub, DL_CMD_HELP, "使用说明");
         append_menu(sub, DL_CMD_SHOW_ALL, "显示全部栅栏");
         append_menu(sub, DL_CMD_HIDE_ALL, "隐藏全部栅栏");
         append_menu(sub, DL_CMD_UNDO, "撤销上次布局调整");
@@ -1576,6 +1624,18 @@ fn fallback_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
     }
 }
 
+/// 路径在磁盘上已确认不存在(删除/移走):GetFileAttributesW 返回 INVALID。
+/// 与"read_dir 瞬态漏读"互补——文件仍在盘上时属性查询依然成功,那才是
+/// 扫描宽恕要保护的情形。
+pub fn path_gone_from_disk(path: &str) -> bool {
+    // windows 0.52 未导出 FILE_ATTRIBUTE_INVALID,失败值即 u32::MAX
+    const FILE_ATTR_INVALID: u32 = u32::MAX;
+    let w = wide(path);
+    unsafe {
+        GetFileAttributesW(PCWSTR::from_raw(w.as_ptr())) == FILE_ATTR_INVALID
+    }
+}
+
 /// "打开方式…"对话框
 pub fn open_with(path: &str) {
     let w = wide(path);
@@ -1650,7 +1710,7 @@ pub fn show_properties(path: &str) {
         sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
         sei.lpVerb = PCWSTR::from_raw(op.as_ptr());
         sei.lpFile = PCWSTR::from_raw(w.as_ptr());
-        sei.nShow = SW_SHOWNORMAL.0 as i32;
+        sei.nShow = SW_SHOWNORMAL.0;
         let _ = ShellExecuteExW(&mut sei);
     }
 }
@@ -2085,6 +2145,8 @@ pub fn start_explorer() {
 
 #[cfg(test)]
 mod tests {
+
+
     use super::select_image_size;
 
     #[test]

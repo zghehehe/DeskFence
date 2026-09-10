@@ -1,8 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cats_panel;
+mod drag;
+mod iconcache;
+mod menu;
 mod model;
 mod ole;
+mod rename;
 mod render;
+mod selfheal;
 mod shell;
 mod ui;
 
