@@ -315,6 +315,25 @@
      （website 首屏卡通动画的自包含版，内联全部 keyframes；GitHub README
      经 <img> 引用可正常播放 CSS 动画；校验 XML 合法性要用 XmlDocument.Load，
      PS5.1 Get-Content 会按 GBK 误读 UTF-8 报假错）。
+     **发布说明纪律（2026-09-10 用户要求，长期有效）**：
+     - 版本说明必须**先经用户逐字确认**才能提交/发布，不得先斩后奏。
+     - 说明只写用户可感知的能力与修复；**严禁个人环境信息**——具体
+       软件品牌（会议/输入法/安全软件）、企业/内网字样、内部工程细节
+       （测试数/门禁/发布自动化方式），一律脱敏。公开源码注释同标准
+       （2026-09-10 已清：输入法品牌注释中性化；输入法窗口类名常量
+       属功能必需保留）。
+     - 载体分工：公开 main = 每版本**一个孤儿提交**、标题一行短句
+       （如 "DeskFence v0.1.2"）；全量说明放 annotated tag 注释，
+       workflow 用 `git tag -l --format='%(contents)'` 提取为 Release
+       body（checkout 需 fetch-depth:0 + fetch-tags:true）。不用 commit
+       message 当说明——否则 commits 页与 Release 页双份长文。
+     - 公开 main 重建 = 组装孤儿根 + `git push --force origin main`
+       覆盖（先例 2026-08-28、2026-09-10）；旧版本 v0.1.x tag 锚定
+       各自历史链，源码包与 Release 不受影响。
+     - 发布后 Releases 页可能有残留 Draft（删 tag 会把旧 Release 转
+       Draft；Actions 也可能留草稿）——Draft 永远浮在列表最上方，
+       由用户网页删除；本机无 GitHub API 凭证（无 gh/无 token），
+       Release 增删改只能网页操作。
 8. **ink 常驻渲染（2026-08-26 重构，勿回退）**：精确模式不再"整窗不透明+
    烙壁纸快照"——draw_fence 只铺 1/255 隐形底（ULW 按逐像素 alpha 做命中
    测试，没有它栅栏空白区会点击穿透！），真壁纸从栅栏底下**逐帧透出**
