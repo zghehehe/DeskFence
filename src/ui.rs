@@ -3631,9 +3631,6 @@ fn add_tray_icon(hwnd: HWND) {
 
 fn init_tray() {
     unsafe {
-        // 沉底段分隔窗线程(见 selfheal::spawn_separator_thread 注释):
-        // 隔断菜单宿主与栅栏群的线程连续段,菜单关闭静默沉底不再波及栅栏。
-        spawn_separator_thread();
         // 托盘宿主窗口:1x1、点击穿透的工具窗口。
         // 关键约束 1:必须"可见"才能被 SetForegroundWindow 前台化(隐藏窗口
         // 静默失败→僵尸菜单),1 像素 + WS_EX_TRANSPARENT 视觉与命中都无感。
