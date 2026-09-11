@@ -122,7 +122,7 @@ unsafe extern "system" fn firstrun_wndproc(
     match msg {
         WM_CREATE => {
             let scale = model::dpi_scale();
-            let font = crate::cats_panel::create_dialog_font();
+            let font = crate::cats_panel::create_dialog_font(false);
             let mk = |id: isize, text: &str, style: i32| {
                 let style = WINDOW_STYLE(style as u32);
                 let cls = shell::wide(match id {
@@ -213,7 +213,7 @@ unsafe extern "system" fn firstrun_wndproc(
                             SWP_NOZORDER | SWP_NOACTIVATE,
                         );
                         let _ = DeleteObject(HGDIOBJ(d.font.0));
-                        d.font = crate::cats_panel::create_dialog_font();
+                        d.font = crate::cats_panel::create_dialog_font(false);
                         let f = WPARAM(d.font.0 as usize);
                         for h in [
                             d.intro1, d.intro2, d.head, d.r1, d.r2, d.r3, d.opts_head,
@@ -273,7 +273,7 @@ unsafe fn apply_choices(d: &mut Dialog) {
 }
 
 fn dialog_size(scale: f32) -> (i32, i32) {
-    let w = (470.0 * scale) as i32;
+    let w = (500.0 * scale) as i32;
     let h = (326.0 * scale) as i32;
     (w, h)
 }
@@ -299,19 +299,19 @@ fn layout(hwnd: HWND, d: &mut Dialog) {
     put(d.intro1, pad, y, text_w, wrap_h);
     y += wrap_h + (2.0 * s) as i32;
     put(d.intro2, pad, y, text_w, wrap_h);
-    y += wrap_h + (10.0 * s) as i32;
+    y += wrap_h + (16.0 * s) as i32;
     put(d.head, pad, y, text_w, line_h);
-    y += line_h;
-    put(d.r1, pad, y, text_w, line_h);
-    y += line_h;
-    put(d.r2, pad, y, text_w, line_h);
-    y += line_h;
-    put(d.r3, pad, y, text_w, line_h);
-    y += line_h + (6.0 * s) as i32;
-    put(d.opts_head, pad, y, text_w, line_h);
     y += line_h + (2.0 * s) as i32;
+    put(d.r1, pad, y, text_w, line_h);
+    y += line_h + (2.0 * s) as i32;
+    put(d.r2, pad, y, text_w, line_h);
+    y += line_h + (2.0 * s) as i32;
+    put(d.r3, pad, y, text_w, line_h);
+    y += line_h + (8.0 * s) as i32;
+    put(d.opts_head, pad, y, text_w, line_h);
+    y += line_h + (6.0 * s) as i32;
     put(d.chrome_cb, pad, y, text_w, cb_h);
-    y += cb_h;
+    y += cb_h + (4.0 * s) as i32;
     put(d.autostart_cb, pad, y, text_w, cb_h);
     // OK 按钮右下角
     let bw = (110.0 * s) as i32;
