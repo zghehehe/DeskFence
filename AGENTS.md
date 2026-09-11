@@ -340,6 +340,12 @@
      （website 首屏卡通动画的自包含版，内联全部 keyframes；GitHub README
      经 <img> 引用可正常播放 CSS 动画；校验 XML 合法性要用 XmlDocument.Load，
      PS5.1 Get-Content 会按 GBK 误读 UTF-8 报假错）。
+     **推送前三关（2026-09-11 用户要求，永久纪律）**：任何 push（私有仓
+     或对外仓）之前必须 ① `git status` 工作树干净、本地全为已提交内容；
+     ② `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`
+     + `cargo test --locked` 三绿；③ 对外内容脱敏扫描（grep 个人路径/
+     用户名/品牌词/内网与企业字样，输入法窗口类名常量按既定决策保留），
+     三关全过才允许推。
      **发布说明纪律（2026-09-10 用户要求，长期有效）**：
      - 版本说明必须**先经用户逐字确认**才能提交/发布，不得先斩后奏。
      - 说明只写用户可感知的能力与修复；**严禁个人环境信息**——具体
