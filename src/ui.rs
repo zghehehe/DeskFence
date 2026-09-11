@@ -2808,6 +2808,9 @@ pub fn startup() {
             log(&format!("env-check at boot: ISSUES\n{report}"));
         }
     }
+    // 一次性首启引导(2026-09-11):first_run_done=false 才弹,任何关闭路径
+    // 都写 true;栅栏已呈现、托盘已就绪后出现,不再早于桌面接管
+    crate::firstrun::maybe_show();
 }
 
 /// IDesktopWallpaper 签名的最近值(幻灯片轮换检测)

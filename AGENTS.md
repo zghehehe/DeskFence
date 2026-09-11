@@ -725,8 +725,21 @@
       4.7h。z 走查步数/每秒 IDesktopWallpaper CoCreateInstance 是可观测
       开销，优化走"先加观测日志"路线，勿直接改自愈行为。
     - 文档对齐提交 7b02caf：壁纸兜底 60s→10min、官网"拖边框"→"拖
-      标题栏"、architecture 模块 6→12+清场机制+所有权架构。新增用户
-      可见字符串一律走 src/str.rs 双语表（批次 6 起），勿再硬编码中文。
+      标题栏"、architecture 模块 6→12+清场机制+所有权架构。
+    - **界面双语已落地（2026-09-11，勿回退）**：新增用户可见字符串一律走
+      **src/lang.rs** 双语表（bilingual! 宏成对生成查表函数,勿再硬编码中文;
+      模块名取 lang 不取 str,避免与原语类型混淆）。settings.lang=
+      auto/zh/en（默认 auto=注册表 InstallLanguage 0804 判定），有效语言
+      缓存 lang::EFFECTIVE,启动预热+托盘"语言"菜单切换即时生效（菜单每次
+      现建）。边界：分类名/栅栏标题是用户数据不翻译；config.json 排序值
+      保持中文存储仅显示翻译（menu.rs fence_menu 的 pairs 键值即存储键）。
+    - **一次性首启引导已落地（2026-09-11，勿回退）**：src/firstrun.rs，
+      startup 末尾 first_run_done=false 才弹；**任何关闭路径都写 true**
+      （WM_DESTROY 单一写点,用户约定"最多只出现一次"）。两个开关=常显
+      边框线(show_chrome)/开机自启,初始勾选=当前实际状态,OK 才应用。
+      窗口模式与 cats_panel 同款,USERDATA 清理用"先取指针再清槽"正确序。
+      实测：2026-09-11 17:06 用户勾选边框线并 OK,settings 正确落盘,
+      关窗后日志零异常。
 
 ## 代码位置备忘
 

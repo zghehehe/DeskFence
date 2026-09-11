@@ -154,6 +154,16 @@ bilingual! {
     new_category_base => ("新分类", "New category"),
     seed_desktop_title => ("桌面整理", "Desktop"),
     seed_new_fence_title => ("新栅栏", "New fence"),
+    // ── 一次性首启引导窗(2026-09-11) ──
+    firstrun_title => ("欢迎使用 DeskFence", "Welcome to DeskFence"),
+    firstrun_intro1 => ("桌面图标已按类型归入栅栏;文件本体从未被移动或改名。", "Your desktop icons are now grouped into fences. The files themselves were never moved or renamed."),
+    firstrun_intro2 => ("把鼠标移到图标区域,栅栏的边框和操作手柄会浮现。", "Hover over a fence to reveal its border and handles."),
+    firstrun_rescue_head => ("随时可以一键还原:", "Restore anytime with one click:"),
+    firstrun_rescue1 => ("· 托盘图标右键 → 退出,桌面立即恢复原样", "· Tray icon → Exit restores your desktop instantly"),
+    firstrun_rescue2 => ("· 桌面图标异常时,再次双击 deskfence.exe 即可自救", "· If icons ever look wrong, just run deskfence.exe again to self-rescue"),
+    firstrun_rescue3 => ("· 命令行 deskfence.exe --restore-desktop 无界面恢复", "· Or run deskfence.exe --restore-desktop from a terminal"),
+    firstrun_chrome_cb => ("显示栅栏边框线(便于观察布局)", "Always show fence borders (easier to see the layout)"),
+    firstrun_ok => ("开始使用", "Get started"),
 }
 
 /// 兜底分类名后缀(拼在分类名后):中文无空格贴合,英文留空格

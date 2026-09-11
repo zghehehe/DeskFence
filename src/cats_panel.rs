@@ -604,7 +604,7 @@ fn set_text(h: HWND, s: &str) {
     }
 }
 
-fn create_dialog_font() -> HFONT {
+pub(crate) fn create_dialog_font() -> HFONT {
     unsafe {
         let mut ncm = NONCLIENTMETRICSW {
             cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,

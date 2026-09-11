@@ -1419,6 +1419,10 @@ pub struct Settings {
     /// 分类名/栅栏标题是用户数据,不随语言变。
     #[serde(default = "default_lang")]
     pub lang: String,
+    /// 一次性首启引导(2026-09-11):false=启动末尾弹出引导窗;窗口任何关闭
+    /// 路径(OK/X)都写 true——用户约定"最多只出现一次"。
+    #[serde(default)]
+    pub first_run_done: bool,
     /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
     /// 分类不再自动重建,除非之后出现该类的**新文件**(mtime 晚于删除)。
     /// 防止"删了的栅栏又冒出来"(回收站恒在=软件类恒有文件,mp3 常驻=
@@ -1509,6 +1513,7 @@ impl Default for Settings {
             z_guard: default_z_guard(),
             show_chrome: false,
             lang: default_lang(),
+            first_run_done: false,
             deleted_category_at: Default::default(),
             categories: default_categories(),
         }
@@ -1545,6 +1550,7 @@ pub fn load_settings_from(path: &std::path::Path) -> Settings {
                 z_guard: default_z_guard(),
                 show_chrome: false,
                 lang: default_lang(),
+                first_run_done: false,
                 deleted_category_at: Default::default(),
                 categories: default_categories(),
             }
