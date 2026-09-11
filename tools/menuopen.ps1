@@ -24,7 +24,7 @@ public static class MO {
 "@
 [void][MO]::SetProcessDpiAwarenessContext([IntPtr](-4))
 [MO]::Find()
-# real window over the fence area (the user's ZCode scenario)
+# real window over the fence area (the user's desktop scenario)
 Add-Type -AssemblyName System.Windows.Forms
 $f = New-Object System.Windows.Forms.Form
 $f.Text = "MO-TEST"

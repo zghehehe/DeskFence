@@ -186,7 +186,7 @@
      倒三角/托盘再点桌面有时闪"的根因。托盘 tooltip 为纯 "DeskFence"。
    - **⑤ 终修第二轮（2026-08-27 下午，勿回退）**：
      **浮窗最后入口**：handle_mousemove 拖栅栏时曾 `SetWindowPos(HWND_TOP)`
-     把被拖栅栏顶到全栈顶且松手无人放回="看到过 1 次浮到 ZCode 上"的根源。
+     把被拖栅栏顶到全栈顶且松手无人放回="看到过 1 次浮到其他窗口上"的根源。
      已改：提升只到最高兄弟栅栏之上（ui.rs `drag_elevate_anchor`，band 内）、
      handle_lbuttonup 立即插回 `desktop_insert_after`、自愈豁免被拖者。
      **菜单后点桌面闪的真根源**：菜单开合瞬间系统瞬态窗插进宿主与栅栏 band
