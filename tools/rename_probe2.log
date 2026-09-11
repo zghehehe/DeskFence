@@ -1,6 +1,0 @@
-PROBE-START 11:29:20
-HIT[11:29:20.842] LV @501CC visible=False
-HIT[11:31:05.763] LV @501CC visible=True
-HIT[11:31:10.199] EDIT text='新建 文本文档.txt' rect=(524,123)-(597,159) size=73x36 style=0x540000C5 exstyle=0x0 font=[楍牣獯景?慙效?? h=-18 w=400] chain='Edit@2B80C90 < SysListView32@501CC < SHELLDLL_DefView@421134 < Progman@91148' | chain='Edit@2B80C90 < SysListView32@501CC < SHELLDLL_DefView@421134 < Progman@91148'
-HIT[11:31:17.461] EDIT text='新建 文本文档.txt' rect=(520,123)-(601,239) size=81x116 style=0x540000C5 exstyle=0x0 font=[楍牣獯景?慙效?? h=-18 w=400] chain='Edit@2B80C90 < SysListView32@501CC < SHELLDLL_DefView@421134 < Progman@91148' | chain='Edit@2B80C90 < SysListView32@501CC < SHELLDLL_DefView@421134 < Progman@91148'
-PROBE-END 11:36:21 samples=1336
