@@ -663,6 +663,15 @@
     - **自救脚本**：仓库根 `恢复桌面.bat`（双击=taskkill 卡死实例+新进程
       `--restore-desktop` 恢复图标后退出；延迟用 ping 不用 timeout——
       Git Bash 的 GNU timeout 会抢名）。bat 必须 CRLF、纯 ASCII 内容。
+    - **双击 exe=一键自救（2026-09-11 用户约定语义，勿改）**：启动时
+      `clear_previous_instances()`（main.rs）先给旧实例托盘窗发 WM_CLOSE
+      走 quit_app 完整清理，健康实例毫秒级自退，2s 超时才强杀兜底——
+      **不判健康与否，只有先后顺序**，勿加 IsHungAppWindow 类判定
+      （有误判边界）；`--restore-desktop` 分支同样先清场再恢复（活着的
+      旧实例会把恢复的图标重新藏回，不清场自救无效）。任何启动都收敛到
+      "唯一且健康"的新实例；托盘菜单负责日常退出。单实例靠 pid 枚举
+      （shell::pids_by_name 排除自身），不是 CreateMutex——对卡死实例
+      更鲁棒，勿改。
     - 用户"cmd 里没这个命令"的原因：PowerShell 不搜当前目录，需
       `.\deskfence.exe`；cmd 里需先 cd 到 exe 所在目录。
 
