@@ -700,6 +700,34 @@
     - 用户"cmd 里没这个命令"的原因：PowerShell 不搜当前目录，需
       `.\deskfence.exe`；cmd 里需先 cd 到 exe 所在目录。
 
+16. **维护与加固批次（2026-09-11，勿回退）**：
+    - **cats_panel NCDESTROY 释放死代码已修**（e2a9afd）：旧写法先清
+      GWLP_USERDATA 再经同一槽位 panel_of() 取指针，恒 None，字体与
+      Panel 永不释放=每次开"管理分类"面板漏 1 个 GDI 字体+1 块堆。
+      正确序=先取指针→立即清槽（保留 EN_KILLFOCUS 空转防护）→再释放。
+      审此类 bug 的教训：**"先清再读同一来源"必然取空**，注释说的防护
+      要看它实际保护的是哪次访问。
+    - **CI 工具链已 pin 1.97.0**（8ccf615，ci.yml 用
+      `dtolnay/rust-toolchain@1.97.0` 替代 @stable）。**勿改回
+      rust-toolchain.toml 方案**：本机 rustup 的显式 `1.97.0` 目录残缺
+      （`rustup show` 报 "Missing manifest"，疑似非标准渠道装的），
+      pin 文件一激活它本地 cargo 直接报错；日常可用的是 default 的
+      `stable`（当前恰好=1.97.0）。本地 stable 升级时**主动**同步 CI
+      的 pin 版本号。fmt 尚不干净，`cargo fmt --check` 门禁未加
+      （加了会全库大 diff）——待办：单独一次 format 提交后再上门禁。
+    - **panic 语义结论（修正旧审计判断）**：wndproc 是 extern "system"，
+      Rust 在 FFI 边界的 panic=直接 abort，进程当场死——不是"锁中毒
+      僵尸进程"。现有 fail-fast + icons_marker + 自启动兜底即可接受；
+      锁中毒兜底（state() 换 unwrap_or_else(PoisonError::into_inner)）
+      降级为可选决策，做前先拍板"带毒继续 vs 快速失败"。
+    - **实测资源基线（2026-09-11，办公负载 PPT 前台）**：67MB 内存、
+      0.08% CPU（22 核≈单核 1.8%）、句柄 548 且 15s 零增长、连续运行
+      4.7h。z 走查步数/每秒 IDesktopWallpaper CoCreateInstance 是可观测
+      开销，优化走"先加观测日志"路线，勿直接改自愈行为。
+    - 文档对齐提交 7b02caf：壁纸兜底 60s→10min、官网"拖边框"→"拖
+      标题栏"、architecture 模块 6→12+清场机制+所有权架构。新增用户
+      可见字符串一律走 src/str.rs 双语表（批次 6 起），勿再硬编码中文。
+
 ## 代码位置备忘
 
 - 渲染：src/render.rs（ink 常驻：透明底+1/255 隐形命中层+seeded GDI 文字；
