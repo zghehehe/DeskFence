@@ -511,7 +511,6 @@ fn set_align_mode(mode: &str) {
     refresh_all_fences();
 }
 
-#[allow(dead_code)]
 /// 一键退出：删除托盘图标、恢复桌面图标、结束消息循环，栅栏窗口随之消失，桌面恢复原样
 pub fn quit_app() {
     log("quit requested");

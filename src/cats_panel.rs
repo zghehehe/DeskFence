@@ -256,9 +256,12 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            // 先清 USERDATA 再释放:此后子窗口销毁触发的 EN_KILLFOCUS 会安全空转
+            // 先取出面板指针、立刻清 USERDATA:此后子窗口销毁触发的 EN_KILLFOCUS
+            // 经 panel_of 拿到 None 安全空转;释放放在清空之后,保证真正执行
+            // (旧写法先清再读同一槽位,释放分支永不执行=每次开面板漏一个字体+一块堆)。
+            let panel = panel_of(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            if let Some(p) = panel_of(hwnd) {
+            if let Some(p) = panel {
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(p.font.0));
                 }
