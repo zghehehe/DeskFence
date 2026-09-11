@@ -45,7 +45,7 @@ fn class_name() -> PCWSTR {
     PCWSTR::from_raw(v.as_ptr())
 }
 
-fn tray_class_name() -> PCWSTR {
+pub(crate) fn tray_class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
     let v = W.get_or_init(|| "DeskFenceTray\0".encode_utf16().collect());
     PCWSTR::from_raw(v.as_ptr())
