@@ -277,7 +277,21 @@
      bandwalk2.ps1 可打印自家窗口在链上的精确步位（bandwalk.ps1 是前 30
      步简版）。repair FAILED 日志（错误码+锚点）保留，防再次出现"修复
      静默无效"无处下手。
-   - **⑦ 公开发布流程（GitHub）**：公开仓库只含必要代码——src/、Cargo.*、
+   - **⑦ 公开发布流程（GitHub）**：
+     **双仓架构（2026-09-11 起，勿回退）**：origin =
+     zghehehe/DeskFence-private（**私有仓，永不公开**，单分支 master
+     含全部历史/AGENTS.md/tools/docs/website，日常开发推送默认去这里）；
+     public = zghehehe/DeskFence（**对外发布仓**，远程只有 main 分支 +
+     v0.1.x tag + Releases；2026-09-11 已删除其远程 master，副本在私仓
+     与本地）。**防呆教训（2026-09-11 用户点破）：GitHub 仓库转 Public
+     后所有分支与全部提交历史任何人可克隆浏览，"主页默认展示 main"
+     不提供任何隐私保护——master 绝不能推到对外仓**（含内部细节的
+     中文提交史会被一起公开）。对外仓现仍 Private（用户决定暂不转
+     公开），转公开时机由用户网页操作；转公开后验证：匿名访问只见
+     main、releases/latest/download/deskfence.exe 直链可用。发布动作 =
+     组装 main（见下）后 `git push public main` + `git push public <v* tag>`
+     （tag 推到 public 触发 Actions build+Release）。
+     公开仓库只含必要代码——src/、Cargo.*、
      build.rs、DeskFence.rc、app.manifest、assets/deskfence.ico、
      resources/deskfence.res、README、LICENSE、.gitignore、
      .cargo/config.toml（crt-static 单文件）、.github/workflows/release.yml。
@@ -295,14 +309,16 @@
      **组装后必须 `diff <(git ls-tree -r --name-only v0.1.0) <(git ls-tree -r --name-only main)`
      核对文件清单**——2026-08-31 v0.1.1 按旧列表漏了 deskfence-icon.svg,README
      图标 404,被迫重写 main 历史。新加 README 引用的文件时同步更新此列表。
-     打 tag v* 推送后 Actions 自动 build+单文件校验+发 Release。
+     打 tag v* 推到 public 后 Actions 自动 build+单文件校验+发 Release。
      crt-static 经 .cargo/config.toml 全局生效（exe 仅依赖系统库）。
      **官网**：website/index.html 是单文件官网（内联 SVG 动画、零依赖），
      含下载(直链 releases/latest/download/deskfence.exe)/隐私/支持三节。
      发布= tools/deploy-site.sh → 推到独立公开仓库 zghehehe.github.io
      （GitHub 用户主页域名 https://zghehehe.github.io）。代码仓保持纯净，
-     site 与代码彻底分离。注意：代码仓 Private 期间官网下载/源码链接
-     对外 404——公开推广前先把 DeskFence 仓库转 Public。
+     site 与代码彻底分离。注意：**zghehehe.github.io 尚未创建**
+     （2026-09-11 实测 404，deploy-site.sh 保留待用）；对外仓 Private
+     期间官网下载/源码链接对外 404——公开推广前先把 zghehehe/DeskFence
+     转 Public（转公开前提=双仓架构已落地、远程无 master）。
      GitHub 提交身份一律中性：zghehehe + zghehehe@users.noreply.github.com
      （publish/deploy 脚本内已强制 env，勿用工作身份提交公开内容）。
      **main 历史已于 2026-08-28 强制重写**（旧根含 README 占位符低级错误）：
@@ -330,7 +346,7 @@
        必须显式 `git fetch --force origin refs/tags/<tag>:refs/tags/<tag>`
        重取 tag 对象后 `git cat-file tag <tag> | sed '1,/^$/d'` 剥头。
        不用 commit message 当说明——否则 commits 页与 Release 页双份长文。
-     - 公开 main 重建 = 组装孤儿根 + `git push --force origin main`
+     - 公开 main 重建 = 组装孤儿根 + `git push --force public main`
        覆盖（先例 2026-08-28、2026-09-10）；旧版本 v0.1.x tag 锚定
        各自历史链，源码包与 Release 不受影响。
      - 发布后 Releases 页可能有残留 Draft（删 tag 会把旧 Release 转

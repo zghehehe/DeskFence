@@ -9,16 +9,18 @@
 #
 # 首次使用前(一次性):
 #   1) GitHub 建空仓库(不勾任何初始化选项)
-#   2) git remote add origin git@github.com:zghehehe/DeskFence.git
+#   2) git remote add public git@github.com:zghehehe/DeskFence.git
+# 双仓架构(2026-09-11): origin=私有仓 DeskFence-private(永不公开,日常开发);
+# public=对外发布仓 DeskFence(只有 main + v* tag;master 绝不推到 public)。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TAG="${1:-}"
-REMOTE="origin"
+REMOTE="public"
 
 git remote get-url "$REMOTE" >/dev/null 2>&1 || {
   echo "!! 还没有配置 $REMOTE。先执行:"
-  echo "   git remote add origin git@github.com:zghehehe/DeskFence.git"
+  echo "   git remote add public git@github.com:zghehehe/DeskFence.git"
   exit 1
 }
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -50,12 +52,12 @@ rm -f .git/pub-idx
 
 echo "==> main 已更新: $(git rev-parse --short main)"
 echo "==> 推送 main ..."
-git push -u origin main
+git push -u public main
 
 if [ -n "$TAG" ]; then
   git tag -f "$TAG" main
   echo "==> 推送 tag $TAG (Actions 将自动构建并发布 Release) ..."
-  git push origin "$TAG"
+  git push public "$TAG"
   echo "==> 完成。进度看 GitHub 仓库的 Actions 页;产物在 Releases 页。"
 else
   echo "==> 完成(未发版)。要发版请带版本号重跑, 如: tools/publish-to-github.sh v0.1.1"
