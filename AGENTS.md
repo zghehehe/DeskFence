@@ -735,11 +735,17 @@
       保持中文存储仅显示翻译（menu.rs fence_menu 的 pairs 键值即存储键）。
     - **一次性首启引导已落地（2026-09-11，勿回退）**：src/firstrun.rs，
       startup 末尾 first_run_done=false 才弹；**任何关闭路径都写 true**
-      （WM_DESTROY 单一写点,用户约定"最多只出现一次"）。两个开关=常显
-      边框线(show_chrome)/开机自启,初始勾选=当前实际状态,OK 才应用。
+      （WM_DESTROY 单一写点,用户约定"最多只出现一次"）。**两个开关默认
+      勾选开启**（常显边框线/开机自启,2026-09-11 用户定案:新装即见边框+
+      常驻自启,窗内可取消），OK 时与当前实际状态比对,有变化才落盘。
       窗口模式与 cats_panel 同款,USERDATA 清理用"先取指针再清槽"正确序。
-      实测：2026-09-11 17:06 用户勾选边框线并 OK,settings 正确落盘,
-      关窗后日志零异常。
+      实测：2026-09-11 17:06 用户实测全链路,settings 正确落盘。
+    - **许可已改 GPL-3.0 + 商业授权双许可（2026-09-11，勿回退 MIT）**：
+      LICENSE = 双许可声明（开源 GPL-3.0-or-later / 闭源等场景走
+      GitHub Issues 协商商业授权）+ GPL 全文；Cargo.toml 用
+      license-file（因非纯 SPDX 单许可）；README 徽章与 License 节、
+      官网"源码"按钮与 FAQ 已同步。公开 main 的 LICENSE 随下次 publish
+      一并替换（README 徽章指 shields.io,对外仓转 Public 后星数生效）。
 
 ## 代码位置备忘
 
