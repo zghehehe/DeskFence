@@ -162,7 +162,9 @@ bilingual! {
     firstrun_rescue1 => ("· 托盘图标右键 → 退出,桌面立即恢复原样", "· Tray icon → Exit restores your desktop instantly"),
     firstrun_rescue2 => ("· 桌面图标异常时,再次双击 deskfence.exe 即可自救", "· If icons ever look wrong, just run deskfence.exe again to self-rescue"),
     firstrun_rescue3 => ("· 命令行 deskfence.exe --restore-desktop 无界面恢复", "· Or run deskfence.exe --restore-desktop from a terminal"),
-    firstrun_chrome_cb => ("显示栅栏边框线(便于观察布局)", "Always show fence borders (easier to see the layout)"),
+    firstrun_opts_head => ("以下推荐项已默认勾选,不需要请取消:", "The recommended options below are pre-checked; uncheck any you don't want:"),
+    firstrun_chrome_cb => ("默认显示栅栏边框线(可随时在托盘菜单关闭)", "Show fence borders by default (toggle anytime from the tray menu)"),
+    firstrun_autostart_cb => ("默认开机自启(可随时在托盘菜单关闭)", "Start with Windows by default (toggle anytime from the tray menu)"),
     firstrun_ok => ("开始使用", "Get started"),
 }
 

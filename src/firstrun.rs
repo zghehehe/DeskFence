@@ -18,7 +18,6 @@ use crate::{model, shell, ui};
 
 /// STATIC/BUTTON 样式与状态常量(windows 0.52 未导出,手写;同 EM_SETSEL 先例)
 const SS_LEFT: i32 = 0x0000;
-const BST_UNCHECKED: u32 = 0x0000;
 const BST_CHECKED: u32 = 0x0001;
 
 static DIALOG_HWND: Mutex<Option<HWND>> = Mutex::new(None);
@@ -34,6 +33,7 @@ const IDC_R3: isize = 0x315;
 const IDC_CHROME: isize = 0x316;
 const IDC_AUTOSTART: isize = 0x317;
 const IDC_OK: isize = 0x318;
+const IDC_OPTS_HEAD: isize = 0x319;
 
 struct Dialog {
     intro1: HWND,
@@ -42,6 +42,7 @@ struct Dialog {
     r1: HWND,
     r2: HWND,
     r3: HWND,
+    opts_head: HWND,
     chrome_cb: HWND,
     autostart_cb: HWND,
     ok_btn: HWND,
@@ -152,8 +153,9 @@ unsafe extern "system" fn firstrun_wndproc(
             let r1 = mk(IDC_R1, crate::lang::firstrun_rescue1(), SS_LEFT);
             let r2 = mk(IDC_R2, crate::lang::firstrun_rescue2(), SS_LEFT);
             let r3 = mk(IDC_R3, crate::lang::firstrun_rescue3(), SS_LEFT);
+            let opts_head = mk(IDC_OPTS_HEAD, crate::lang::firstrun_opts_head(), SS_LEFT);
             let chrome_cb = mk(IDC_CHROME, crate::lang::firstrun_chrome_cb(), BS_AUTOCHECKBOX);
-            let autostart_cb = mk(IDC_AUTOSTART, crate::lang::autostart(), BS_AUTOCHECKBOX);
+            let autostart_cb = mk(IDC_AUTOSTART, crate::lang::firstrun_autostart_cb(), BS_AUTOCHECKBOX);
             let ok_btn = mk(IDC_OK, crate::lang::firstrun_ok(), BS_DEFPUSHBUTTON);
             let mut d = Box::new(Dialog {
                 intro1,
@@ -162,36 +164,20 @@ unsafe extern "system" fn firstrun_wndproc(
                 r1,
                 r2,
                 r3,
+                opts_head,
                 chrome_cb,
                 autostart_cb,
                 ok_btn,
                 font,
                 scale,
             });
-            // 开关初始态=当前实际状态(不改默认行为,只把选择摆出来)
+            // 两项默认勾选开启(2026-09-11 用户定案):新装即见边框、常驻自启,
+            // 用户在窗内取消即不启用;OK 时与当前实际状态比对,有变化才落盘
             unsafe {
-                let _ = SendMessageW(
-                    chrome_cb,
-                    BM_SETCHECK,
-                    WPARAM(if ui::chrome_always_on() {
-                        BST_CHECKED as usize
-                    } else {
-                        BST_UNCHECKED as usize
-                    }),
-                    LPARAM(0),
-                );
-                let _ = SendMessageW(
-                    autostart_cb,
-                    BM_SETCHECK,
-                    WPARAM(if shell::get_autostart() {
-                        BST_CHECKED as usize
-                    } else {
-                        BST_UNCHECKED as usize
-                    }),
-                    LPARAM(0),
-                );
+                let _ = SendMessageW(chrome_cb, BM_SETCHECK, WPARAM(BST_CHECKED as usize), LPARAM(0));
+                let _ = SendMessageW(autostart_cb, BM_SETCHECK, WPARAM(BST_CHECKED as usize), LPARAM(0));
                 let f = WPARAM(d.font.0 as usize);
-                for h in [intro1, intro2, head, r1, r2, r3, chrome_cb, autostart_cb, ok_btn] {
+                for h in [intro1, intro2, head, r1, r2, r3, opts_head, chrome_cb, autostart_cb, ok_btn] {
                     let _ = SendMessageW(h, WM_SETFONT, f, LPARAM(1));
                 }
             }
@@ -230,8 +216,8 @@ unsafe extern "system" fn firstrun_wndproc(
                         d.font = crate::cats_panel::create_dialog_font();
                         let f = WPARAM(d.font.0 as usize);
                         for h in [
-                            d.intro1, d.intro2, d.head, d.r1, d.r2, d.r3, d.chrome_cb,
-                            d.autostart_cb, d.ok_btn,
+                            d.intro1, d.intro2, d.head, d.r1, d.r2, d.r3, d.opts_head,
+                            d.chrome_cb, d.autostart_cb, d.ok_btn,
                         ] {
                             let _ = SendMessageW(h, WM_SETFONT, f, LPARAM(1));
                         }
@@ -288,7 +274,7 @@ unsafe fn apply_choices(d: &mut Dialog) {
 
 fn dialog_size(scale: f32) -> (i32, i32) {
     let w = (470.0 * scale) as i32;
-    let h = (302.0 * scale) as i32;
+    let h = (326.0 * scale) as i32;
     (w, h)
 }
 
@@ -321,7 +307,9 @@ fn layout(hwnd: HWND, d: &mut Dialog) {
     put(d.r2, pad, y, text_w, line_h);
     y += line_h;
     put(d.r3, pad, y, text_w, line_h);
-    y += line_h + (10.0 * s) as i32;
+    y += line_h + (6.0 * s) as i32;
+    put(d.opts_head, pad, y, text_w, line_h);
+    y += line_h + (2.0 * s) as i32;
     put(d.chrome_cb, pad, y, text_w, cb_h);
     y += cb_h;
     put(d.autostart_cb, pad, y, text_w, cb_h);
