@@ -325,6 +325,13 @@ const WM_IME_COMPOSITION: u32 = 0x010F;
 const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
 static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
 pub(crate) static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// 提交防重入门闩:回车/失焦/WM_ACTIVATE/点击外部轮询可在同一帧叠加多条
+/// 提交消息,重入会对同一编辑框提交两次。历史上失败路径的模态 MessageBox
+/// 弹出→编辑框失焦→自动提交路径 Post 新提交→模态循环把新提交分发→重入
+/// 失败→再弹框……同秒几十次 commit/failed 占死 UI 线程(2026-09-11 用户
+/// 实测"回车即卡死"),模态框删除后此门闩继续兜住多源叠加。
+static FILE_RENAME_COMMITTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// 改名提交后置位:rescan 的"无变化早退"必须跳过一次。改名提交已把内存
 /// 文件列表同步到新路径/新分类,磁盘扫描结果与内存全一致,任何 diff 都看
 /// 不出变化——但新分类缺栅栏时 ensure_missing_category_fences 必须跑一遍,
@@ -614,8 +621,47 @@ unsafe extern "system" fn file_rename_edit_proc(
             adjust_rename_edit_height(hwnd);
             return LRESULT(0);
         }
-        WM_CHAR | WM_PASTE => {
+        WM_CHAR => {
+            if matches!(wparam.0 as u32, 0x0D | 0x0A) {
+                // 多行 EDIT 的换行最终经 WM_CHAR 落进文本——回车必须在此
+                // 兜住(WM_KEYDOWN 已拦,但 IME/前台转移等路径可能把回车直接
+                // 以 WM_CHAR 形式送达;2026-09-11 实测漏网一次=文件名里混进
+                // 换行触发后续失败循环)
+                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                return LRESULT(0);
+            }
             // 多行重命名(与原生一致):输入/粘贴后按实际换行行数增高编辑框
+            let r = CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(old)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            );
+            adjust_rename_edit_height(hwnd);
+            return r;
+        }
+        WM_PASTE => {
+            // 与原生一致:粘贴文本的换行折叠成空格、其余控制字符剔除——
+            // 多行 EDIT 直接接纳粘贴会把非法换行带进文件名
+            if let Some(raw) = sanitized_clipboard_text() {
+                let clean = collapse_for_filename(&raw);
+                if !clean.is_empty() {
+                    const EM_REPLACESEL: u32 = 0x00C2;
+                    let w = shell::wide(&clean);
+                    let _ = SendMessageW(
+                        hwnd,
+                        EM_REPLACESEL,
+                        WPARAM(1),
+                        LPARAM(w.as_ptr() as isize),
+                    );
+                }
+                adjust_rename_edit_height(hwnd);
+                return LRESULT(0);
+            }
             let r = CallWindowProcW(
                 Some(std::mem::transmute::<
                     isize,
@@ -875,119 +921,211 @@ fn adjust_rename_edit_height(edit: HWND) {
 }
 
 fn commit_file_rename(edit: HWND) {
-    log("file rename commit");
-    let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
-    let mut renamed = false;
-    let mut migration: Option<(String, u32, f32, f32)> = None;
-    if !old_path.is_empty() {
-        let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
-        let mut buf = vec![0u16; len + 1];
-        unsafe {
-            let _ = GetWindowTextW(edit, &mut buf);
-        }
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let new_name = String::from_utf16_lossy(&buf[..end]).trim().to_string();
-        let old_name = std::path::Path::new(&old_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        // 与 Explorer 相同的非法字符集合;空名/原名不动
-        let invalid = new_name.is_empty()
-            || new_name == old_name
-            || new_name
-                .chars()
-                .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
-        if !invalid {
-            renamed = shell::rename_path(&old_path, &new_name);
-        }
-        if renamed {
-            // 同步被拖入栅栏的 pinned 引用,指向新路径
-            let new_path = std::path::Path::new(&old_path)
-                .parent()
-                .map(|p| p.join(&new_name).to_string_lossy().to_string())
-                .unwrap_or_else(|| old_path.clone());
-            let mut s = state().lock().unwrap();
-            for f in s.fences.iter_mut() {
-                for p in f.pinned.iter_mut().chain(f.item_order.iter_mut()) {
-                    if *p == old_path {
-                        *p = new_path.clone();
-                    }
-                }
-            }
-            if s.selected_paths.remove(&old_path) {
-                s.selected_paths.insert(new_path.clone());
-            }
-            if s.focused_path.as_deref() == Some(&old_path) {
-                s.focused_path = Some(new_path.clone());
-            }
-            if s.selection_anchor.as_deref() == Some(&old_path) {
-                s.selection_anchor = Some(new_path.clone());
-            }
-            // 同步内存文件列表(2026-09-02,与原生一致):改名立即生效,不等
-            // 异步 rescan——消除"改名后双击旧路径(已不存在)"的窗口期。
-            // category 必须随名重算(2026-09-03):txt 改名 mp4 后分类仍是
-            // 旧值的话文件会永远留在原分类栅栏里;且下面的 rescan 早退
-            // 只比路径,内存已同步路径后它必然早退,分类永远不会再算
-            let old_cat = s
-                .files
-                .iter()
-                .find(|f| f.path == old_path)
-                .map(|f| (f.category.clone(), f.is_dir));
-            let new_cat = model::categorize(
-                &new_name,
-                old_cat.as_ref().map(|(_, d)| *d).unwrap_or(false),
-            );
-            let cat_changed = old_cat.as_ref().is_some_and(|(c, _)| *c != new_cat);
-            if cat_changed {
-                // 用户主动把文件改名进某分类=明确意图,先清该分类墓碑:
-                // 墓碑的"新文件"判定只看 mtime(改名不变 mtime),不清理的话
-                // 墓碑挡住缺类补建,文件无栏可归=隐身(2026-09-03 用户实测
-                // md→mp3 后媒体栅栏不建、文件失踪)
-                clear_category_tombstone(&new_cat);
-                // 迁移动画起点:必须在分类同步前抓取旧栏旧槽位
-                // (auto_scroll=false:不为起飞而滚动旧栏)
-                migration = fence_slot_screen_pos(&mut s, &old_path, false)
-                    .map(|(fid, p)| (new_path.clone(), fid, p.0, p.1));
-            }
-            for f in s.files.iter_mut() {
-                if f.path == old_path {
-                    f.path = new_path.clone();
-                    f.name = new_name.clone();
-                    f.category = new_cat.clone();
-                }
-            }
-        } else if !invalid {
-            log(&format!("file rename failed: {} -> {}", old_path, new_name));
-            let title = shell::wide("重命名失败");
-            let text = shell::wide("无法重命名该项目。目标名称可能已存在，或者文件正在使用中。");
-            unsafe {
-                let _ = MessageBoxW(
-                    edit,
-                    PCWSTR::from_raw(text.as_ptr()),
-                    PCWSTR::from_raw(title.as_ptr()),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
+    // 防重入:同一帧叠加的多条提交只处理第一条(见 FILE_RENAME_COMMITTING)
+    if FILE_RENAME_COMMITTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let outcome = commit_file_rename_once(edit);
+    FILE_RENAME_COMMITTING.store(false, std::sync::atomic::Ordering::Release);
+    if outcome.renamed {
+        // 内存已同步,磁盘扫描与内存一致,rescan_now 的 diff 必为空——
+        // 置强制位让缺类补建跑一遍(改名成 mp4 要能冒出媒体栅栏)
+        RENAME_RESCAN_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        // 同步版 rescan:调用返回即应用完毕(异步版无法保证下面迁移动画的
+        // 排队顺序:目标分类栅栏必须已就位)
+        rescan_now();
+        // 跨栏迁移动画必须在扫描应用之后排队:目标分类栅栏(可能新建)已
+        // 就位、新栏帧已渲染,这里排队并刷新新栏把成员藏到落地显形
+        if let Some((new_path, old_fid, fx, fy)) = outcome.migration {
+            queue_migration_animations(&[(new_path, old_fid, fx, fy)]);
         }
     }
+}
+
+struct CommitOutcome {
+    renamed: bool,
+    migration: Option<(String, u32, f32, f32)>,
+}
+
+/// 失败/非法名的非阻塞处置(与原生 Explorer 同款):响系统错误音、编辑框
+/// 保持打开并全选,用户改完可再提交,Esc 取消。**绝不能用模态 MessageBox**:
+/// 弹框令编辑框失焦→自动提交路径 Post 新提交→模态循环分发→重入失败→
+/// 再弹框的自激死循环(2026-09-11 卡死根因)。
+fn rename_failure_feedback(edit: HWND) {
+    use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+    unsafe {
+        let _ = MessageBeep(MB_ICONERROR);
+        let _ = SetFocus(edit);
+        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+    }
+}
+
+fn destroy_file_rename_edit(edit: HWND) {
     uninstall_rename_mouse_hook();
     unsafe {
         let _ = KillTimer(edit, RENAME_FIT_TIMER);
         let _ = DestroyWindow(edit);
     }
-    if renamed {
-        // 内存已同步,磁盘扫描与内存一致,rescan_now 的 diff 必为空——
-        // 置强制位让缺类补建跑一遍(改名成 mp4 要能冒出媒体栅栏)
-        RENAME_RESCAN_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
+    log("file rename commit");
+    let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
+    if old_path.is_empty() {
+        destroy_file_rename_edit(edit);
+        return CommitOutcome { renamed: false, migration: None };
     }
-    // 同步版 rescan:调用返回即应用完毕(异步版无法保证下面迁移动画的
-    // 排队顺序:目标分类栅栏必须已就位)
-    rescan_now();
-    // 跨栏迁移动画必须在扫描应用之后排队:目标分类栅栏(可能新建)已就位、
-    // 新栏帧已渲染,这里排队并刷新新栏把成员藏到落地显形
-    if let Some((new_path, old_fid, fx, fy)) = migration {
-        queue_migration_animations(&[(new_path, old_fid, fx, fy)]);
+    let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
+    let mut buf = vec![0u16; len + 1];
+    unsafe {
+        let _ = GetWindowTextW(edit, &mut buf);
     }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let new_name = String::from_utf16_lossy(&buf[..end]).trim().to_string();
+    let old_name = std::path::Path::new(&old_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 空名/没改:关闭编辑框,桌面状态不动(与原生一致)
+    if new_name.is_empty() || new_name == old_name {
+        destroy_file_rename_edit(edit);
+        return CommitOutcome { renamed: false, migration: None };
+    }
+    // 与 Explorer 相同的非法字符集合,外加全部控制字符(\n\r\t 等——
+    // NTFS 文件名禁控制字符,漏检会走到 rename 必败路径)
+    let invalid = new_name
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
+    if invalid {
+        log(&format!("file rename rejected (illegal chars): {new_name}"));
+        rename_failure_feedback(edit);
+        return CommitOutcome { renamed: false, migration: None };
+    }
+    let renamed = shell::rename_path(&old_path, &new_name);
+    if !renamed {
+        log(&format!("file rename failed: {old_path} -> {new_name}"));
+        rename_failure_feedback(edit);
+        return CommitOutcome { renamed: false, migration: None };
+    }
+    // 同步被拖入栅栏的 pinned 引用,指向新路径
+    let new_path = std::path::Path::new(&old_path)
+        .parent()
+        .map(|p| p.join(&new_name).to_string_lossy().to_string())
+        .unwrap_or_else(|| old_path.clone());
+    let mut migration: Option<(String, u32, f32, f32)> = None;
+    {
+        let mut s = state().lock().unwrap();
+        for f in s.fences.iter_mut() {
+            for p in f.pinned.iter_mut().chain(f.item_order.iter_mut()) {
+                if *p == old_path {
+                    *p = new_path.clone();
+                }
+            }
+        }
+        if s.selected_paths.remove(&old_path) {
+            s.selected_paths.insert(new_path.clone());
+        }
+        if s.focused_path.as_deref() == Some(&old_path) {
+            s.focused_path = Some(new_path.clone());
+        }
+        if s.selection_anchor.as_deref() == Some(&old_path) {
+            s.selection_anchor = Some(new_path.clone());
+        }
+        // 同步内存文件列表(2026-09-02,与原生一致):改名立即生效,不等
+        // 异步 rescan——消除"改名后双击旧路径(已不存在)"的窗口期。
+        // category 必须随名重算(2026-09-03):txt 改名 mp4 后分类仍是
+        // 旧值的话文件会永远留在原分类栅栏里;且下面的 rescan 早退
+        // 只比路径,内存已同步路径后它必然早退,分类永远不会再算
+        let old_cat = s
+            .files
+            .iter()
+            .find(|f| f.path == old_path)
+            .map(|f| (f.category.clone(), f.is_dir));
+        let new_cat = model::categorize(
+            &new_name,
+            old_cat.as_ref().map(|(_, d)| *d).unwrap_or(false),
+        );
+        let cat_changed = old_cat.as_ref().is_some_and(|(c, _)| *c != new_cat);
+        if cat_changed {
+            // 用户主动把文件改名进某分类=明确意图,先清该分类墓碑:
+            // 墓碑的"新文件"判定只看 mtime(改名不变 mtime),不清理的话
+            // 墓碑挡住缺类补建,文件无栏可归=隐身(2026-09-03 用户实测
+            // md→mp3 后媒体栅栏不建、文件失踪)
+            clear_category_tombstone(&new_cat);
+            // 迁移动画起点:必须在分类同步前抓取旧栏旧槽位
+            // (auto_scroll=false:不为起飞而滚动旧栏)
+            migration = fence_slot_screen_pos(&mut s, &old_path, false)
+                .map(|(fid, p)| (new_path.clone(), fid, p.0, p.1));
+        }
+        for f in s.files.iter_mut() {
+            if f.path == old_path {
+                f.path = new_path.clone();
+                f.name = new_name.clone();
+                f.category = new_cat.clone();
+            }
+        }
+    }
+    destroy_file_rename_edit(edit);
+    CommitOutcome { renamed: true, migration }
+}
+
+/// 读取剪贴板 CF_UNICODETEXT;取不到返回 None(调用方回落默认粘贴行为)
+fn sanitized_clipboard_text() -> Option<String> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let text = (|| {
+            let h = GetClipboardData(CF_UNICODETEXT).ok()?;
+            let hg = HGLOBAL(h.0 as *mut core::ffi::c_void);
+            let p = GlobalLock(hg) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+/// 粘贴清洗(与原生一致):换行/制表折叠为单个空格,其余控制字符剔除
+fn collapse_for_filename(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        let mapped = if matches!(c, '\r' | '\n' | '\t') {
+            Some(' ')
+        } else if c.is_control() {
+            None
+        } else {
+            Some(c)
+        };
+        match mapped {
+            Some(' ') => {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            Some(c) => {
+                out.push(c);
+                prev_space = false;
+            }
+            None => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 fn cancel_file_rename(edit: HWND) {

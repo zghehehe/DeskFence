@@ -45,7 +45,7 @@ fn class_name() -> PCWSTR {
     PCWSTR::from_raw(v.as_ptr())
 }
 
-fn tray_class_name() -> PCWSTR {
+pub(crate) fn tray_class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
     let v = W.get_or_init(|| "DeskFenceTray\0".encode_utf16().collect());
     PCWSTR::from_raw(v.as_ptr())
@@ -1106,7 +1106,9 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
         match shell::capture_window_pixels(host.hwnd) {
             Ok((px, w, ph)) => {
                 let all_dark = px
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .take(4096)
                     .all(|c| c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 255);
                 if all_dark && w > 64 && ph > 64 {
@@ -1251,7 +1253,7 @@ fn px_differs(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return true;
     }
-    for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+    for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
         if pa[0].abs_diff(pb[0]) > 8
             || pa[1].abs_diff(pb[1]) > 8
             || pa[2].abs_diff(pb[2]) > 8

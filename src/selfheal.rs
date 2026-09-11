@@ -206,7 +206,7 @@ const DEFAULT_IME_CLASS: [u16; 11] = [
     0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
 ]; // "Default IME"
    // 第三方输入法 TSF 基础设施窗组沿用同一辅助窗语义。
-const SOGOU_IME_CLASS: [u16; 3] = [0x49, 0x4D, 0x45]; // "IME"
+const GENERIC_IME_CLASS: [u16; 3] = [0x49, 0x4D, 0x45]; // "IME"
 const SOIME_TSF_CLASS: [u16; 14] = [
     0x53, 0x6F, 0x49, 0x6D, 0x65, 0x42, 0x53, 0x5F, 0x54, 0x53, 0x46, 0x5F, 0x55, 0x49,
 ]; // "SoImeBS_TSF_UI"
@@ -245,7 +245,7 @@ fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
         || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
         || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
         || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
-        || (n == 3 && cls_buf[..3] == SOGOU_IME_CLASS)
+        || (n == 3 && cls_buf[..3] == GENERIC_IME_CLASS)
         || (n == 14 && cls_buf[..14] == SOIME_TSF_CLASS)
         || (n == 7 && cls_buf[..7] == SOBS_UI_CLASS)
         || (n == 9 && cls_buf[..9] == SOBS_HINT_CLASS)
