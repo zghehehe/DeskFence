@@ -1078,7 +1078,7 @@ pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> 
             return Err(format!("PrintWindow false err={code}"));
         }
         // GDI 捕获的 alpha 不可靠:精确模式整窗不透明,统一置 255
-        for px in out.chunks_exact_mut(4) {
+        for px in out.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
         Ok((out, w, h))
