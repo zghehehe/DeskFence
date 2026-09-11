@@ -5,7 +5,7 @@ on:
     branches: [master]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -15,28 +15,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # 诊断期临时改造(2026-09-11):两步输出落盘,失败时推回 ci-log 分支
-      # 以便本地取证;拿到报错后本段恢复原样,脚手架即删。
       - name: Test
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo test --locked 2>&1 | tee ci-test.log
-      - name: Clippy (deny warnings)
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo clippy --locked -- -D warnings 2>&1 | tee ci-clippy.log
+        run: cargo test --locked
+
       # clippy 严格门禁(2026-09-09:存量 71 条风格警告已在 1f59b84..305e72b
-      # 分批清零,任何新警告直接红灯) 2>&1 | tee ci-clippy.log
-      - name: Collect failure log (temporary diagnostics)
-        if: failure()
-        shell: bash
-        run: |
-          { rustc --version; cargo --version; cargo clippy --version; } > ci-versions.log
-          git config user.name "zghehehe"
-          git config user.email "zghehehe@users.noreply.github.com"
-          git checkout -b ci-log
-          git add -f ci-test.log ci-clippy.log ci-versions.log 2>/dev/null || true
-          git commit -m "ci failure log $(date -u +%FT%TZ)" || echo "(no logs)"
-          git push origin ci-log --force
+      # 分批清零,任何新警告直接红灯)
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked -- -D warnings
