@@ -707,14 +707,18 @@
       正确序=先取指针→立即清槽（保留 EN_KILLFOCUS 空转防护）→再释放。
       审此类 bug 的教训：**"先清再读同一来源"必然取空**，注释说的防护
       要看它实际保护的是哪次访问。
-    - **CI 工具链已 pin 1.97.0**（8ccf615，ci.yml 用
-      `dtolnay/rust-toolchain@1.97.0` 替代 @stable）。**勿改回
-      rust-toolchain.toml 方案**：本机 rustup 的显式 `1.97.0` 目录残缺
-      （`rustup show` 报 "Missing manifest"，疑似非标准渠道装的），
-      pin 文件一激活它本地 cargo 直接报错；日常可用的是 default 的
-      `stable`（当前恰好=1.97.0）。本地 stable 升级时**主动**同步 CI
-      的 pin 版本号。fmt 尚不干净，`cargo fmt --check` 门禁未加
-      （加了会全库大 diff）——待办：单独一次 format 提交后再上门禁。
+- **CI 工具链已 pin 1.97.0**（8ccf615，ci.yml 用
+  `dtolnay/rust-toolchain@1.97.0` 替代 @stable）。2026-09-11 晚间已修复
+  本机 rustup 并恢复 rust-toolchain.toml（9105049，双保险）：残缺原因是
+  旧 1.97.0 目录半截安装（缺 rustc/rust-std manifest 与总清单），卸载后
+  用**字节 rsproxy 镜像**完整重装——国内下载 rustup 工具链一律走
+  `RUSTUP_DIST_SERVER=https://rsproxy.cn
+  RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup`（官方源在本机基本不通），
+  约 1 分钟装完。**升级流程**：本地升 stable → 改 rust-toolchain.toml
+  与 ci.yml 两处版本号 → 本地全绿 → 提交。
+- **fmt 门禁已开（2026-09-11）**：640607f 一次性 `cargo fmt` 全库格式化
+  （纯格式零语义），5878d68 CI 加 `cargo fmt --check`。此后提交前先跑
+  `cargo fmt --check`（IDE 保存即格式化亦可）。
     - **panic 语义结论（修正旧审计判断）**：wndproc 是 extern "system"，
       Rust 在 FFI 边界的 panic=直接 abort，进程当场死——不是"锁中毒
       僵尸进程"。现有 fail-fast + icons_marker + 自启动兜底即可接受；
