@@ -194,6 +194,17 @@ pub(crate) fn set_show_chrome_stored(on: bool) {
     update_stored_settings(|s| s.show_chrome = on);
 }
 
+/// 界面语言设置("auto"/"zh"/"en",默认 auto,2026-09-11):有效语言缓存在
+/// lang::EFFECTIVE 原子量,启动预热;切换时同步改原子量+落盘。菜单每次
+/// 现建、面板每次现开,查表即时生效,无需重启。
+pub fn lang_setting_value() -> String {
+    model::load_settings().lang
+}
+pub(crate) fn set_lang_stored(v: &str) {
+    crate::lang::set_effective(crate::lang::resolve(v, crate::lang::system_prefers_zh()));
+    update_stored_settings(|s| s.lang = v.to_string());
+}
+
 /// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
 /// 复活,除非之后出现该类的新文件(mtime 晚于墓碑)——那时清除墓碑并
 /// 正常补建,保留"首次出现该类文件会自动新建"的原设计。
@@ -2636,6 +2647,9 @@ pub fn startup() {
     {
         model::set_auto_category(model::load_settings().auto_category); // 预热:开关单一真相
         SHOW_CHROME.store(model::load_settings().show_chrome, Ordering::Relaxed);
+        // 界面语言预热:settings.lang + 系统 locale -> 有效语言(菜单/面板查表)
+        let st = model::load_settings();
+        crate::lang::set_effective(crate::lang::resolve(&st.lang, crate::lang::system_prefers_zh()));
     }
     // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载
     // 持久化缓存(快,且免去"原生图标可见时现场捕获"的残影/闪烁问题);无缓存

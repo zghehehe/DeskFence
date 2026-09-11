@@ -1413,6 +1413,12 @@ pub struct Settings {
     /// 布局;关=无边框常显(悬停或拖拽时才浮现)。托盘菜单切换即落盘。
     #[serde(default)]
     pub show_chrome: bool,
+    /// 界面语言(2026-09-11):"auto"=系统安装语言是简中则中文否则英文(默认) /
+    /// "zh"=简体中文 / "en"=English。托盘"语言/Language"切换即落盘;有效语言
+    /// 解析进 lang 模块原子量,菜单/面板每次现建时查表,切换无需重启。
+    /// 分类名/栅栏标题是用户数据,不随语言变。
+    #[serde(default = "default_lang")]
+    pub lang: String,
     /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
     /// 分类不再自动重建,除非之后出现该类的**新文件**(mtime 晚于删除)。
     /// 防止"删了的栅栏又冒出来"(回收站恒在=软件类恒有文件,mp3 常驻=
@@ -1438,6 +1444,9 @@ pub fn default_auto_category() -> bool {
 }
 pub fn default_z_guard() -> bool {
     true
+}
+pub fn default_lang() -> String {
+    "auto".into()
 }
 
 /// 自定义分类模式的兜底类别:未被任何栅栏收纳的文件都在这里,保证不"隐身"
@@ -1499,6 +1508,7 @@ impl Default for Settings {
             desktop_state: default_desktop_state(),
             z_guard: default_z_guard(),
             show_chrome: false,
+            lang: default_lang(),
             deleted_category_at: Default::default(),
             categories: default_categories(),
         }
@@ -1533,9 +1543,10 @@ pub fn load_settings_from(path: &std::path::Path) -> Settings {
                 auto_category: default_auto_category(),
                 desktop_state: default_desktop_state(),
                 z_guard: default_z_guard(),
-            show_chrome: false,
-            deleted_category_at: Default::default(),
-            categories: default_categories(),
+                show_chrome: false,
+                lang: default_lang(),
+                deleted_category_at: Default::default(),
+                categories: default_categories(),
             }
         }
     }

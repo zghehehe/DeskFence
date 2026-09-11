@@ -44,6 +44,9 @@ const MENU_CATS_BASE: u32 = 0x5120;
 const MENU_CATS_ADD: u32 = 0x5130;
 const MENU_CHECK_UPDATE: u32 = 0x5131;
 const MENU_MODE_CUSTOM: u32 = 0x5133;
+const MENU_LANG_AUTO: u32 = 0x5134;
+const MENU_LANG_ZH: u32 = 0x5135;
+const MENU_LANG_EN: u32 = 0x5136;
 
 pub(crate) fn show_tray_menu(x: i32, y: i32) {
     let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
@@ -61,36 +64,36 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         )
     };
     if all_hidden {
-        shell::append_menu(menu, MENU_SHOW_ALL, "显示全部栅栏");
+        shell::append_menu(menu, MENU_SHOW_ALL, crate::lang::tray_show_all());
     } else {
-        shell::append_menu(menu, MENU_HIDE_ALL, "隐藏全部栅栏");
+        shell::append_menu(menu, MENU_HIDE_ALL, crate::lang::tray_hide_all());
     }
     shell::append_separator(menu);
-    shell::append_menu(menu, MENU_UNDO, "撤销上次布局调整");
-    shell::append_menu(menu, MENU_RESET_LAYOUT, "恢复默认布局");
+    shell::append_menu(menu, MENU_UNDO, crate::lang::undo_layout());
+    shell::append_menu(menu, MENU_RESET_LAYOUT, crate::lang::reset_layout());
     shell::append_separator(menu);
     shell::append_menu(
         menu,
         MENU_TOGGLE_DESKTOP_ICONS,
         if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
-            "显示桌面图标"
+            crate::lang::show_desktop_icons()
         } else {
-            "隐藏桌面图标"
+            crate::lang::hide_desktop_icons()
         },
     );
     // 原生图标可见且栅栏全部隐藏 = 原生桌面态,翻转为恢复栅栏
     let native_mode = all_hidden && !icons_hidden;
     if native_mode {
-        shell::append_menu(menu, MENU_SHOW_ALL, "恢复栅栏桌面");
+        shell::append_menu(menu, MENU_SHOW_ALL, crate::lang::restore_fence_desktop());
     } else {
-        shell::append_menu(menu, MENU_RESTORE_DESKTOP, "恢复原始桌面");
+        shell::append_menu(menu, MENU_RESTORE_DESKTOP, crate::lang::restore_native_desktop());
     }
     let align = unsafe { CreatePopupMenu().unwrap_or_default() };
     let mode = align_mode();
     let modes = [
-        (MENU_AUTO_ALIGN, "auto", "自动对齐(固定间隔)"),
-        (MENU_ALIGN_GRID, "grid", "网格对齐(图标格倍数)"),
-        (MENU_ALIGN_FREE, "free", "自由移动(不受限)"),
+        (MENU_AUTO_ALIGN, "auto", crate::lang::align_auto()),
+        (MENU_ALIGN_GRID, "grid", crate::lang::align_grid()),
+        (MENU_ALIGN_FREE, "free", crate::lang::align_free()),
     ];
     for (id, key, label) in modes {
         if mode == key {
@@ -99,17 +102,17 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
             shell::append_menu(align, id, label);
         }
     }
-    shell::append_submenu(menu, "对齐方式", align);
+    shell::append_submenu(menu, crate::lang::align_submenu(), align);
     // 渲染模式:精确(默认,壁纸底+ClearType 与原生一致)在上;
     // 透明为兜底(动态壁纸不兼容时使用)
     let render = unsafe { CreatePopupMenu().unwrap_or_default() };
     let rmode = render_mode();
     let rmodes = [
-        (MENU_RENDER_PRECISE, "precise", "精确(与原生逐像素一致)"),
+        (MENU_RENDER_PRECISE, "precise", crate::lang::render_precise()),
         (
             MENU_RENDER_TRANSPARENT,
             "transparent",
-            "透明(兜底:动态壁纸不兼容时)",
+            crate::lang::render_transparent(),
         ),
     ];
     for (id, key, label) in rmodes {
@@ -119,7 +122,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
             shell::append_menu(render, id, label);
         }
     }
-    shell::append_submenu(menu, "渲染模式", render);
+    shell::append_submenu(menu, crate::lang::render_submenu(), render);
     // 自动分类(2026-09-08 用户定案):与"渲染模式"同款单一入口。子菜单
     // 首段=模式二选一(与精确/透明同款交互,点击即切换生效);分隔线之下
     // 类别清单归自动模式——点击分类名进面板就地改名,底部"新增分类…"直接
@@ -130,37 +133,37 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     // 定案):分隔线之后紧贴的类别清单一眼可知归属自动分类;类别行用全角
     // 空格缩进,与两个模式项拉开层次。
     if auto_category() {
-        shell::append_menu(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
+        shell::append_menu(auto, MENU_MODE_CUSTOM, crate::lang::mode_custom());
     } else {
-        shell::append_menu_checked(auto, MENU_MODE_CUSTOM, "自定义(拖入归类)");
+        shell::append_menu_checked(auto, MENU_MODE_CUSTOM, crate::lang::mode_custom());
     }
     shell::append_separator(auto);
     if auto_category() {
-        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+        shell::append_menu_checked(auto, MENU_AUTO_CATEGORY, crate::lang::mode_auto_category());
     } else {
-        shell::append_menu(auto, MENU_AUTO_CATEGORY, "自动分类(按类型归类)");
+        shell::append_menu(auto, MENU_AUTO_CATEGORY, crate::lang::mode_auto_category());
     }
     let table = model::category_table();
     let shown = table.len().min((MENU_CATS_ADD - MENU_CATS_BASE) as usize);
     for (i, c) in table.iter().take(shown).enumerate() {
         let label = if c.name == model::FALLBACK_CATEGORY {
-            format!("{}(兜底)", c.name)
+            format!("{}{}", c.name, crate::lang::fallback_suffix())
         } else {
             c.name.clone()
         };
         shell::append_menu(auto, MENU_CATS_BASE + i as u32, &format!("　{label}"));
     }
     shell::append_separator(auto);
-    shell::append_menu(auto, MENU_CATS_ADD, "　新增分类…");
+    shell::append_menu(auto, MENU_CATS_ADD, &format!("　{}", crate::lang::add_category_item()));
     if auto_category() {
-        shell::append_submenu_checked(menu, "自动分类", auto);
+        shell::append_submenu_checked(menu, crate::lang::auto_cat_submenu(), auto);
     } else {
-        shell::append_submenu(menu, "自动分类", auto);
+        shell::append_submenu(menu, crate::lang::auto_cat_submenu(), auto);
     }
     if chrome_always_on() {
-        shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
+        shell::append_menu_checked(menu, MENU_TOGGLE_CHROME, crate::lang::toggle_chrome());
     } else {
-        shell::append_menu(menu, MENU_TOGGLE_CHROME, "显示栅栏边框线");
+        shell::append_menu(menu, MENU_TOGGLE_CHROME, crate::lang::toggle_chrome());
     }
     // z 序守卫不设菜单入口(2026-09-08 用户要求):降级开关走 settings.json
     // 的 z_guard 字段,默认开=实测验证过的正确状态。
@@ -168,21 +171,42 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     shell::append_menu(
         menu,
         MENU_CHECK_UPDATE,
-        &format!("检查更新 (v{})", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "{} (v{})",
+            crate::lang::check_update(),
+            env!("CARGO_PKG_VERSION")
+        ),
     );
     // 桌面环境体检/修复:全自动机制(boot 体检 + 30s watchdog),不提供
     // 手动入口(用户要求,2026-08-29)。
     if shell::get_autostart() {
-        shell::append_menu_checked(menu, MENU_AUTOSTART, "开机自启");
+        shell::append_menu_checked(menu, MENU_AUTOSTART, crate::lang::autostart());
     } else {
-        shell::append_menu(menu, MENU_AUTOSTART, "开机自启");
+        shell::append_menu(menu, MENU_AUTOSTART, crate::lang::autostart());
     }
+    // 界面语言(2026-09-11):跟随系统/中文/English,切换即时生效+落盘
+    let lang_menu = unsafe { CreatePopupMenu().unwrap_or_default() };
+    let lang_now = lang_setting_value();
+    let langs = [
+        (MENU_LANG_AUTO, "auto", crate::lang::lang_auto()),
+        (MENU_LANG_ZH, "zh", crate::lang::lang_zh()),
+        (MENU_LANG_EN, "en", crate::lang::lang_en()),
+    ];
+    for (id, key, label) in langs {
+        if lang_now == key {
+            shell::append_menu_checked(lang_menu, id, label);
+        } else {
+            shell::append_menu(lang_menu, id, label);
+        }
+    }
+    shell::append_submenu(menu, crate::lang::lang_submenu(), lang_menu);
     shell::append_separator(menu);
-    shell::append_menu(menu, MENU_QUIT, "退出");
+    shell::append_menu(menu, MENU_QUIT, crate::lang::quit());
     let id = track(menu, hwnd, x, y);
     unsafe {
         let _ = DestroyMenu(align);
         let _ = DestroyMenu(render);
+        let _ = DestroyMenu(lang_menu);
         let _ = DestroyMenu(menu);
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     }
@@ -230,6 +254,9 @@ fn dispatch_tray_command(id: u32) {
         }
         MENU_CHECK_UPDATE => check_update(),
         MENU_AUTOSTART => toggle_autostart(),
+        MENU_LANG_AUTO => set_lang_stored("auto"),
+        MENU_LANG_ZH => set_lang_stored("zh"),
+        MENU_LANG_EN => set_lang_stored("en"),
         MENU_QUIT => quit_app(),
         _ => log(&format!("unknown tray command: {}", id)),
     }
@@ -565,7 +592,7 @@ fn reset_fence_layout() {
             let (dw, dh) = default_fence_size();
             vec![Fence {
                 id: 1,
-                title: "桌面整理".into(),
+                title: crate::lang::seed_desktop_title().into(),
                 category: String::new(),
                 pinned: Vec::new(),
                 item_order: Vec::new(),
@@ -673,11 +700,12 @@ pub(crate) fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
     };
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
     let sort = unsafe { CreatePopupMenu().unwrap_or_default() };
+    // 键=config.json 里存的排序值(用户数据,保持中文存储);label=界面文案
     let pairs = [
-        (MENU_SORT_FREQ, "常用", "常用(默认)"),
-        (MENU_SORT_TIME, "时间", "时间(最近修改)"),
-        (MENU_SORT_NAME, "名称", "名称"),
-        (MENU_SORT_MANUAL, "手动", "手动(拖拽自定义)"),
+        (MENU_SORT_FREQ, "常用", crate::lang::sort_freq()),
+        (MENU_SORT_TIME, "时间", crate::lang::sort_time()),
+        (MENU_SORT_NAME, "名称", crate::lang::sort_name()),
+        (MENU_SORT_MANUAL, "手动", crate::lang::sort_manual()),
     ];
     for (id, key, label) in pairs {
         if sort_mode == key {
@@ -686,27 +714,31 @@ pub(crate) fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
             shell::append_menu(sort, id, label);
         }
     }
-    shell::append_menu(menu, MENU_ADD_FENCE, "新建栅栏");
-    shell::append_menu(menu, MENU_RENAME, "重命名");
+    shell::append_menu(menu, MENU_ADD_FENCE, crate::lang::new_fence());
+    shell::append_menu(menu, MENU_RENAME, crate::lang::rename());
     shell::append_menu(
         menu,
         MENU_TOGGLE_COLLAPSE,
-        if collapsed { "展开" } else { "折叠" },
+        if collapsed {
+            crate::lang::expand()
+        } else {
+            crate::lang::collapse()
+        },
     );
     shell::append_menu(
         menu,
         MENU_LOCK,
         if locked {
-            "解除锁定位置与大小"
+            crate::lang::unlock()
         } else {
-            "锁定位置与大小"
+            crate::lang::lock()
         },
     );
-    shell::append_submenu(menu, "排序方式", sort);
+    shell::append_submenu(menu, crate::lang::sort_submenu(), sort);
     shell::append_separator(menu);
-    shell::append_menu(menu, MENU_DELETE_FENCE, "删除栅栏");
+    shell::append_menu(menu, MENU_DELETE_FENCE, crate::lang::delete_fence());
     shell::append_separator(menu);
-    shell::append_menu(menu, MENU_REFRESH, "刷新");
+    shell::append_menu(menu, MENU_REFRESH, crate::lang::refresh());
     let id = track(menu, hwnd, x, y);
     unsafe {
         let _ = DestroyMenu(sort);
@@ -739,7 +771,7 @@ pub fn add_fence_after(_base_id: u32) -> u32 {
         let r = new_fence_rect(&s, dw, dh);
         s.fences.push(Fence {
             id: max_id,
-            title: "新栅栏".into(),
+            title: crate::lang::seed_new_fence_title().into(),
             category: String::new(),
             pinned: Vec::new(),
             item_order: Vec::new(),
