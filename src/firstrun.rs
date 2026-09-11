@@ -9,9 +9,7 @@
 use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    DeleteObject, HBRUSH, HFONT, HGDIOBJ, COLOR_BTNFACE,
-};
+use windows::Win32::Graphics::Gdi::{DeleteObject, COLOR_BTNFACE, HBRUSH, HFONT, HGDIOBJ};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{model, shell, ui};
@@ -154,8 +152,16 @@ unsafe extern "system" fn firstrun_wndproc(
             let r2 = mk(IDC_R2, crate::lang::firstrun_rescue2(), SS_LEFT);
             let r3 = mk(IDC_R3, crate::lang::firstrun_rescue3(), SS_LEFT);
             let opts_head = mk(IDC_OPTS_HEAD, crate::lang::firstrun_opts_head(), SS_LEFT);
-            let chrome_cb = mk(IDC_CHROME, crate::lang::firstrun_chrome_cb(), BS_AUTOCHECKBOX);
-            let autostart_cb = mk(IDC_AUTOSTART, crate::lang::firstrun_autostart_cb(), BS_AUTOCHECKBOX);
+            let chrome_cb = mk(
+                IDC_CHROME,
+                crate::lang::firstrun_chrome_cb(),
+                BS_AUTOCHECKBOX,
+            );
+            let autostart_cb = mk(
+                IDC_AUTOSTART,
+                crate::lang::firstrun_autostart_cb(),
+                BS_AUTOCHECKBOX,
+            );
             let ok_btn = mk(IDC_OK, crate::lang::firstrun_ok(), BS_DEFPUSHBUTTON);
             let mut d = Box::new(Dialog {
                 intro1,
@@ -174,10 +180,31 @@ unsafe extern "system" fn firstrun_wndproc(
             // 两项默认勾选开启(2026-09-11 用户定案):新装即见边框、常驻自启,
             // 用户在窗内取消即不启用;OK 时与当前实际状态比对,有变化才落盘
             unsafe {
-                let _ = SendMessageW(chrome_cb, BM_SETCHECK, WPARAM(BST_CHECKED as usize), LPARAM(0));
-                let _ = SendMessageW(autostart_cb, BM_SETCHECK, WPARAM(BST_CHECKED as usize), LPARAM(0));
+                let _ = SendMessageW(
+                    chrome_cb,
+                    BM_SETCHECK,
+                    WPARAM(BST_CHECKED as usize),
+                    LPARAM(0),
+                );
+                let _ = SendMessageW(
+                    autostart_cb,
+                    BM_SETCHECK,
+                    WPARAM(BST_CHECKED as usize),
+                    LPARAM(0),
+                );
                 let f = WPARAM(d.font.0 as usize);
-                for h in [intro1, intro2, head, r1, r2, r3, opts_head, chrome_cb, autostart_cb, ok_btn] {
+                for h in [
+                    intro1,
+                    intro2,
+                    head,
+                    r1,
+                    r2,
+                    r3,
+                    opts_head,
+                    chrome_cb,
+                    autostart_cb,
+                    ok_btn,
+                ] {
                     let _ = SendMessageW(h, WM_SETFONT, f, LPARAM(1));
                 }
             }
@@ -216,8 +243,16 @@ unsafe extern "system" fn firstrun_wndproc(
                         d.font = crate::cats_panel::create_dialog_font(false);
                         let f = WPARAM(d.font.0 as usize);
                         for h in [
-                            d.intro1, d.intro2, d.head, d.r1, d.r2, d.r3, d.opts_head,
-                            d.chrome_cb, d.autostart_cb, d.ok_btn,
+                            d.intro1,
+                            d.intro2,
+                            d.head,
+                            d.r1,
+                            d.r2,
+                            d.r3,
+                            d.opts_head,
+                            d.chrome_cb,
+                            d.autostart_cb,
+                            d.ok_btn,
                         ] {
                             let _ = SendMessageW(h, WM_SETFONT, f, LPARAM(1));
                         }

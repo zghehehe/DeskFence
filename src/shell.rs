@@ -6,18 +6,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{ComInterface, PCSTR, PCWSTR, PSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, GetLastError, BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
     BITMAPINFO, DIB_RGB_COLORS, LOGFONTW,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ, GetFileAttributesW,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetFileAttributesW, ReadDirectoryChangesW, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_SYSTEM, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Com::{
@@ -25,8 +25,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, KEY_WRITE, REG_OPTION_NON_VOLATILE,
-    REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -43,11 +43,10 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EnumWindows, FindWindowExW, FindWindowW,
     GetForegroundWindow, GetMenuItemCount, GetMenuItemID, GetSystemMetrics, GetWindowRect,
-    GetWindowThreadProcessId, InsertMenuW, MF_BYPOSITION, PostMessageW, SendMessageTimeoutW,
-    SetForegroundWindow, SystemParametersInfoW, TrackPopupMenu, HICON, HMENU, MENU_ITEM_FLAGS,
-    MF_CHECKED, MF_POPUP, MF_SEPARATOR, SMTO_ABORTIFHUNG, SM_CXICON,
-    SPI_GETICONTITLELOGFONT, SW_SHOWNORMAL,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, WM_NULL,
+    GetWindowThreadProcessId, InsertMenuW, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
+    SystemParametersInfoW, TrackPopupMenu, HICON, HMENU, MENU_ITEM_FLAGS, MF_BYPOSITION,
+    MF_CHECKED, MF_POPUP, MF_SEPARATOR, SMTO_ABORTIFHUNG, SM_CXICON, SPI_GETICONTITLELOGFONT,
+    SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_RETURNCMD, WM_NULL,
 };
 
 use crate::model::FileItem;
@@ -452,10 +451,7 @@ fn dedup_by_display_name(files: &mut Vec<FileItem>) {
 /// 并行预热图标像素缓存:启动时把桌面全部路径按主屏图标像素先提取,
 /// 首帧栅栏绘制全部命中缓存(SHGFI 对 .lnk/exe 单个可达 ~180ms,
 /// 串行 22 个要 ~1.6s)。返回 map 键与 render::get_icon_buffer 一致,直接合并。
-pub fn prewarm_icon_cache(
-    paths: &[String],
-    px: f32,
-) -> std::collections::HashMap<String, Vec<u8>> {
+pub fn prewarm_icon_cache(paths: &[String], px: f32) -> std::collections::HashMap<String, Vec<u8>> {
     const THREADS: usize = 4;
     let n = paths.len();
     let mut merged = std::collections::HashMap::new();
@@ -1248,7 +1244,8 @@ pub unsafe fn menu_foreground(hwnd: HWND) -> MenuForegroundGuard {
         if fg.0 != 0 {
             let cur = GetCurrentThreadId();
             let fg_thread = GetWindowThreadProcessId(fg, None);
-            if fg_thread != 0 && fg_thread != cur
+            if fg_thread != 0
+                && fg_thread != cur
                 && AttachThreadInput(cur, fg_thread, true).as_bool()
             {
                 let _ = SetForegroundWindow(hwnd);
@@ -1612,9 +1609,7 @@ pub fn path_gone_from_disk(path: &str) -> bool {
     // windows 0.52 未导出 FILE_ATTRIBUTE_INVALID,失败值即 u32::MAX
     const FILE_ATTR_INVALID: u32 = u32::MAX;
     let w = wide(path);
-    unsafe {
-        GetFileAttributesW(PCWSTR::from_raw(w.as_ptr())) == FILE_ATTR_INVALID
-    }
+    unsafe { GetFileAttributesW(PCWSTR::from_raw(w.as_ptr())) == FILE_ATTR_INVALID }
 }
 
 /// "打开方式…"对话框
@@ -2042,7 +2037,10 @@ pub fn wallpaper_signature() -> Option<String> {
             .GetBackgroundColor()
             .map(|c| c.0.to_string())
             .unwrap_or_default();
-        let pos = dp.GetPosition().map(|p| p.0.to_string()).unwrap_or_default();
+        let pos = dp
+            .GetPosition()
+            .map(|p| p.0.to_string())
+            .unwrap_or_default();
         Some(format!("{bg}|{pos}|{}", parts.join("\u{1}")))
     }
 }
@@ -2126,7 +2124,6 @@ pub fn start_explorer() {
 
 #[cfg(test)]
 mod tests {
-
 
     use super::select_image_size;
 

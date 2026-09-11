@@ -4,15 +4,15 @@ use std::sync::atomic::Ordering;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 
-use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
-use windows::Win32::System::Ole::RevokeDragDrop;
-use windows::Win32::UI::WindowsAndMessaging::*;
-use crate::render;
-use crate::model::{self, Fence, Rect};
-use crate::shell;
 use crate::drag::*;
+use crate::model::{self, Fence, Rect};
 use crate::rename::start_rename;
+use crate::render;
+use crate::shell;
 use crate::ui::*;
+use windows::Win32::System::Ole::RevokeDragDrop;
+use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 const MENU_ADD_FENCE: u32 = 0x5101;
 const MENU_RENAME: u32 = 0x5102;
@@ -86,7 +86,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     if native_mode {
         shell::append_menu(menu, MENU_SHOW_ALL, crate::lang::restore_fence_desktop());
     } else {
-        shell::append_menu(menu, MENU_RESTORE_DESKTOP, crate::lang::restore_native_desktop());
+        shell::append_menu(
+            menu,
+            MENU_RESTORE_DESKTOP,
+            crate::lang::restore_native_desktop(),
+        );
     }
     let align = unsafe { CreatePopupMenu().unwrap_or_default() };
     let mode = align_mode();
@@ -108,7 +112,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     let render = unsafe { CreatePopupMenu().unwrap_or_default() };
     let rmode = render_mode();
     let rmodes = [
-        (MENU_RENDER_PRECISE, "precise", crate::lang::render_precise()),
+        (
+            MENU_RENDER_PRECISE,
+            "precise",
+            crate::lang::render_precise(),
+        ),
         (
             MENU_RENDER_TRANSPARENT,
             "transparent",
@@ -154,7 +162,11 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         shell::append_menu(auto, MENU_CATS_BASE + i as u32, &format!("　{label}"));
     }
     shell::append_separator(auto);
-    shell::append_menu(auto, MENU_CATS_ADD, &format!("　{}", crate::lang::add_category_item()));
+    shell::append_menu(
+        auto,
+        MENU_CATS_ADD,
+        &format!("　{}", crate::lang::add_category_item()),
+    );
     if auto_category() {
         shell::append_submenu_checked(menu, crate::lang::auto_cat_submenu(), auto);
     } else {
@@ -353,7 +365,9 @@ pub(crate) fn apply_category_exts(name: &str, exts: Vec<String>) -> bool {
             .iter()
             .any(|c| c.name != name && c.exts.contains(&e))
         {
-            log(&format!("exts rejected: '{e}' already owned by another category"));
+            log(&format!(
+                "exts rejected: '{e}' already owned by another category"
+            ));
             return false;
         }
         clean.push(e);
@@ -436,7 +450,10 @@ pub(crate) fn apply_category_delete(name: &str) -> bool {
     }
     rebuild_pins();
     refresh_all_fences();
-    log(&format!("category deleted '{name}', members refiled to {}", model::FALLBACK_CATEGORY));
+    log(&format!(
+        "category deleted '{name}', members refiled to {}",
+        model::FALLBACK_CATEGORY
+    ));
     true
 }
 
@@ -675,7 +692,15 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
                 menu_host_or(hwnd) == fg
             ));
         }
-        let r = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, menu_host_or(hwnd), None);
+        let r = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            x,
+            y,
+            0,
+            menu_host_or(hwnd),
+            None,
+        );
         if r.0 == 0 {
             log("track: menu dismissed without selection");
         }
@@ -882,14 +907,11 @@ pub(crate) fn delete_fence_ex(fence_id: u32, tombstone: bool) {
             .collect();
         let slot = |i: usize| (rects[i].x, rects[i].y);
         let rows = model::rows_from_rects(&rects);
-        let own = ids
-            .iter()
-            .position(|id| *id == fence_id)
-            .and_then(|pos| {
-                rows.iter().enumerate().find_map(|(ri, row)| {
-                    row.iter().position(|&i| i == pos).map(|j| (ri, j))
-                })
-            });
+        let own = ids.iter().position(|id| *id == fence_id).and_then(|pos| {
+            rows.iter()
+                .enumerate()
+                .find_map(|(ri, row)| row.iter().position(|&i| i == pos).map(|j| (ri, j)))
+        });
         let mut out = Vec::new();
         if let Some((ri, j)) = own {
             // 行锚点=该行(含被删者)最左成员;洞后成员按各自宽度+GAP 从锚点
@@ -1036,4 +1058,3 @@ pub(crate) fn dispatch_desktop_command(id: u32) {
         _ => {}
     }
 }
-
