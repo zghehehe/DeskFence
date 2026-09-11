@@ -170,8 +170,9 @@
      +闪事件仅菜单自身像素"）+ tools/elevtest.ps1（人为把栅栏顶到栈顶，
      1s 内自愈拉回底带）+ tools/fenceloc.ps1（5 栅栏必须 aboveHost+1..+5）。
      ④ rescan 无条件 show_all_fences 全量重绘（watcher dirty 在菜单交互时
-     被 Explorer 元数据触碰置位）；壁纸 60s 兜底捕获(PrintWindow 强制宿主
-     重绘)撞上交互。修：rescan 文件集合无变化直接返回；壁纸比对带每通道
+     被 Explorer 元数据触碰置位）；壁纸兜底捕获(当时 60s 一次,PrintWindow
+     强制宿主重绘;2026-08-26 起已放宽到 10min)撞上交互。修：rescan 文件
+     集合无变化直接返回；壁纸比对带每通道
      8 容差（捕获亮度有 ±4% 时序波动，严格比较会误判"变了"引发全量重绘）；
      交互后 2.5s 内推迟捕获（mark_interaction/LAST_INTERACTION_MS）。
    - **残余现象（勿再追）**：菜单遮挡栅栏期间 DWM 丢弃被遮区域的颜色转换
@@ -222,10 +223,12 @@
      才计。回退判定需 `wallpapers.is_empty() && fails>=2 && 启动>10s` 双保险。
    - 壁纸变化信号源（按优先级）：WM_SETTINGCHANGE（手动换壁纸，毫秒级）→
      Themes 目录 watcher + IDesktopWallpaper 签名轮询（幻灯片轮换，秒级）→
-     60s 兜底轮询（PrintWindow 强制宿主重绘，更短间隔会在交互时看到桌面闪；
-     60s 经 60 秒静默连拍验证无可见闪）。**本机（企业定制环境）两个轮换信号
+     **10min 兜底轮询**（WALLPAPER_REFRESH_MS=600_000，2026-08-26 从 60s 放宽：
+     ink 常驻后快照只作文字种子、不新鲜无视觉代价，而 PrintWindow 强制宿主
+     重绘落在交互后就是"点击闪一下"；旧值 60s 曾经 60 秒静默连拍验证无可见闪）。
+     **本机（企业定制环境）两个轮换信号
      都不可用**：换壁纸不写 TranscodedWallpaper（mtime 不变），IDesktopWallpaper
-     coclass 未注册（REGDB_E_CLASSNOTREG）——只靠 SETTINGCHANGE+60s 兜底。
+     coclass 未注册（REGDB_E_CLASSNOTREG）——只靠 SETTINGCHANGE+10min 兜底。
    - 启动关键路径已并行化：scan_desktop_raw（纯 FS ~5ms）先行，显示名解析
      （SHGFI_DISPLAYNAME，54 文件串行 ~1.3s）与图标提取（.lnk/exe 单个可达
      ~180ms）各 4 线程后台跑，主线程同时做壁纸暖场+渲染器预热（一次性小表面

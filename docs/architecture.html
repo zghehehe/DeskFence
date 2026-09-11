@@ -54,7 +54,7 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
 </head>
 <body>
 
-<h1>DeskFence 全链路架构图<span class="tag">src 共 6 个模块 · main / ui / render / shell / model / ole</span></h1>
+<h1>DeskFence 全链路架构图<span class="tag">src 共 12 个模块 · main / ui / model / render / shell / drag / menu / rename / selfheal / ole / cats_panel / iconcache</span></h1>
 <div class="sub">架构基线:2026-08-26 ink 常驻渲染重构后。从双击启动到每一次点击的完整逻辑链,排障时先定位症状所属链路,再沿节点查对应函数与日志。</div>
 
 <div class="legend">
@@ -78,8 +78,8 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
 <h2>① 启动链路<small>双击 exe → 桌面被栅栏接管(目标:1 秒内、无中间态)</small></h2>
 <div class="desc">要点:shell 调用(显示名/图标)全部后台并行,主线程只做配置与壁纸种子缓存加载;首帧必须是"带 ClearType 阴影的最终帧",没就绪就保持原生桌面。</div>
 <div class="chain">
-  <div class="node start"><b>双击 deskfence.exe</b><span>单实例互斥体检查</span><span class="fn">main.rs acquire_single_instance</span></div>
-  <div class="node"><b>已有实例?</b><span>是 → 唤醒旧实例显示全部栅栏后退出</span><span class="fn">ui::notify_second_instance</span></div>
+  <div class="node start"><b>双击 deskfence.exe</b><span>清场旧实例:不判健康、只有先后</span><span class="fn">main.rs clear_previous_instances</span></div>
+  <div class="node"><b>旧实例收 WM_CLOSE</b><span>托盘窗走完整清理毫秒级自退;2s 超时才强杀兜底(--restore-desktop 同样先清场再恢复)</span><span class="fn">shell::pids_by_name 进程名枚举</span></div>
   <div class="node start"><b>init()</b><span>per-monitor DPI、COM STA、D2D 渲染器、实测图标格距</span><span class="fn">ui::init · log "boot init done"</span></div>
   <div class="node"><b>startup() 并行分流</b><span>后台线程A:显示名解析(4线程) / 后台线程B:图标提取(4线程)</span><span class="fn">shell::finalize_scan / prewarm_icon_cache</span></div>
   <div class="node io"><b>主线程同时</b><span>加载布局配置 → 壁纸种子缓存(wallpaper.bin,两模式共用,~50ms) → 渲染器预热(烧掉 D2D/GDI 首次成本)</span><span class="fn">load_wallpaper_cache / warm_renderer_scratch</span></div>
@@ -95,11 +95,11 @@ td.sym{color:var(--err)}td.chainc{color:var(--acc)}td code{font-family:Consolas,
 <div class="layer">
   <div class="lrow"><div class="z">TOPMOST band</div><div class="b">拖拽指示 overlay(guide 窗口)<small> · 全屏分层 · 仅拖拽期间有内容</small></div></div>
   <div class="lrow"><div class="z">普通窗口 band</div><div class="b">用户的浏览器/办公软件等一切普通窗口</div></div>
-  <div class="lrow"><div class="z">桌面层(z 链)</div><div class="b">栅栏窗口 ×N(WS_EX_LAYERED,紧贴宿主正上方连续排列)<small> · 1px 菜单宿主与托盘窗口(点击穿透,屏幕角落,容忍于 z 链判定)</small></div></div>
+  <div class="lrow"><div class="z">桌面层(z 链)</div><div class="b">栅栏窗口 ×N(WS_EX_LAYERED,桌面宿主的 owned 顶层窗口,锚在最低可见外来窗之下;2026-09-10 所有权架构起不再紧贴宿主)<small> · 1px 菜单宿主与托盘窗口(点击穿透,屏幕角落,容忍于 z 链判定)</small></div></div>
   <div class="lrow"><div class="z">桌面宿主</div><div class="b">Progman / WorkerW(SHELLDLL_DefView 的图标列表按需隐藏)</div></div>
   <div class="lrow"><div class="z">最底层</div><div class="b">壁纸(DWM 绘制;栅栏背景 = 它的实时透出)</div></div>
 </div>
-<div class="note"><b>z 序自愈(每秒):</b><code>ensure_all_attached</code> 做<b>整链就位判定</b>——宿主上方窗口之下恰好是全部栅栏才跳过 SetWindowPos;否则重排一次。绝不逐窗口无条件重申(历史上的"每秒洗牌"会在前台 band 变化后变成真实移动=闪屏)。</div>
+<div class="note"><b>z 序守卫+自愈(2026-09-10 所有权架构,勿按旧版机制恢复):</b>栅栏是桌面宿主(Progman)的 <b>owned 顶层窗口</b>——Win32 语义保证它永远在宿主之上;外部把栅栏往宿主之下压的动作会先收到 <code>WM_WINDOWPOSCHANGING</code>,z 守卫当场否决(注入 SWP_NOZORDER)。兜底:<code>ensure_all_attached</code> 每秒走查,失位(可见外来窗先于栅栏)按故障签名 3 拍防抖后,用 <code>resolve_band_anchor</code>(单遍受限扫描,纯函数可单测)找锚修复;沉底首拍即修,预算耗尽只记日志。旧版"整链就位判定/churn 晋升/topmost 免疫"已全部删除。</div>
 
 <h2>③ 渲染链路<small>一次 refresh_fence_impl 的完整流水线</small></h2>
 <div class="chain">

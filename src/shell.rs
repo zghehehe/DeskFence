@@ -1552,7 +1552,7 @@ pub fn show_desktop_context_menu(
             _ => "对齐方式: 自动(固定间隔)",
         };
         append_menu(sub, DL_CMD_AUTO_ALIGN, mode_label);
-        // 渲染模式:透明(默认,兼容动态壁纸) ↔ 精确(壁纸底+ClearType,与原生一致)
+        // 渲染模式:精确(默认,壁纸底+ClearType,与原生一致) ↔ 透明(兜底,动态壁纸不兼容时)
         let render_label = match render_mode {
             "precise" => "渲染模式: 精确(壁纸底,与原生一致)",
             _ => "渲染模式: 透明(动态壁纸兼容)",
