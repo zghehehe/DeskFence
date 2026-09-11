@@ -6,11 +6,11 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, HBRUSH, HDC, HFONT, HMONITOR,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, ScreenToClient,
-};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, ScreenToClient, HBRUSH, HDC, HFONT,
+    HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Ole::RevokeDragDrop;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -28,16 +28,16 @@ use windows::Win32::UI::Shell::{
 // windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::drag::*;
+use crate::iconcache::{load_icon_cache_file, save_icon_cache_file_now};
+use crate::menu::{delete_fence_ex, quit_app, set_render_mode, show_tray_menu};
 use crate::model::{self, Fence, FileItem, Hit, Rect};
 use crate::ole;
+use crate::rename::*;
 use crate::render;
 use crate::render::{IconBuffer, Renderer, Surface};
-use crate::shell;
-use crate::drag::*;
-use crate::rename::*;
-use crate::iconcache::{load_icon_cache_file, save_icon_cache_file_now};
 use crate::selfheal::*;
-use crate::menu::{delete_fence_ex, quit_app, set_render_mode, show_tray_menu};
+use crate::shell;
 
 fn class_name() -> PCWSTR {
     static W: OnceLock<Vec<u16>> = OnceLock::new();
@@ -79,7 +79,9 @@ fn deskfence_icon() -> HICON {
     // PCWSTR(1) = MakeIntResourceW(1),即 DeskFence.rc 里 ID=1 的图标资源。
     // 不能按 clippy 建议换成 ptr::dangling()(地址=对齐值 2,会查错资源)
     #[allow(clippy::manual_dangling_ptr)]
-    unsafe { LoadIconW(hinstance(), PCWSTR(1usize as *const u16)).unwrap_or_default() }
+    unsafe {
+        LoadIconW(hinstance(), PCWSTR(1usize as *const u16)).unwrap_or_default()
+    }
 }
 
 /// 对齐模式(三档):"auto"=固定间隔自动对齐(默认,实时挤压+等距流式);
@@ -192,6 +194,17 @@ pub fn chrome_always_on() -> bool {
 pub(crate) fn set_show_chrome_stored(on: bool) {
     SHOW_CHROME.store(on, Ordering::Relaxed);
     update_stored_settings(|s| s.show_chrome = on);
+}
+
+/// 界面语言设置("auto"/"zh"/"en",默认 auto,2026-09-11):有效语言缓存在
+/// lang::EFFECTIVE 原子量,启动预热;切换时同步改原子量+落盘。菜单每次
+/// 现建、面板每次现开,查表即时生效,无需重启。
+pub fn lang_setting_value() -> String {
+    model::load_settings().lang
+}
+pub(crate) fn set_lang_stored(v: &str) {
+    crate::lang::set_effective(crate::lang::resolve(v, crate::lang::system_prefers_zh()));
+    update_stored_settings(|s| s.lang = v.to_string());
 }
 
 /// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
@@ -369,7 +382,8 @@ pub(crate) struct UiState {
 
 pub(crate) fn state() -> &'static Mutex<UiState> {
     static S: OnceLock<Mutex<UiState>> = OnceLock::new();
-    S.get_or_init(|| {        Mutex::new(UiState {
+    S.get_or_init(|| {
+        Mutex::new(UiState {
             renderer: None,
             fences: Vec::new(),
             files: Vec::new(),
@@ -510,8 +524,7 @@ pub fn log(line: &str) {
         let _ = writeln!(
             f,
             "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-            line
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line
         );
     }
 }
@@ -935,8 +948,8 @@ pub(crate) fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
         let is_fence = n == 14
             && cls_buf[..14]
                 == [
-                    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65,
-                    0x6E, 0x63, 0x65,
+                    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65, 0x6E, 0x63,
+                    0x65,
                 ];
         if !is_fence {
             break;
@@ -989,7 +1002,9 @@ pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostI
         log(&format!("no desktop host yet, defer fence {}", fence_id));
         return false;
     }
-    let Some(owner) = desktop_shell_window() else { return false };
+    let Some(owner) = desktop_shell_window() else {
+        return false;
+    };
     let _zcreate = z_scope(ZIntent::Create);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -1162,9 +1177,9 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
     } else {
         s.wallpaper_fails = 0;
         s.wallpaper_dirty_since = 0; // 懒捕获任务完成:种子已就绪
-        // 区域感知比较:只有栅栏底下的像素变了才算"变"(时钟壁纸的分钟
-        // 跳动不再触发全量重绘与缓存落盘)。快照本体总是更新,种子保持
-        // 最新;changed=false 时调用方不重绘,切换无感。
+                                     // 区域感知比较:只有栅栏底下的像素变了才算"变"(时钟壁纸的分钟
+                                     // 跳动不再触发全量重绘与缓存落盘)。快照本体总是更新,种子保持
+                                     // 最新;changed=false 时调用方不重绘,切换无感。
         let t0 = resize_now_ms();
         let changed = wallpaper_changed_under_fences(&s.wallpapers, &caps, &s.fences);
         s.wallpapers = caps;
@@ -1181,14 +1196,12 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
 }
 
 /// "捕获到纯黑过渡帧"的节流日志时间戳
-static EMPTY_CAPTURE_LOG_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static EMPTY_CAPTURE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 最近一次用户交互(菜单开/关、桌面点击)的时刻。壁纸捕获在交互后
 /// 2.5s 内主动推迟:宿主在前台切换后的未稳定态下被 PrintWindow 强制
 /// 重绘会闪 ±4% 亮度,稳态则无感。
-pub static LAST_INTERACTION_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_INTERACTION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn mark_interaction() {
     LAST_INTERACTION_MS.store(resize_now_ms(), Ordering::Relaxed);
@@ -1254,10 +1267,7 @@ fn px_differs(a: &[u8], b: &[u8]) -> bool {
         return true;
     }
     for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
-        if pa[0].abs_diff(pb[0]) > 8
-            || pa[1].abs_diff(pb[1]) > 8
-            || pa[2].abs_diff(pb[2]) > 8
-        {
+        if pa[0].abs_diff(pb[0]) > 8 || pa[1].abs_diff(pb[1]) > 8 || pa[2].abs_diff(pb[2]) > 8 {
             return true;
         }
     }
@@ -1400,12 +1410,10 @@ fn wallpaper_follow_tick(hwnd: HWND) {
 }
 
 /// 启动阶段首帧呈现日志只打一次的闸门
-static BOOT_FIRST_PRESENT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static BOOT_FIRST_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static WALLPAPER_CATCHUP_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static WALLPAPER_CATCHUP_TRIES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static WALLPAPER_CATCHUP_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 武装壁纸追赶定时器(200ms)。幂等:已武装时直接返回,避免每次刷新
 /// 重置计时周期导致永不触发。定时器到点在托盘窗口线程回调,与所有
@@ -1542,8 +1550,7 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     let hover = *s.hover.get(&fence_id).unwrap_or(&None);
     // fence_hovered 在渲染侧仅控制 chrome 显隐;托盘"显示栅栏边框线"打开时
     // 全部栅栏常显边框(无边框常显基线的可观察模式)
-    let fence_hovered =
-        *s.fence_hover.get(&fence_id).unwrap_or(&false) || chrome_always_on();
+    let fence_hovered = *s.fence_hover.get(&fence_id).unwrap_or(&false) || chrome_always_on();
     let active = matches!(&s.drag, Some(d) if d.fence_id == fence_id
         && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
     let marquee = s.marquee;
@@ -1603,7 +1610,11 @@ fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
     if BOOT_VERBOSE.load(Ordering::Relaxed) && (t_draw > 100 || t_gdi > 100 || t_pres > 100) {
         log(&format!(
             "boot slow draw fence {}: draw={}ms gdi={}ms present={}ms items={}",
-            fence_id, t_draw, t_gdi, t_pres, items.len()
+            fence_id,
+            t_draw,
+            t_gdi,
+            t_pres,
+            items.len()
         ));
     }
     if ok {
@@ -1743,7 +1754,10 @@ fn warm_renderer_scratch() {
     }];
     render::gdi_draw_labels_seeded(&sf, &warm_job, wp, 0, 0);
     render::release_surface(sf);
-    log(&format!("boot renderer warm-up took {}ms", resize_now_ms() - t0));
+    log(&format!(
+        "boot renderer warm-up took {}ms",
+        resize_now_ms() - t0
+    ));
 }
 
 /// 完整恢复 DeskFence 桌面：重新发现 Explorer 宿主、重新挂接/创建窗口、
@@ -1873,10 +1887,7 @@ pub(crate) fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
                 // 用户手动删过的分类在墓碑期内不复活;该类出现**新文件**
                 // (mtime 晚于删除时刻)才清除墓碑并补建
                 if let Some(ts) = category_tombstone_at(cat) {
-                    let has_newer = s
-                        .files
-                        .iter()
-                        .any(|f| f.category == cat && f.mtime_ms > ts);
+                    let has_newer = s.files.iter().any(|f| f.category == cat && f.mtime_ms > ts);
                     if has_newer {
                         clear_category_tombstone(cat);
                         log(&format!("category fence '{cat}' resurrected by newer file"));
@@ -1889,9 +1900,9 @@ pub(crate) fn ensure_missing_category_fences(s: &mut UiState) -> Vec<String> {
             }
         }
     } else if !have.contains(model::FALLBACK_CATEGORY) {
-            // 自定义分类模式:未归位文件统一进兜底"其他",保证没有任何文件隐身
-            // (2026-09-09 起不再自动新建"未分类"栅栏——切模式不冒出多余栅栏)
-            added.push(model::FALLBACK_CATEGORY.to_string());
+        // 自定义分类模式:未归位文件统一进兜底"其他",保证没有任何文件隐身
+        // (2026-09-09 起不再自动新建"未分类"栅栏——切模式不冒出多余栅栏)
+        added.push(model::FALLBACK_CATEGORY.to_string());
     }
     let mut new_ids = Vec::new();
     for cat in &added {
@@ -2027,8 +2038,7 @@ fn apply_pending_scan() {
             log("stale scan snapshot dropped (memory synced behind scanner)");
         }
     }
-    if SCAN_INFLIGHT.swap(false, Ordering::Relaxed)
-        && SCAN_REQUEUED.swap(false, Ordering::Relaxed)
+    if SCAN_INFLIGHT.swap(false, Ordering::Relaxed) && SCAN_REQUEUED.swap(false, Ordering::Relaxed)
     {
         rescan();
     }
@@ -2055,7 +2065,10 @@ fn apply_scan(mut files: Vec<FileItem>) {
                     // 那种情况属性查询依然成功。没有这层,外部删除的图标只能
                     // 等宽恕轮数收敛,表现为"明明删了,栅栏里还在"。
                     miss.remove(&f.path);
-                    log(&format!("scan: '{}' gone from disk, removed immediately", f.path));
+                    log(&format!(
+                        "scan: '{}' gone from disk, removed immediately",
+                        f.path
+                    ));
                 } else {
                     let c = miss.entry(f.path.clone()).or_insert(0);
                     // 计数递增(2026-09-09 修复):此前 c 从不递增,自然消失路径
@@ -2076,14 +2089,15 @@ fn apply_scan(mut files: Vec<FileItem>) {
         // 分类漂移也算变化(2026-09-03):同名文件的分类变了(改名内存同步
         // 后、或将来分类规则调整)不能走"无变化早退"——早退会跳过
         // ensure_missing_category_fences,改名成 mp4 的文件永远留在文档栏
-        let mut old_cats: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::new();
+        let mut old_cats: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for f in s.files.iter() {
             old_cats.insert(f.path.as_str(), f.category.as_str());
         }
-        let recat = files
-            .iter()
-            .any(|f| old_cats.get(f.path.as_str()).is_some_and(|&c| c != f.category));
+        let recat = files.iter().any(|f| {
+            old_cats
+                .get(f.path.as_str())
+                .is_some_and(|&c| c != f.category)
+        });
         // 有成员"迁入"的分类(2026-09-03):外部改名/分类规则调整导致某文件
         // 分类变化,与在应用内改名同权——清该分类墓碑,否则墓碑挡住缺类补
         // 建,迁入成员无栏可归=隐身
@@ -2119,8 +2133,12 @@ fn apply_scan(mut files: Vec<FileItem>) {
             s.files.iter().map(|f| f.path.clone()).collect();
         // 只清已消失文件的图标缓存(2026-09-09:原实现全清,桌面一有变化
         // 全部图标重新 SHGFI 提取=可感知的卡顿)
-        s.icon_cache
-            .retain(|k, _| k.split('\0').next().map(|p| keep.contains(p)).unwrap_or(false));
+        s.icon_cache.retain(|k, _| {
+            k.split('\0')
+                .next()
+                .map(|p| keep.contains(p))
+                .unwrap_or(false)
+        });
         // 已删文件的常用记录同步剔除(2026-09-03):usage.json 残留旧路径时,
         // 同名新建会继承旧次数直接顶到"常用"第一位(用户实测)
         let pruned = model::prune_usage(&keep);
@@ -2603,10 +2621,7 @@ pub fn startup() {
                 f.hidden = persist_hidden;
             }
             if persist_hidden {
-                log(&format!(
-                    "boot restores desktop_state={}",
-                    desktop_state()
-                ));
+                log(&format!("boot restores desktop_state={}", desktop_state()));
             }
             if desktop_state() == "zen" {
                 // 纯净态启动:栅栏全程不呈现,图标协调不会去藏图标,
@@ -2636,6 +2651,12 @@ pub fn startup() {
     {
         model::set_auto_category(model::load_settings().auto_category); // 预热:开关单一真相
         SHOW_CHROME.store(model::load_settings().show_chrome, Ordering::Relaxed);
+        // 界面语言预热:settings.lang + 系统 locale -> 有效语言(菜单/面板查表)
+        let st = model::load_settings();
+        crate::lang::set_effective(crate::lang::resolve(
+            &st.lang,
+            crate::lang::system_prefers_zh(),
+        ));
     }
     // 首帧壁纸来源(两模式共用,2026-08-26 起透明模式同样需要种子):优先加载
     // 持久化缓存(快,且免去"原生图标可见时现场捕获"的残影/闪烁问题);无缓存
@@ -2684,8 +2705,7 @@ pub fn startup() {
     // join 后台 shell 预热:合并文件列表与图标缓存,补齐依赖文件列表的
     // 首次运行默认布局
     let (files, t_names) = bg_names.join().unwrap_or_else(|_| (Vec::new(), 0));
-    let (icon_prewarm, t_icons) =
-        bg_icons.join().unwrap_or_else(|_| (Default::default(), 0));
+    let (icon_prewarm, t_icons) = bg_icons.join().unwrap_or_else(|_| (Default::default(), 0));
     let mut created_cats: Vec<String> = Vec::new();
     {
         let mut s = state().lock().unwrap();
@@ -2794,6 +2814,9 @@ pub fn startup() {
             log(&format!("env-check at boot: ISSUES\n{report}"));
         }
     }
+    // 一次性首启引导(2026-09-11):first_run_done=false 才弹,任何关闭路径
+    // 都写 true;栅栏已呈现、托盘已就绪后出现,不再早于桌面接管
+    crate::firstrun::maybe_show();
 }
 
 /// IDesktopWallpaper 签名的最近值(幻灯片轮换检测)
@@ -2869,7 +2892,10 @@ fn global_tick() {
         let dirty = ICON_SAVE_DIRTY_MS.load(Ordering::Relaxed);
         if dirty != 0 && resize_now_ms().saturating_sub(dirty) > 4000 && t.is_multiple_of(4) {
             ICON_SAVE_DIRTY_MS.store(0, Ordering::Relaxed);
-            let px = model::DpiMetrics::system().icon_px.round().clamp(16.0, 256.0) as u32;
+            let px = model::DpiMetrics::system()
+                .icon_px
+                .round()
+                .clamp(16.0, 256.0) as u32;
             save_icon_cache_file_now(px);
         }
     }
@@ -2883,11 +2909,13 @@ fn global_tick() {
         let s = state().lock().unwrap();
         s.fences
             .iter()
-            .filter(|f| fence_needs_presentation(
-                f.hidden,
-                s.presented.contains(&f.id),
-                s.surfaces.contains_key(&f.id),
-            ))
+            .filter(|f| {
+                fence_needs_presentation(
+                    f.hidden,
+                    s.presented.contains(&f.id),
+                    s.surfaces.contains_key(&f.id),
+                )
+            })
             .map(|f| f.id)
             .collect()
     };
@@ -2922,11 +2950,7 @@ fn global_tick() {
         // 登录早期/壁纸切换过渡期的瞬态失败绝不能把"精确"误落盘成"透明"
         let capture_failed = state()
             .try_lock()
-            .map(|s| {
-                s.wallpapers.is_empty()
-                    && s.wallpaper_fails >= 2
-                    && resize_now_ms() > 10_000
-            })
+            .map(|s| s.wallpapers.is_empty() && s.wallpaper_fails >= 2 && resize_now_ms() > 10_000)
             .unwrap_or(false);
         if capture_failed {
             set_render_mode("transparent");
@@ -3195,7 +3219,9 @@ pub fn env_health_report() -> (bool, String) {
         lines.push("窗口: 无孤儿窗口 ✓".into());
     } else {
         ok = false;
-        lines.push(format!("窗口: 检测到 {orphans} 个孤儿 DeskFence 窗口(建议\"修复桌面环境\")"));
+        lines.push(format!(
+            "窗口: 检测到 {orphans} 个孤儿 DeskFence 窗口(建议\"修复桌面环境\")"
+        ));
     }
     // 4) 栅栏在带内(仅 normal 态判定)。zen/native 态栅栏有意全部隐藏,
     // total=0 不能构成 fault——2026-08-31 教训:zen 态被此判定恒判 fault,
@@ -3229,13 +3255,12 @@ pub fn env_health_report() -> (bool, String) {
             lines.push(format!("栅栏: {in_band}/{total} 在桌面层内 ✓"));
         } else {
             ok = false;
-            lines.push(format!("栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"));
+            lines.push(format!(
+                "栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"
+            ));
         }
     } else {
-        lines.push(format!(
-            "栅栏: 桌面态 {} 栅栏按状态隐藏 ✓",
-            desktop_state()
-        ));
+        lines.push(format!("栅栏: 桌面态 {} 栅栏按状态隐藏 ✓", desktop_state()));
     }
     // 5) 原生图标与接管状态一致性(仅提示,协调器每秒会修)
     if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
@@ -3345,7 +3370,9 @@ fn env_watchdog_tick() {
         let prev = WATCHDOG_FAULT_SINCE_MS.load(Ordering::Relaxed);
         if prev == 0 {
             WATCHDOG_FAULT_SINCE_MS.store(now, Ordering::Relaxed);
-            log(&format!("env-watchdog: fault started, waiting self-heal ({report})"));
+            log(&format!(
+                "env-watchdog: fault started, waiting self-heal ({report})"
+            ));
             now
         } else {
             prev
@@ -3391,8 +3418,7 @@ pub(crate) fn reconcile_desktop_icons() {
         // ——Explorer 在 ToggleDesktop/自身重建后可能重新显示图标列表,
         // 只看 DESKTOP_ICONS_HIDDEN 会死锁(标志 true 但图标可见,永不
         // 重新隐藏)。栅栏在桌面=图标必须藏,这就是"不被环境干扰"。
-        let lv_vis =
-            desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
+        let lv_vis = desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
         if (!DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) || lv_vis)
             && set_desktop_icons_visible(false)
         {
@@ -3406,8 +3432,8 @@ pub(crate) fn reconcile_desktop_icons() {
         // 若以标志为前提,清掉后 zen 的图标维持整条失效=纯净态破功
         // (2026-08-31)。每秒只做"读可见性"的检查,失配才重新隐藏,
         // 平时零骚扰。崩溃安全不受影响:接管标记仍在。
-        let re_showing = desktop_listview()
-            .is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
+        let re_showing =
+            desktop_listview().is_some_and(|lv| unsafe { IsWindowVisible(lv).as_bool() });
         if re_showing
             && !NATIVE_DESKTOP_OVERRIDE.load(Ordering::Relaxed)
             && set_desktop_icons_visible(false)
@@ -3424,9 +3450,10 @@ pub(crate) fn reconcile_desktop_icons() {
             let s = state().lock().unwrap();
             let mut why: Vec<String> = Vec::new();
             for f in s.fences.iter().filter(|f| !f.hidden) {
-                let vis = s.windows.get(&f.id).is_some_and(|h| unsafe {
-                    IsWindowVisible(*h).as_bool()
-                });
+                let vis = s
+                    .windows
+                    .get(&f.id)
+                    .is_some_and(|h| unsafe { IsWindowVisible(*h).as_bool() });
                 if !(vis && s.presented.contains(&f.id)) {
                     why.push(format!(
                         "{}:vis={}pres={}",
@@ -4051,7 +4078,6 @@ pub(crate) fn set_all_hidden(hidden: bool) {
     }
 }
 
-
 static INTENTIONAL_HIDE: AtomicBool = AtomicBool::new(false);
 
 // ---------------- WndProc ----------------
@@ -4476,4 +4502,3 @@ mod presentation_tests {
         }
     }
 }
-

@@ -327,10 +327,7 @@ pub fn align_first_row_left(rects: &mut [Rect], anchor_x: f32) -> bool {
     let Some(first) = rows.first() else {
         return false;
     };
-    let min_x = first
-        .iter()
-        .map(|&i| rects[i].x)
-        .fold(f32::MAX, f32::min);
+    let min_x = first.iter().map(|&i| rects[i].x).fold(f32::MAX, f32::min);
     if min_x == anchor_x {
         return false;
     }
@@ -386,7 +383,10 @@ pub fn row_slot_of(rects: &[Rect], rows: &[Vec<usize>], center: (f32, f32)) -> (
     let mut best_row = 0usize;
     let mut bd = f32::MAX;
     for (ri, row) in rows.iter().enumerate() {
-        let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+        let mid = row
+            .iter()
+            .map(|&i| rects[i].y + rects[i].h * 0.5)
+            .sum::<f32>()
             / row.len() as f32;
         let d = (center.1 - mid).abs();
         if d < bd {
@@ -409,7 +409,10 @@ pub fn row_slot_of(rects: &[Rect], rows: &[Vec<usize>], center: (f32, f32)) -> (
 pub fn nearest_row_distance(rects: &[Rect], rows: &[Vec<usize>], y: f32) -> f32 {
     rows.iter()
         .map(|row| {
-            let mid = row.iter().map(|&i| rects[i].y + rects[i].h * 0.5).sum::<f32>()
+            let mid = row
+                .iter()
+                .map(|&i| rects[i].y + rects[i].h * 0.5)
+                .sum::<f32>()
                 / row.len() as f32;
             (y - mid).abs()
         })
@@ -882,14 +885,53 @@ fn svec(v: &[&str]) -> Vec<String> {
 /// 内置 8 类(与历史 categorize 硬编码逐字节一致,老配置无缝迁移)
 pub fn default_categories() -> Vec<CategoryDef> {
     vec![
-        CategoryDef { name: "软件".into(), exts: svec(&["exe", "msi", "lnk", "bat", "cmd", "com"]), dirs: false },
-        CategoryDef { name: "文件夹".into(), exts: vec![], dirs: true },
-        CategoryDef { name: "文档".into(), exts: svec(&["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "rtf", "log"]), dirs: false },
-        CategoryDef { name: "图片".into(), exts: svec(&["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico"]), dirs: false },
-        CategoryDef { name: "媒体".into(), exts: svec(&["mp3", "wav", "flac", "aac", "ogg", "mp4", "avi", "mkv", "mov", "wmv", "flv"]), dirs: false },
-        CategoryDef { name: "代码".into(), exts: svec(&["js", "ts", "py", "rs", "go", "c", "cpp", "h", "hpp", "java", "cs", "rb", "php", "html", "css", "json", "xml", "yaml", "yml", "toml", "sh", "md"]), dirs: false },
-        CategoryDef { name: "压缩包".into(), exts: svec(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "part"]), dirs: false },
-        CategoryDef { name: FALLBACK_CATEGORY.into(), exts: vec![], dirs: false },
+        CategoryDef {
+            name: "软件".into(),
+            exts: svec(&["exe", "msi", "lnk", "bat", "cmd", "com"]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: "文件夹".into(),
+            exts: vec![],
+            dirs: true,
+        },
+        CategoryDef {
+            name: "文档".into(),
+            exts: svec(&[
+                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "rtf", "log",
+            ]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: "图片".into(),
+            exts: svec(&["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico"]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: "媒体".into(),
+            exts: svec(&[
+                "mp3", "wav", "flac", "aac", "ogg", "mp4", "avi", "mkv", "mov", "wmv", "flv",
+            ]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: "代码".into(),
+            exts: svec(&[
+                "js", "ts", "py", "rs", "go", "c", "cpp", "h", "hpp", "java", "cs", "rb", "php",
+                "html", "css", "json", "xml", "yaml", "yml", "toml", "sh", "md",
+            ]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: "压缩包".into(),
+            exts: svec(&["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "part"]),
+            dirs: false,
+        },
+        CategoryDef {
+            name: FALLBACK_CATEGORY.into(),
+            exts: vec![],
+            dirs: false,
+        },
     ]
 }
 
@@ -928,8 +970,7 @@ fn ext_of(name: &str) -> &str {
 
 /// 分类表运行时缓存:惰性从 settings.json 加载一次,面板修改后经
 /// set_category_table 同步(进程级 Mutex——categorize 在扫描线程也会被调)
-static CATEGORY_TABLE: std::sync::Mutex<Option<Vec<CategoryDef>>> =
-    std::sync::Mutex::new(None);
+static CATEGORY_TABLE: std::sync::Mutex<Option<Vec<CategoryDef>>> = std::sync::Mutex::new(None);
 
 /// 当前生效的分类表(惰性加载;未加载前与 load_settings().categories 一致)
 pub fn category_table() -> Vec<CategoryDef> {
@@ -1413,6 +1454,16 @@ pub struct Settings {
     /// 布局;关=无边框常显(悬停或拖拽时才浮现)。托盘菜单切换即落盘。
     #[serde(default)]
     pub show_chrome: bool,
+    /// 界面语言(2026-09-11):"auto"=系统安装语言是简中则中文否则英文(默认) /
+    /// "zh"=简体中文 / "en"=English。托盘"语言/Language"切换即落盘;有效语言
+    /// 解析进 lang 模块原子量,菜单/面板每次现建时查表,切换无需重启。
+    /// 分类名/栅栏标题是用户数据,不随语言变。
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    /// 一次性首启引导(2026-09-11):false=启动末尾弹出引导窗;窗口任何关闭
+    /// 路径(OK/X)都写 true——用户约定"最多只出现一次"。
+    #[serde(default)]
+    pub first_run_done: bool,
     /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
     /// 分类不再自动重建,除非之后出现该类的**新文件**(mtime 晚于删除)。
     /// 防止"删了的栅栏又冒出来"(回收站恒在=软件类恒有文件,mp3 常驻=
@@ -1438,6 +1489,9 @@ pub fn default_auto_category() -> bool {
 }
 pub fn default_z_guard() -> bool {
     true
+}
+pub fn default_lang() -> String {
+    "auto".into()
 }
 
 /// 自定义分类模式的兜底类别:未被任何栅栏收纳的文件都在这里,保证不"隐身"
@@ -1499,6 +1553,8 @@ impl Default for Settings {
             desktop_state: default_desktop_state(),
             z_guard: default_z_guard(),
             show_chrome: false,
+            lang: default_lang(),
+            first_run_done: false,
             deleted_category_at: Default::default(),
             categories: default_categories(),
         }
@@ -1533,9 +1589,11 @@ pub fn load_settings_from(path: &std::path::Path) -> Settings {
                 auto_category: default_auto_category(),
                 desktop_state: default_desktop_state(),
                 z_guard: default_z_guard(),
-            show_chrome: false,
-            deleted_category_at: Default::default(),
-            categories: default_categories(),
+                show_chrome: false,
+                lang: default_lang(),
+                first_run_done: false,
+                deleted_category_at: Default::default(),
+                categories: default_categories(),
             }
         }
     }
@@ -2003,7 +2061,10 @@ mod tests {
             mtime_ms: mtime,
         };
         // 输入故意先给后建的,验证排序键而非输入顺序
-        let items = vec![mk("新建 Microsoft Excel 工作表.xlsx", 2000), mk("新建 文本文档 (2).txt", 1000)];
+        let items = vec![
+            mk("新建 Microsoft Excel 工作表.xlsx", 2000),
+            mk("新建 文本文档 (2).txt", 1000),
+        ];
         let out = display_list(&fence, &items);
         assert_eq!(out[0].name, "新建 文本文档 (2).txt");
         assert_eq!(out[1].name, "新建 Microsoft Excel 工作表.xlsx");
@@ -2119,7 +2180,7 @@ mod tests {
         let ((x, y), snapped) = snap_gap_to_neighbors(&Rect { x: 448.0, ..r }, &others, 18.0);
         assert!(snapped && (x - 444.0).abs() < 0.01);
         assert_eq!(y, 60.0); // 未命中轴保持原值
-        // 远离时不吸附
+                             // 远离时不吸附
         let ((x2, _), snapped2) = snap_gap_to_neighbors(&Rect { x: 100.0, ..r }, &others, 18.0);
         assert!(!snapped2 && x2 == 100.0);
     }
@@ -3215,13 +3276,13 @@ mod tests {
     /// 下行 [M3(0,112,244) M4(256,112,132) M5(400,112,132)]
     fn two_row_layout(a: Rect) -> Vec<Rect> {
         vec![
-            rr(0.0, 0.0, 244.0, 100.0), // 0 M0
-            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
-            rr(512.0, 0.0, 132.0, 100.0), // 2 M2
-            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(0.0, 0.0, 244.0, 100.0),     // 0 M0
+            rr(256.0, 0.0, 244.0, 100.0),   // 1 M1
+            rr(512.0, 0.0, 132.0, 100.0),   // 2 M2
+            rr(0.0, 112.0, 244.0, 100.0),   // 3 M3
             rr(256.0, 112.0, 132.0, 100.0), // 4 M4
             rr(400.0, 112.0, 132.0, 100.0), // 5 M5
-            a,                          // 6 A(被拖者)
+            a,                              // 6 A(被拖者)
         ]
     }
 
@@ -3334,7 +3395,7 @@ mod tests {
         // 三层:中行 A(256,212) 插到第三行 G(512) 之前:
         // 第三行 [A,G] @ 512/656;中行另一成员 M1 不动
         let rects = vec![
-            rr(0.0, 212.0, 244.0, 100.0), // 0 M1(中行)
+            rr(0.0, 212.0, 244.0, 100.0),   // 0 M1(中行)
             rr(512.0, 424.0, 132.0, 100.0), // 1 G(第三行)
             rr(256.0, 212.0, 132.0, 100.0), // 2 A(中行)
         ];
@@ -3349,17 +3410,17 @@ mod tests {
     fn head_slot_fills_when_first_member_leaves() {
         // 行首 A(0,0) 移走进下行:上行 M0 左滑接管行首(0,0),不残留空洞
         let rects = vec![
-            rr(0.0, 0.0, 132.0, 100.0), // 0 A(行首)
-            rr(144.0, 0.0, 244.0, 100.0), // 1 M0
-            rr(400.0, 0.0, 244.0, 100.0), // 2 M1
-            rr(0.0, 112.0, 244.0, 100.0), // 3 M3
+            rr(0.0, 0.0, 132.0, 100.0),     // 0 A(行首)
+            rr(144.0, 0.0, 244.0, 100.0),   // 1 M0
+            rr(400.0, 0.0, 244.0, 100.0),   // 2 M1
+            rr(0.0, 112.0, 244.0, 100.0),   // 3 M3
             rr(256.0, 112.0, 132.0, 100.0), // 4 M4
         ];
         let (pos, land) = row_insert_layout(&rects, 0, (1, 0));
         assert_eq!(land, (0.0, 112.0));
         assert_eq!(pos[1], (0.0, 0.0)); // M0 左滑接管行首(0,0)
         assert_eq!(pos[2], (256.0, 0.0)); // M1 跟进,与 M0 保持固定 GAP
-        // 下行 [A,M3,M4] @ 0/144/400
+                                          // 下行 [A,M3,M4] @ 0/144/400
         assert_eq!(pos[3], (144.0, 112.0));
         assert_eq!(pos[4], (400.0, 112.0));
         assert_no_overlap(&rects, &pos);
@@ -3369,9 +3430,9 @@ mod tests {
     fn second_member_slides_to_row_head() {
         // 下行两个 [B1(0),B2(256)],B1 移走进上行:B2 左滑到下行行首(0,112)
         let rects = vec![
-            rr(0.0, 0.0, 244.0, 100.0), // 0 M0(上行)
-            rr(256.0, 0.0, 244.0, 100.0), // 1 M1
-            rr(0.0, 112.0, 132.0, 100.0), // 2 B1
+            rr(0.0, 0.0, 244.0, 100.0),     // 0 M0(上行)
+            rr(256.0, 0.0, 244.0, 100.0),   // 1 M1
+            rr(0.0, 112.0, 132.0, 100.0),   // 2 B1
             rr(256.0, 112.0, 132.0, 100.0), // 3 B2
         ];
         let (pos, land) = row_insert_layout(&rects, 2, (0, 0));
@@ -3400,9 +3461,9 @@ mod tests {
         // 同行错位:行内 y 归一到最顶栅栏顶边,两行各自归一互不越行;
         // x/尺寸一律不动
         let mut rects = vec![
-            rr(0.0, 30.0, 200.0, 100.0), // 0 行0 顶
-            rr(220.0, 80.0, 200.0, 100.0), // 1 行0 错位(中心差 50 ≤ 容差 60)
-            rr(0.0, 180.0, 132.0, 100.0), // 2 行1 顶
+            rr(0.0, 30.0, 200.0, 100.0),    // 0 行0 顶
+            rr(220.0, 80.0, 200.0, 100.0),  // 1 行0 错位(中心差 50 ≤ 容差 60)
+            rr(0.0, 180.0, 132.0, 100.0),   // 2 行1 顶
             rr(220.0, 220.0, 132.0, 100.0), // 3 行1 错位
         ];
         assert!(align_rows_top(&mut rects));
@@ -3419,7 +3480,7 @@ mod tests {
     fn align_rows_top_keeps_distinct_rows_intact() {
         // 中心距超容差=两行,各自顶边已是最小 → 无改动(归一不合并行)
         let mut rects = vec![
-            rr(0.0, 0.0, 132.0, 100.0),    // 中心 50
+            rr(0.0, 0.0, 132.0, 100.0),   // 中心 50
             rr(0.0, 115.0, 132.0, 100.0), // 中心 165,差 115 > 容差 60
         ];
         assert!(!align_rows_top(&mut rects));
@@ -3457,8 +3518,8 @@ mod tests {
     fn align_first_row_left_translates_row_to_edge() {
         // 首行整体平移到工作区左缘,行内间距保持;第二行不动
         let mut rects = vec![
-            rr(120.0, 0.0, 200.0, 100.0), // 首行最左
-            rr(360.0, 20.0, 132.0, 100.0), // 首行第二(中心差 20 ≤ 60)
+            rr(120.0, 0.0, 200.0, 100.0),   // 首行最左
+            rr(360.0, 20.0, 132.0, 100.0),  // 首行第二(中心差 20 ≤ 60)
             rr(300.0, 300.0, 132.0, 100.0), // 第二行
         ];
         assert!(align_first_row_left(&mut rects, 0.0));
@@ -3483,7 +3544,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("settings.json");
         let mut s = Settings::default();
-        s.deleted_category_at.insert("文档".into(), 1_726_400_000_000);
+        s.deleted_category_at
+            .insert("文档".into(), 1_726_400_000_000);
         save_settings_to(&p, &s);
         // 部分更新:只改对齐档位
         let mut cur = load_settings_from(&p);

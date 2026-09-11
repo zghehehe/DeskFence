@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, CreateFontIndirectW, HBRUSH, HFONT, HGDIOBJ, COLOR_BTNFACE,
+    CreateFontIndirectW, DeleteObject, COLOR_BTNFACE, HBRUSH, HFONT, HGDIOBJ,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -114,7 +114,7 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
     let px = (pt.x - w / 2).clamp(vs_x, (vs_x + vs_w - w).max(vs_x));
     let py = (pt.y - h - 12).clamp(vs_y, (vs_y + vs_h - h).max(vs_y));
     let cls = shell::wide("DeskFenceCatsPanel");
-    let title = shell::wide("管理分类");
+    let title = shell::wide(crate::lang::cats_title());
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -175,7 +175,7 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     match msg {
         WM_CREATE => {
             let scale = model::dpi_scale();
-            let font = create_dialog_font();
+            let font = create_dialog_font(false);
             let mut panel = Box::new(Panel {
                 rows: Vec::new(),
                 font,
@@ -184,8 +184,19 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             });
             for c in model::category_table() {
                 let locked_name = c.name == model::FALLBACK_CATEGORY;
-                let exts_text = if c.dirs { "(目录)".to_string() } else { c.exts.join(";") };
-                append_row(hwnd, &mut panel, &c.name, &exts_text, locked_name, locked_name || c.dirs);
+                let exts_text = if c.dirs {
+                    crate::lang::dirs_marker().to_string()
+                } else {
+                    c.exts.join(";")
+                };
+                append_row(
+                    hwnd,
+                    &mut panel,
+                    &c.name,
+                    &exts_text,
+                    locked_name,
+                    locked_name || c.dirs,
+                );
             }
             panel.add_btn = create_add_button(hwnd, &panel);
             layout_all(hwnd, &panel);
@@ -240,7 +251,7 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(panel.font.0));
                     }
-                    panel.font = create_dialog_font();
+                    panel.font = create_dialog_font(false);
                     let f = WPARAM(panel.font.0 as usize);
                     for r in &panel.rows {
                         let _ = SendMessageW(r.edit, WM_SETFONT, f, LPARAM(1));
@@ -256,9 +267,12 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            // 先清 USERDATA 再释放:此后子窗口销毁触发的 EN_KILLFOCUS 会安全空转
+            // 先取出面板指针、立刻清 USERDATA:此后子窗口销毁触发的 EN_KILLFOCUS
+            // 经 panel_of 拿到 None 安全空转;释放放在清空之后,保证真正执行
+            // (旧写法先清再读同一槽位,释放分支永不执行=每次开面板漏一个字体+一块堆)。
+            let panel = panel_of(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            if let Some(p) = panel_of(hwnd) {
+            if let Some(p) = panel {
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(p.font.0));
                 }
@@ -281,7 +295,14 @@ unsafe fn panel_of(hwnd: HWND) -> Option<&'static mut Panel> {
     }
 }
 
-fn append_row(parent: HWND, panel: &mut Panel, name: &str, exts_text: &str, locked_name: bool, locked_exts: bool) {
+fn append_row(
+    parent: HWND,
+    panel: &mut Panel,
+    name: &str,
+    exts_text: &str,
+    locked_name: bool,
+    locked_exts: bool,
+) {
     let i = panel.rows.len();
     let s = panel.scale;
     let row_h = row_h(s);
@@ -384,7 +405,7 @@ fn append_row(parent: HWND, panel: &mut Panel, name: &str, exts_text: &str, lock
 fn create_add_button(parent: HWND, panel: &Panel) -> HWND {
     let s = panel.scale;
     let cls_btn = shell::wide("BUTTON");
-    let t = shell::wide("＋ 新增分类");
+    let t = shell::wide(crate::lang::cats_add_btn());
     unsafe {
         let h = CreateWindowExW(
             WS_EX_NOPARENTNOTIFY,
@@ -505,7 +526,7 @@ fn do_add(hwnd: HWND, panel: &mut Panel) {
     if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
         commit_row(panel, i);
     }
-    if let Some(name) = crate::menu::apply_category_add("新分类") {
+    if let Some(name) = crate::menu::apply_category_add(crate::lang::new_category_base()) {
         append_row(hwnd, panel, &name, "", false, false);
         layout_all(hwnd, panel);
         if let Some(r) = panel.rows.last() {
@@ -601,7 +622,8 @@ fn set_text(h: HWND, s: &str) {
     }
 }
 
-fn create_dialog_font() -> HFONT {
+/// 创建对话框消息字体;bold=粗体(节头用)。regular/粗体两档共用一套度量
+pub(crate) fn create_dialog_font(bold: bool) -> HFONT {
     unsafe {
         let mut ncm = NONCLIENTMETRICSW {
             cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
@@ -615,6 +637,9 @@ fn create_dialog_font() -> HFONT {
         )
         .is_ok()
         {
+            if bold {
+                ncm.lfMessageFont.lfWeight = 700;
+            }
             return CreateFontIndirectW(&ncm.lfMessageFont);
         }
         HFONT(0) // 取系统字体失败时控件用默认字体,不影响功能

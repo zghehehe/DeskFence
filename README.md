@@ -7,7 +7,8 @@
 **把 Windows 桌面还给你 —— 自动分类、原生观感、零感知的桌面图标栅栏**
 
 [![Release](https://img.shields.io/github/v/release/zghehehe/DeskFence?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/zghehehe/DeskFence/releases/latest)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/zghehehe/DeskFence?style=flat&logo=github&label=Stars)](https://github.com/zghehehe/DeskFence/stargazers)
+[![License](https://img.shields.io/badge/license-GPL--3.0%20%2B%20Commercial-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)
 ![Rust](https://img.shields.io/badge/Rust-%F0%9F%A6%80-orange)
 
@@ -46,9 +47,15 @@ Rust + Win32 + Direct2D 实现。
   - 正常：栅栏接管桌面
   - 纯净：栅栏与图标都隐藏，只剩壁纸
   - 原生：恢复 Explorer 原生图标
-- **无边框常显**：平时完全干净，悬停才浮现边框/标题/手柄
+- **边框线随心显隐**：默认显示细边框便于观察分组；关掉后平时完全
+  干净，悬停才浮现边框/标题/手柄（托盘一键切换）
 - **栅栏操作**：新建 / 重命名 / 折叠 / 锁定 / 删除；内容多时滚轮滚动，
   框选批量移动，图标就地重命名（与 Explorer 同款）
+- **中英双语**：托盘 → 语言 / Language 即时切换（跟随系统/中文/English），
+  无需重启；界面文字与原生菜单完全一致
+- **首启引导（一次性）**：首次启动弹出说明窗——桌面已被归类、如何一键
+  还原，并默认勾选"显示栅栏边框线"与"开机自启"（不需要取消勾选即可），
+  关闭后绝不再弹
 - **多显示器 + 高 DPI**：跨屏 DPI 变更即时自适应，跟随系统 Ctrl+滚轮的
   图标大小；开机自启动（托盘开关），进程拉起后约 0.3 秒全量呈现
 - 布局可反悔：撤销上次布局调整、一键恢复默认布局；Explorer 重启自愈
@@ -111,4 +118,11 @@ windres 等额外工具。
 
 ## License
 
-[MIT](LICENSE)
+采用 **GPL-3.0 + 商业授权** 双许可（详见 [LICENSE](LICENSE)）：
+
+- **开源使用**：个人使用、学习、修改、再分发遵循
+  [GNU GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html)——含商用，
+  但衍生物须同样以 GPL-3.0 开源
+- **商业授权**：闭源集成、OEM 定制等无法满足 GPL 义务的场景，可经
+  [GitHub Issues](https://github.com/zghehehe/DeskFence/issues) 与作者
+  协商单独授权

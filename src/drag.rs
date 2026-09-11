@@ -8,28 +8,25 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    HWND, LPARAM, POINT, WPARAM,
-};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE,
-    TRACKMOUSEEVENT, TRACKMOUSEEVENT_FLAGS, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    TRACKMOUSEEVENT_FLAGS, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_UP,
 };
 // windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::menu::{dispatch_desktop_command, fence_menu};
 use crate::model::{self, Fence, Hit, Rect};
 use crate::ole;
 use crate::render;
-use crate::shell;
 use crate::selfheal::*;
-use crate::menu::{dispatch_desktop_command, fence_menu};
+use crate::shell;
 
 use crate::rename::*;
 use crate::ui::*;
-
 
 #[derive(Clone, Copy)]
 pub(crate) enum DragMode {
@@ -450,11 +447,7 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
         let m = rects[row_t[row_t.len() - 1]];
         (m.x + m.w + model::GAP * 0.5 - 1.25, top, 2.5, bottom - top)
     };
-    Some(InsertPlan {
-        assign,
-        land,
-        line,
-    })
+    Some(InsertPlan { assign, land, line })
 }
 
 /// 邻居等距吸附(上下左右对称):左右贴齐/紧邻保持 GAP,上下同理。
@@ -740,10 +733,7 @@ pub(crate) fn refresh_guide(s: &mut UiState) {
 /// 其他应用上方(2026-09-08 误删此泵导致,勿再删)。
 pub(crate) fn update_overlay() {
     let mut s = state().lock().unwrap();
-    if s.drag_ghost.is_none()
-        && s.arrival_animations.is_empty()
-        && s.insert_line.is_none()
-    {
+    if s.drag_ghost.is_none() && s.arrival_animations.is_empty() && s.insert_line.is_none() {
         if let Some(h) = s.guide_hwnd {
             unsafe {
                 let _ = ShowWindow(h, SW_HIDE);
@@ -1219,8 +1209,7 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             let hx = sx - model::icon_size() / 2.0;
                             let hy = sy - model::icon_size() / 2.0;
                             let (original, original_sort_mode) = {
-                                let Some(fence) = s.fences.iter().find(|f| f.id == fence_id)
-                                else {
+                                let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
                                     log("icon drag aborted: fence vanished mid-press");
                                     s.drag = None;
                                     drop(s);
@@ -1698,7 +1687,12 @@ pub(crate) fn rollback_ghost_preview(s: &mut UiState) {
 }
 
 /// 拖出释放点(屏幕坐标)是否落在某个非源栅栏的回收站图标上。
-pub(crate) fn release_on_recycle_bin_screen(s: &UiState, sx: f32, sy: f32, source_fence: u32) -> bool {
+pub(crate) fn release_on_recycle_bin_screen(
+    s: &UiState,
+    sx: f32,
+    sy: f32,
+    source_fence: u32,
+) -> bool {
     for fence in &s.fences {
         if fence.id == source_fence || fence.hidden || fence.collapsed {
             continue;
@@ -1933,7 +1927,8 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     // 9/7 重构(1d007b4"UP 出口无条件执行")留下的洞)
                     *pending_open().lock().unwrap() = None;
                 }
-                let slow_rename = now_ms as i64 - prev_up_ms > unsafe { GetDoubleClickTime() } as i64;
+                let slow_rename =
+                    now_ms as i64 - prev_up_ms > unsafe { GetDoubleClickTime() } as i64;
                 if drag.icon_was_selected
                     && !ctrl
                     && !moved
@@ -2192,9 +2187,11 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         {
             let s = state().lock().unwrap();
             let hosts = desktop_hosts();
-            let target = s.fences.iter().find(|f| f.id == fence_id).map(|f| {
-                (f.hidden, f.rect)
-            });
+            let target = s
+                .fences
+                .iter()
+                .find(|f| f.id == fence_id)
+                .map(|f| (f.hidden, f.rect));
             if let Some((hidden, rect)) = target {
                 if !hidden {
                     if let Some(host) = host_for_rect(&rect, &hosts) {

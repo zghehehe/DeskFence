@@ -2,7 +2,9 @@
 
 mod cats_panel;
 mod drag;
+mod firstrun;
 mod iconcache;
+mod lang;
 mod menu;
 mod model;
 mod ole;

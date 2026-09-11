@@ -1,2 +1,7 @@
 /target
 /.site-deploy
+
+# 本地调试/验证产物不入库(2026-09-11):截图、探针日志、改文件前的 .bak 备份
+*.bak-*
+tools/*_shot.png
+tools/*_probe*.log

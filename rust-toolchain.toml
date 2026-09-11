@@ -1,0 +1,4 @@
+[toolchain]
+# 与 CI 的 dtolnay/rust-toolchain@1.97.0 一致;升级=同步改 CI 那行+本地全绿
+# 本机 1.97.0 已于 2026-09-11 经 rsproxy 镜像完整重装(旧目录残缺 Missing manifest)
+channel = "1.97.0"

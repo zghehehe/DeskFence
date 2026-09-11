@@ -518,10 +518,8 @@ pub(crate) fn start_file_rename(path: String) {
         {
             let mut s = state().lock().unwrap();
             s.rename_metrics.insert(edit.0, edit_metrics);
-            s.rename_centers.insert(
-                edit.0,
-                (edit_x as f32 + edit_w as f32 * 0.5).round() as i32,
-            );
+            s.rename_centers
+                .insert(edit.0, (edit_x as f32 + edit_w as f32 * 0.5).round() as i32);
             if !font.is_invalid() {
                 s.rename_fonts.insert(edit.0, font);
             }
@@ -652,12 +650,8 @@ unsafe extern "system" fn file_rename_edit_proc(
                 if !clean.is_empty() {
                     const EM_REPLACESEL: u32 = 0x00C2;
                     let w = shell::wide(&clean);
-                    let _ = SendMessageW(
-                        hwnd,
-                        EM_REPLACESEL,
-                        WPARAM(1),
-                        LPARAM(w.as_ptr() as isize),
-                    );
+                    let _ =
+                        SendMessageW(hwnd, EM_REPLACESEL, WPARAM(1), LPARAM(w.as_ptr() as isize));
                 }
                 adjust_rename_edit_height(hwnd);
                 return LRESULT(0);
@@ -721,7 +715,11 @@ unsafe extern "system" fn file_rename_edit_proc(
                     s.file_rename_edit = None;
                     s.rename_metrics.remove(&hwnd.0);
                     s.rename_centers.remove(&hwnd.0);
-                    s.fences.iter().filter(|f| !f.hidden).map(|f| f.id).collect::<Vec<_>>()
+                    s.fences
+                        .iter()
+                        .filter(|f| !f.hidden)
+                        .map(|f| f.id)
+                        .collect::<Vec<_>>()
                 };
                 uninstall_rename_mouse_hook();
                 let font = state().lock().unwrap().rename_fonts.remove(&hwnd.0);
@@ -807,8 +805,8 @@ fn adjust_rename_edit_height(edit: HWND) {
         // 系数 0.69:应用内实测 text_w(v4flash测试.txt)=123,原生同名的
         // 可见换行点在"测|试"→ 原生有效换行宽 ≈ 85(窗口 [82,97)),0.69×123
         // = 85 正中;xxx.txt(43)→ 66 保单行;长名(690)→ 封顶 111 保 6 字/行。
-        let fmt_w = ((text_w * 0.69).round() as i32)
-            .clamp(66, (m.cell_w - 2.0 * m.scale).round() as i32);
+        let fmt_w =
+            ((text_w * 0.69).round() as i32).clamp(66, (m.cell_w - 2.0 * m.scale).round() as i32);
         let new_w = fmt_w + 10;
         // 先应用宽度:换行随之更新,后续行数/高度按新宽计算(同轮收敛)
         if new_w != rc.right - rc.left {
@@ -845,11 +843,13 @@ fn adjust_rename_edit_height(edit: HWND) {
             LPARAM((&mut format as *mut RECT) as isize),
         );
         let format_ok = format.right > format.left && format.bottom > format.top;
-        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as f32;
+        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0))
+            .0
+            .max(1) as f32;
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        let in_mon = GetMonitorInfoW(MonitorFromWindow(edit, MONITOR_DEFAULTTONEAREST), &mut mi)
-            .as_bool();
+        let in_mon =
+            GetMonitorInfoW(MonitorFromWindow(edit, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool();
         let (mon_left, mon_top, mon_right, mon_bottom) = if in_mon {
             (
                 mi.rcMonitor.left as i32,
@@ -881,7 +881,9 @@ fn adjust_rename_edit_height(edit: HWND) {
         let format_h = if format_ok {
             (format.bottom - format.top).max(1)
         } else {
-            client_h.saturating_sub((8.0 * m.scale).round() as i32).max(1)
+            client_h
+                .saturating_sub((8.0 * m.scale).round() as i32)
+                .max(1)
         };
         let vertical_pad = (client_h - format_h).max((4.0 * m.scale).round() as i32);
         let min_h = (line_h.round() as i32).saturating_add(vertical_pad);
@@ -973,7 +975,10 @@ fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
     let old_path = FILE_RENAME_PATH.lock().unwrap().clone().unwrap_or_default();
     if old_path.is_empty() {
         destroy_file_rename_edit(edit);
-        return CommitOutcome { renamed: false, migration: None };
+        return CommitOutcome {
+            renamed: false,
+            migration: None,
+        };
     }
     let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
     let mut buf = vec![0u16; len + 1];
@@ -989,23 +994,32 @@ fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
     // 空名/没改:关闭编辑框,桌面状态不动(与原生一致)
     if new_name.is_empty() || new_name == old_name {
         destroy_file_rename_edit(edit);
-        return CommitOutcome { renamed: false, migration: None };
+        return CommitOutcome {
+            renamed: false,
+            migration: None,
+        };
     }
     // 与 Explorer 相同的非法字符集合,外加全部控制字符(\n\r\t 等——
     // NTFS 文件名禁控制字符,漏检会走到 rename 必败路径)
-    let invalid = new_name
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
+    let invalid = new_name.chars().any(|c| {
+        c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    });
     if invalid {
         log(&format!("file rename rejected (illegal chars): {new_name}"));
         rename_failure_feedback(edit);
-        return CommitOutcome { renamed: false, migration: None };
+        return CommitOutcome {
+            renamed: false,
+            migration: None,
+        };
     }
     let renamed = shell::rename_path(&old_path, &new_name);
     if !renamed {
         log(&format!("file rename failed: {old_path} -> {new_name}"));
         rename_failure_feedback(edit);
-        return CommitOutcome { renamed: false, migration: None };
+        return CommitOutcome {
+            renamed: false,
+            migration: None,
+        };
     }
     // 同步被拖入栅栏的 pinned 引用,指向新路径
     let new_path = std::path::Path::new(&old_path)
@@ -1066,13 +1080,16 @@ fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
         }
     }
     destroy_file_rename_edit(edit);
-    CommitOutcome { renamed: true, migration }
+    CommitOutcome {
+        renamed: true,
+        migration,
+    }
 }
 
 /// 读取剪贴板 CF_UNICODETEXT;取不到返回 None(调用方回落默认粘贴行为)
 fn sanitized_clipboard_text() -> Option<String> {
-    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     const CF_UNICODETEXT: u32 = 13;
     unsafe {

@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
 
 permissions:
   contents: read
@@ -13,12 +15,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # 工具链 pin 在 1.97.0(2026-09-11):CI 用 @stable 曾因 runner 比本地新
+      # (1.98 新 lint chunks_exact_to_as_chunks)四处红灯。本机 rustup 的显式
+      # 1.97.0 目录残缺(Missing manifest)故不能用 rust-toolchain.toml,
+      # 改在 CI 侧 pin;本地 stable 升级时主动同步这里。
+      - uses: dtolnay/rust-toolchain@1.97.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 2026-09-11 全库格式化后开启;本地提交前先 cargo fmt --check
+      - name: Format check
+        run: cargo fmt --check
 
       - name: Test
         run: cargo test --locked
 
       # clippy 严格门禁(2026-09-09:存量 71 条风格警告已在 1f59b84..305e72b
-      # 分批清零,任何新警告直接红灯)
+      # 分批清零,任何新警告直接红灯)。--all-targets 把测试代码也纳入门禁
+      # (2026-09-11 本地全绿后加入)
       - name: Clippy (deny warnings)
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings

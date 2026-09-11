@@ -19,10 +19,9 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_GDI_CLASSIC,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_GDI_CLASSIC,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -456,12 +455,7 @@ pub fn gdi_draw_labels_seeded(
                     // 快照壁纸色(直色);无快照或超出覆盖范围按黑种子兜底
                     let wx = fence_x + (x0 + xx) as i32 - wp.map(|w| w.origin_x).unwrap_or(0);
                     let (wb, wg, wr) = match wp {
-                        Some(w)
-                            if wx >= 0
-                                && wy >= 0
-                                && (wx as u32) < w.w
-                                && (wy as u32) < w.h =>
-                        {
+                        Some(w) if wx >= 0 && wy >= 0 && (wx as u32) < w.w && (wy as u32) < w.h => {
                             let wo = ((wy as u32 * w.w + wx as u32) * 4) as usize;
                             (w.px[wo], w.px[wo + 1], w.px[wo + 2])
                         }
@@ -605,8 +599,7 @@ pub fn get_icon_buffer(
 
 /// 图标提取(缓存未命中)累计耗时/次数,启动诊断"首帧慢"用
 pub static ICON_EXTRACT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static ICON_EXTRACT_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static ICON_EXTRACT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 绘制整个栅栏到表面。
 /// 默认完全透明(与原生桌面一致);悬停或拖动时浮现极淡卡片与标题/滚动条等 chrome。
@@ -723,7 +716,17 @@ pub fn draw_fence(
                 let selected = selected_paths.contains(&item.path);
                 let focused = focused_path == Some(item.path.as_str());
                 draw_item(
-                    rt, r, item, ix, iy, metrics, icon_cache, hovered, selected, focused, accent,
+                    rt,
+                    r,
+                    item,
+                    ix,
+                    iy,
+                    metrics,
+                    icon_cache,
+                    hovered,
+                    selected,
+                    focused,
+                    accent,
                     &mut jobs,
                     hide_label == Some(item.path.as_str()),
                 );
@@ -797,6 +800,17 @@ fn label_cache() -> &'static Mutex<LabelTrimCache> {
     LABEL_TRIM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 截断缓存条目上限:超过即整体清空(纯记忆化,清空只损失一次重算)。
+/// 键含文件名,改名/新建/DPI 切换会让条目单调增长,须有界(同 icon_cache 思路)。
+const LABEL_TRIM_CACHE_CAP: usize = 512;
+fn label_cache_put(key: (String, u32, u32, u32), val: String) {
+    let mut c = label_cache().lock().unwrap();
+    if c.len() >= LABEL_TRIM_CACHE_CAP {
+        c.clear();
+    }
+    c.insert(key, val);
+}
+
 /// 行数超限时逐步截断并补省略号,直到恰好 max_lines 行。
 pub fn trim_to_lines(
     dw: &IDWriteFactory,
@@ -838,10 +852,7 @@ pub fn trim_to_lines(
         .unwrap_or(true)
     };
     if fits(&cur) {
-        label_cache()
-            .lock()
-            .unwrap()
-            .insert(key.clone(), cur.clone());
+        label_cache_put(key.clone(), cur.clone());
         return cur;
     }
     let ell = "…";
@@ -859,7 +870,7 @@ pub fn trim_to_lines(
         }
         cur = next;
     }
-    label_cache().lock().unwrap().insert(key, cur.clone());
+    label_cache_put(key, cur.clone());
     cur
 }
 
@@ -1115,15 +1126,7 @@ fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h:
     unsafe {
         let accent = fence.color();
         // A thin category rail is easier to scan than a large colored card.
-        if let Some(a) = brush(
-            rt,
-            &color(
-                accent[0],
-                accent[1],
-                accent[2],
-                0.95,
-            ),
-        ) {
+        if let Some(a) = brush(rt, &color(accent[0], accent[1], accent[2], 0.95)) {
             let rr = rounded(rect(7.0, 7.0, 10.0, model::TITLE_H - 7.0), 1.5);
             rt.FillRoundedRectangle(&rr, as_brush(&a));
         }
@@ -1157,16 +1160,10 @@ fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h:
                 let zone = rect(w - 3.0 - 26.0, cy - 8.0, w - 3.0, cy + 8.0);
                 let zone_rr = rounded(zone, 3.0);
                 // 底色浅灰:肉眼可见即可(不抢图标名的视觉)
-                if let Some(bb) = brush(
-                    rt,
-                    &color(0.05, 0.06, 0.09, 0.26),
-                ) {
+                if let Some(bb) = brush(rt, &color(0.05, 0.06, 0.09, 0.26)) {
                     rt.FillRoundedRectangle(&zone_rr, as_brush(&bb));
                 }
-                if let Some(sb) = brush(
-                    rt,
-                        &color(1.0, 1.0, 1.0, 0.42),
-                ) {
+                if let Some(sb) = brush(rt, &color(1.0, 1.0, 1.0, 0.42)) {
                     rt.DrawRoundedRectangle(&zone_rr, as_brush(&sb), 1.0, None);
                 }
                 // 宽扁三角:宽 16,高 8(2:1),与左侧栅栏名同水平线

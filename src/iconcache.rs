@@ -48,7 +48,8 @@ pub(crate) fn load_icon_cache_file(
     ) as usize;
     let mut off = 16usize;
     let mut icons: HashMap<String, Vec<u8>> = HashMap::new();
-    let expect_mtime: HashMap<&str, u64> = raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
+    let expect_mtime: HashMap<&str, u64> =
+        raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
     for _ in 0..count.min(8192) {
         if off + 2 > buf.len() {
             break;
@@ -84,14 +85,14 @@ pub(crate) fn load_icon_cache_file(
     if off + 4 <= buf.len() && &buf[off..off + 4] == b"DFNM" {
         off += 4;
         if off + 4 <= buf.len() {
-            let ncnt =
-                u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
+            let ncnt = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4])) as usize;
             off += 4;
             for _ in 0..ncnt.min(8192) {
                 if off + 2 > buf.len() {
                     break;
                 }
-                let plen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
+                let plen =
+                    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
                 off += 2;
                 if plen == 0 || plen > 1024 || off + plen > buf.len() {
                     break;
@@ -101,7 +102,8 @@ pub(crate) fn load_icon_cache_file(
                 if off + 2 > buf.len() {
                     break;
                 }
-                let dlen = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
+                let dlen =
+                    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap_or([0; 2])) as usize;
                 off += 2;
                 if dlen > 512 || off + dlen > buf.len() {
                     break;
@@ -150,11 +152,7 @@ pub(crate) fn save_icon_cache_file_now(px_expected: u32) {
             if fi.mtime_ms == 0 {
                 continue;
             }
-            entries.push((
-                key.clone(),
-                fi.mtime_ms,
-                std::sync::Arc::new(buf.clone()),
-            ));
+            entries.push((key.clone(), fi.mtime_ms, std::sync::Arc::new(buf.clone())));
         }
         for f in s.files.iter() {
             names.push((f.path.clone(), f.name.clone()));
