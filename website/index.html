@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DeskFence — 让桌面井然有序</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%20256%20256'%3E%3Cdefs%3E%3ClinearGradient%20id='bg'%20x1='0'%20y1='0'%20x2='0.9'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%237C6DF8'/%3E%3Cstop%20offset='1'%20stop-color='%235A4CE6'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='256'%20height='256'%20rx='58'%20fill='url(%23bg)'/%3E%3Cg%20fill='%23FFF'%3E%3Crect%20x='69'%20y='104'%20width='26'%20height='66'%20rx='13'/%3E%3Crect%20x='115'%20y='82'%20width='26'%20height='88'%20rx='13'/%3E%3Crect%20x='161'%20y='122'%20width='26'%20height='48'%20rx='13'/%3E%3Crect%20x='56'%20y='170'%20width='144'%20height='16'%20rx='8'/%3E%3C/g%3E%3C/svg%3E">
-<meta name="description" content="DeskFence 桌面栅栏:自动分类桌面图标,与 Windows 原生观感逐像素一致,换壁纸零感知,轻量、稳定、开箱即用。">
+<meta name="description" content="DeskFence 桌面栅栏:自动分类桌面图标,分类与排序随心定制,与 Windows 原生观感逐像素一致,换壁纸零感知,轻量、稳定、开箱即用。">
 <style>
 /* ============ 基础(Apple 式留白 + 系统字体栈) ============ */
 :root{
@@ -398,12 +398,16 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
 <!-- ============ 核心能力 ============ -->
 <section id="features" class="features">
   <div class="wrap">
-    <h2 class="sec-title">它替你做好的六件事</h2>
+    <h2 class="sec-title">它替你做好的九件事</h2>
     <p class="sec-sub">每一个能力都可以在托盘菜单里单独开关。</p>
     <div class="grid6">
       <div class="card">
         <div class="ico" style="background:#e8f1ff"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="2" y="3" width="22" height="20" rx="3.5" fill="#fff" stroke="#0071e3" stroke-width="1.6"/><rect x="2" y="3" width="22" height="4.5" rx="2.25" fill="#0071e3" opacity=".3"/><rect x="5.5" y="10.5" width="5.5" height="5.5" rx="1.5" fill="#8FBCEF"/><rect x="14.5" y="10.5" width="5.5" height="5.5" rx="1.5" fill="#96D49A"/><rect x="5.5" y="17" width="5.5" height="4.5" rx="1.5" fill="#F0B6CC"/><rect x="14.5" y="17" width="5.5" height="4.5" rx="1.5" fill="#F0CB8A"/></svg></div>
         <h3>自动分类</h3><p>按固定 8 类(软件 / 文件夹 / 文档 / 图片 / 媒体 / 代码 / 压缩包 / 其他)自动建栅栏归类;新文件落下自动入位,无需手动整理。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#e6faf7"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M4 7 h18" stroke="#0ea5a4" stroke-width="2" stroke-linecap="round"/><circle cx="10" cy="7" r="2.8" fill="#fff" stroke="#0ea5a4" stroke-width="2"/><path d="M4 13 h18" stroke="#0ea5a4" stroke-width="2" stroke-linecap="round"/><circle cx="17" cy="13" r="2.8" fill="#fff" stroke="#0ea5a4" stroke-width="2"/><path d="M4 19 h18" stroke="#0ea5a4" stroke-width="2" stroke-linecap="round"/><circle cx="9" cy="19" r="2.8" fill="#fff" stroke="#0ea5a4" stroke-width="2"/></svg></div>
+        <h3>分类随心定制</h3><p>管理面板里改名、删除、新增分类,每类可编辑扩展名规则,归属即时重算;也可切到"拖入归类"模式,文件只进你拖入的栅栏。</p>
       </div>
       <div class="card">
         <div class="ico" style="background:#eafff0"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M4 20 L13 5 L22 20 Z" fill="#34c759"/><rect x="7" y="20" width="12" height="3" rx="1.5" fill="#34c759" opacity=".5"/></svg></div>
@@ -420,6 +424,14 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       <div class="card">
         <div class="ico" style="background:#ffe9ee"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="1.5" y="4" width="8.5" height="18" rx="2" fill="#fff" stroke="#ff6482" stroke-width="1.5"/><rect x="16" y="4" width="8.5" height="18" rx="2" fill="#fff" stroke="#ff6482" stroke-width="1.5"/><rect x="3.5" y="7" width="4.5" height="4.5" rx="1.2" fill="#91BAF3" opacity=".45"/><rect x="3.5" y="13" width="4.5" height="4.5" rx="1.2" fill="#91BAF3" opacity=".45"/><rect x="18" y="7" width="4.5" height="4.5" rx="1.2" fill="#96D49A"/><rect x="18" y="13" width="4.5" height="4.5" rx="1.2" fill="#8FBCEF" opacity=".45"/><path d="M10.5 9.5 Q13 8.5 15.5 9.3" stroke="#ff6482" stroke-width="1.5" fill="none" stroke-dasharray="2 1.6"/><rect x="11" y="10.5" width="4.5" height="4.5" rx="1.2" fill="#8FBCEF" stroke="#ff6482" stroke-width="1"/></svg></div>
         <h3>拖拽即归类</h3><p>把图标从一个栅栏拖到另一个就完成分类转移,松手才落位、其余图标纹丝不动;拖到回收站即删除。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#ecebfd"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M8 5v16M8 21l-3.5-3.5M8 21l3.5-3.5" stroke="#5856d6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M18 21V5M18 5l-3.5 3.5M18 5l3.5 3.5" stroke="#5856d6" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>每栅栏独立排序</h3><p>常用(默认)、时间、名称,或手动拖拽自定义顺序——每个栅栏各排各的,互不干扰。</p>
+      </div>
+      <div class="card">
+        <div class="ico" style="background:#e5f6ff"><svg width="26" height="26" viewBox="0 0 26 26"><rect x="3" y="5" width="20" height="13" rx="2.5" fill="none" stroke="#0a84ff" stroke-width="2"/><path d="M9 22h8" stroke="#0a84ff" stroke-width="2" stroke-linecap="round"/><circle cx="8.5" cy="11.5" r="1.9" fill="#0a84ff"/><circle cx="13" cy="11.5" r="1.9" fill="#0a84ff" opacity=".55"/><circle cx="17.5" cy="11.5" r="1.9" fill="#0a84ff" opacity=".3"/></svg></div>
+        <h3>三态桌面</h3><p>栅栏接管 / 纯净只剩壁纸 / 原生 Explorer 接管,托盘一键切换,重启保持。</p>
       </div>
       <div class="card">
         <div class="ico" style="background:#e5f6ff"><svg width="26" height="26" viewBox="0 0 26 26"><path d="M13 3 L22 7 V13 C22 18.5 18.2 21.8 13 23 C7.8 21.8 4 18.5 4 13 V7 Z" fill="none" stroke="#0a84ff" stroke-width="2"/><path d="M9 13 L12 16 L17 10" stroke="#0a84ff" stroke-width="2" fill="none"/></svg></div>
@@ -445,7 +457,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
         <ul>
           <li><b>首次运行</b> 在系统托盘出现图标,悬停显示 <b>DeskFence</b></li>
           <li><b>无需配置</b> —— 默认就是最接近原生桌面的"精确渲染"</li>
-          <li><b>想还原?</b> 托盘右键 → 显示原生桌面 / 退出</li>
+          <li><b>想还原?</b> 托盘右键 → 恢复原始桌面 / 退出</li>
         </ul>
       </div>
       <div>
@@ -487,7 +499,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
         <ul>
           <li><b>拖边框</b> → 栅栏移到新位置(自动吸附对齐)</li>
           <li><b>拖四角 L 形手柄</b> → 等比放大缩小</li>
-          <li><b>点标题旁倒三角 ▾</b> → 操作菜单(改名/折叠/锁定/删除)</li>
+          <li><b>点标题旁倒三角 ▾</b> → 操作菜单(改名/排序/折叠/锁定/删除)</li>
           <li>鼠标移开后自动隐身,桌面回归干净</li>
         </ul>
       </div>
@@ -571,10 +583,11 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
         <p>点击任务栏托盘的 <b>DeskFence</b> 图标,打开总控菜单:</p>
         <ul>
           <li><b>渲染模式</b>:精确(默认,与原生逐像素一致)/ 透明(兼容特殊环境)</li>
-          <li><b>对齐模式</b>:网格吸附 / 自由摆放</li>
-          <li><b>自动分类</b>:新文件自动入栅栏,可随时开关</li>
-          <li><b>显示原生桌面</b>:临时退回原生状态查看</li>
-          <li><b>开机自启 / 使用说明 / 退出</b></li>
+          <li><b>对齐方式</b>:自动对齐 / 网格对齐 / 自由移动(邻居磁吸)</li>
+          <li><b>自动分类</b>:按类型归类 ⇄ 自定义(拖入归类);子菜单直达分类管理面板——改名/删除/新增分类、编辑扩展名规则,即时生效</li>
+          <li><b>三态桌面</b>:纯净(只剩壁纸)⇄ 恢复栅栏桌面;恢复原始桌面 ⇄ 栅栏接管,重启保持</li>
+          <li><b>布局可反悔</b>:撤销上次布局调整 / 一键恢复默认布局</li>
+          <li><b>开机自启 / 退出</b></li>
         </ul>
       </div>
       <div>
@@ -711,7 +724,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
 <section id="faq">
   <div class="wrap">
     <h2 class="sec-title">常见问题</h2>
-    <p class="sec-sub">没找到答案?托盘菜单 → 使用说明。</p>
+    <p class="sec-sub">没找到答案?到 <a href="https://github.com/zghehehe/DeskFence/issues" target="_blank" rel="noopener">GitHub Issues</a> 提问。</p>
     <div class="faq">
       <details open>
         <summary>我的文件会被移动或修改吗?</summary>
@@ -727,15 +740,23 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       </details>
       <details>
         <summary>怎么还原原生桌面 / 卸载?</summary>
-        <p>托盘菜单 → "显示原生桌面"临时还原;退出即完全恢复。删除 deskfence.exe 即完成卸载——不写注册表残留,不装驱动服务。</p>
+        <p>托盘菜单 → "恢复原始桌面"临时还原;退出即完全恢复。删除 deskfence.exe 即完成卸载——不写注册表残留,不装驱动服务。</p>
       </details>
       <details>
-        <summary>双击后没反应?</summary>
-        <p>程序可能已在后台运行(单实例)。再双击一次会唤醒它显示全部栅栏;或检查托盘是否已有 DeskFence 图标。紧急情况运行 <code>deskfence.exe --restore-desktop</code> 恢复原生桌面。</p>
+        <summary>程序卡死 / 桌面异常,怎么自救?</summary>
+        <p>再次双击 <code>deskfence.exe</code> 就是自救:旧实例先优雅退出(恢复图标、保存状态)让位,新实例约 1 秒接管;旧实例若已卡死,2 秒后自动强杀——双击拿到的永远是健康实例,升级新版也是同样双击。紧急只想恢复原生图标,运行 <code>deskfence.exe --restore-desktop</code>。</p>
       </details>
       <details>
         <summary>支持多显示器吗?</summary>
         <p>支持。每个显示器的桌面区域都会被接管,栅栏可在各屏之间自由摆放,DPI 不同的混合屏幕也没问题。</p>
+      </details>
+      <details>
+        <summary>分类规则可以自定义吗?</summary>
+        <p>可以。托盘菜单 → 自动分类 → 点分类名,打开分类管理面板:改名、删除、新增分类,并为每个分类编辑扩展名规则(空格/逗号分隔),保存后所有文件的归属立即重算;不想按类型分,就切到"自定义(拖入归类)"模式,文件只进你拖入的栅栏。</p>
+      </details>
+      <details>
+        <summary>图标顺序能自己定吗?</summary>
+        <p>能。每个栅栏独立选择排序方式:常用(默认)/ 时间(最近修改)/ 名称,或"手动"——拖到哪算哪,顺序永久保持;在栅栏标题旁倒三角菜单里切换。</p>
       </details>
       <details>
         <summary>和 Fences 等同类软件比有什么不同?</summary>
@@ -758,7 +779,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
     <div class="faq" style="max-width:720px;margin:28px auto 0">
       <details>
         <summary>安装方式</summary>
-        <p>下载 <code>deskfence.exe</code> 后双击即可运行——它就是全部,没有安装器、没有驱动服务、不写注册表。想常驻:托盘菜单勾选"开机自启动"。</p>
+        <p>下载 <code>deskfence.exe</code> 后双击即可运行——没有安装器、没有驱动服务、不往 Program Files 或开始菜单写任何东西。想常驻:托盘菜单勾选"开机自启动"(随时可取消)。</p>
       </details>
       <details>
         <summary>系统要求</summary>
@@ -770,7 +791,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       </details>
       <details>
         <summary>卸载方法</summary>
-        <p>托盘菜单退出程序 → 删除 exe 与 <code>%APPDATA%\DeskFence</code> 文件夹。桌面图标自动恢复原样。</p>
+        <p>托盘菜单退出程序 → 删除 exe 与 <code>%APPDATA%\DeskFence</code> 文件夹,桌面图标自动恢复原样;若勾选过"开机自启动",再到任务管理器 → 启动应用里移除残留项(不删也无害,只是开机时静默失败一次)。</p>
       </details>
     </div>
   </div>
@@ -805,8 +826,8 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
     <p class="sec-sub">遇到问题,按这三步走,基本都能解决。</p>
     <div class="faq" style="max-width:720px;margin:0 auto">
       <details open>
-        <summary>1. 先看内置自救</summary>
-        <p>桌面异常时运行 <code>deskfence.exe --restore-desktop</code>:无 UI 恢复原生桌面图标后退出,绝不留白屏。日常排障看日志:<code>%APPDATA%\DeskFence\run.log</code>。</p>
+        <summary>1. 先双击 exe 自救</summary>
+        <p>桌面异常时再次双击 <code>deskfence.exe</code>:旧实例优雅退出、卡死 2 秒自动强杀,新实例一定是健康的,桌面随之恢复正常;需要无 UI 仅恢复原生图标时运行 <code>deskfence.exe --restore-desktop</code>。日常排障看日志:<code>%APPDATA%\DeskFence\run.log</code>。</p>
       </details>
       <details>
         <summary>2. 查常见问题</summary>
@@ -834,7 +855,7 @@ footer .fine{border-top:1px solid #333336;padding-top:20px;color:#6e6e73}
       </div>
       <div>
         <h4>排障</h4>
-        <p>运行日志:<code style="color:#a1a1a6">%APPDATA%\DeskFence\run.log</code><br>恢复命令:<code style="color:#a1a1a6">deskfence.exe --restore-desktop</code></p>
+        <p>自救:再次双击 deskfence.exe<br>运行日志:<code style="color:#a1a1a6">%APPDATA%\DeskFence\run.log</code><br>恢复命令:<code style="color:#a1a1a6">deskfence.exe --restore-desktop</code></p>
       </div>
       <div>
         <h4>链接</h4>
