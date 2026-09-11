@@ -640,6 +640,32 @@
       全可见。回归工具：`powershell -File tools/sinkwatch.ps1 <ms> <out>`，
       判据 `B[0-9]+,.*,DeskFenceFence,` 计数必须为 0。
 
+15. **文件重命名回车卡死（2026-09-11 终修，勿回退）**：用户重命名文件按
+    回车即假死。完整根因链（5ab90fd 修）：
+    - **换行进名字**：文件改名框是 ES_MULTILINE EDIT，WM_KEYDOWN 拦
+      VK_RETURN 存在漏网路径（IME/前台转移），换行经 WM_CHAR 落进文本——
+      修后 WM_CHAR 层再拦 0x0D/0x0A（多行 EDIT 一切文本插入的必经之路，
+      最后一道闸，勿删）；粘贴路径另加清洗（换行/制表折空格、控制字符
+      剔除，与原生一致）。
+    - **自激死循环放大器=失败路径的模态 MessageBoxW**：名字带换行不在
+      非法字符表里→rename 必败→弹模态框→编辑框失焦→WM_KILLFOCUS 自动
+      提交路径 Post 新 COMMIT→模态消息循环把新 COMMIT 分发→重入失败→
+      再弹框……日志指纹=同一秒几十条 `file rename commit`/`file rename
+      failed` 交替。**改名失败处置永远不能用模态框**：现行为 MessageBeep
+      +编辑框保持打开全选（原生同款，用户改完重试/Esc 取消）。
+    - **防重入门闩** FILE_RENAME_COMMITTING：回车/失焦/WM_ACTIVATE/点击
+      外部轮询四条提交源可同帧叠加，重入会对同一编辑框提交两次。
+    - 非法字符检查补 `c.is_control()`（NTFS 禁控制字符，漏检=rename 必败）。
+    - 空名/原名未变=直接关闭编辑框（不叮一声）；非法/失败=保持打开+叮。
+    - windows crate feature 坑：MessageBeep 在 System::Diagnostics::Debug
+      不在 WindowsAndMessaging；HGLOBAL 在 Foundation；剪贴板三件套需
+      Win32_System_DataExchange+Memory。
+    - **自救脚本**：仓库根 `恢复桌面.bat`（双击=taskkill 卡死实例+新进程
+      `--restore-desktop` 恢复图标后退出；延迟用 ping 不用 timeout——
+      Git Bash 的 GNU timeout 会抢名）。bat 必须 CRLF、纯 ASCII 内容。
+    - 用户"cmd 里没这个命令"的原因：PowerShell 不搜当前目录，需
+      `.\deskfence.exe`；cmd 里需先 cd 到 exe 所在目录。
+
 ## 代码位置备忘
 
 - 渲染：src/render.rs（ink 常驻：透明底+1/255 隐形命中层+seeded GDI 文字；
