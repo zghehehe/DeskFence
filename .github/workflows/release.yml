@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   build:
+    # 仓库守卫:发布自动化只属于对外仓(含将来转移后的组织路径)。
+    # 私有开发仓(origin)推 tag 不触发构建,也不产生重复 Release。
+    if: github.repository == 'zghehehe/DeskFence' || github.repository == 'DeskFence/DeskFence'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
