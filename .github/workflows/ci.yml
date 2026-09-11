@@ -23,6 +23,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # 2026-09-11 全库格式化后开启;本地提交前先 cargo fmt --check
+      - name: Format check
+        run: cargo fmt --check
+
       - name: Test
         run: cargo test --locked
 
