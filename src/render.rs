@@ -797,6 +797,17 @@ fn label_cache() -> &'static Mutex<LabelTrimCache> {
     LABEL_TRIM_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 截断缓存条目上限:超过即整体清空(纯记忆化,清空只损失一次重算)。
+/// 键含文件名,改名/新建/DPI 切换会让条目单调增长,须有界(同 icon_cache 思路)。
+const LABEL_TRIM_CACHE_CAP: usize = 512;
+fn label_cache_put(key: (String, u32, u32, u32), val: String) {
+    let mut c = label_cache().lock().unwrap();
+    if c.len() >= LABEL_TRIM_CACHE_CAP {
+        c.clear();
+    }
+    c.insert(key, val);
+}
+
 /// 行数超限时逐步截断并补省略号,直到恰好 max_lines 行。
 pub fn trim_to_lines(
     dw: &IDWriteFactory,
@@ -838,10 +849,7 @@ pub fn trim_to_lines(
         .unwrap_or(true)
     };
     if fits(&cur) {
-        label_cache()
-            .lock()
-            .unwrap()
-            .insert(key.clone(), cur.clone());
+        label_cache_put(key.clone(), cur.clone());
         return cur;
     }
     let ell = "…";
@@ -859,7 +867,7 @@ pub fn trim_to_lines(
         }
         cur = next;
     }
-    label_cache().lock().unwrap().insert(key, cur.clone());
+    label_cache_put(key, cur.clone());
     cur
 }
 
