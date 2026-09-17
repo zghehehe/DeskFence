@@ -86,7 +86,7 @@ just like the native desktop. Implemented in Rust + Win32 + Direct2D.
   current user's hive (HKCU)
 - No VC++ runtime required — a crt-static, statically linked single file that
   depends only on built-in system libraries
-- About 3 MB on disk; roughly 70 MB of resident memory
+- About 1.2 MB single-file exe; resident memory roughly 60–90 MB (including wallpaper/icon caches, varies with desktop content), plus ~10 MB of data cache under %APPDATA% (safe to delete, rebuilt automatically)
 
 ## Installation
 
@@ -137,7 +137,6 @@ open source, so audit it yourself.
 | Option | Description |
 |---|---|
 | `--restore-desktop` | Restore the native desktop icons and exit (no UI); any running old instance is cleared first — handy for self-rescue when the desktop misbehaves |
-| `--icondump <file> <out-prefix>` | Diagnostic: exports the BMP + BGRA pixels of both icon-extraction paths for the given file, for comparison against native desktop screenshots |
 
 Starting with no arguments runs the app normally (the old instance is replaced
 first, then the desktop is taken over).
