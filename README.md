@@ -6,6 +6,8 @@
 
 **把 Windows 桌面还给你 —— 自动分类、原生观感、零感知的桌面图标栅栏**
 
+中文 | [English](README_EN.md)
+
 [![Release](https://img.shields.io/github/v/release/zghehehe/DeskFence?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/zghehehe/DeskFence/releases/latest)
 [![Stars](https://img.shields.io/github/stars/zghehehe/DeskFence?style=flat&logo=github&label=Stars)](https://github.com/zghehehe/DeskFence/stargazers)
 [![License](https://img.shields.io/badge/license-GPL--3.0%20%2B%20Commercial-blue)](LICENSE)
@@ -54,7 +56,7 @@ Rust + Win32 + Direct2D 实现。
 - **中英双语**：托盘 → 语言 / Language 即时切换（跟随系统/中文/English），
   无需重启；界面文字与原生菜单完全一致
 - **首启引导（一次性）**：首次启动弹出说明窗——桌面已被归类、如何一键
-  还原，并默认勾选"显示栅栏边框线"与"开机自启"（不需要取消勾选即可），
+  还原，并默认勾选"显示栅栏边框线"与"开机自启"（不需要可在首启窗口取消勾选），
   关闭后绝不再弹
 - **多显示器 + 高 DPI**：跨屏 DPI 变更即时自适应，跟随系统 Ctrl+滚轮的
   图标大小；开机自启动（托盘开关），进程拉起后约 0.3 秒全量呈现
@@ -62,6 +64,13 @@ Rust + Win32 + Direct2D 实现。
 - **双击即恢复**：任何时候双击 exe 都得到一个健康的 DeskFence——旧实例
   先优雅退出（恢复图标、保存状态）让位，新实例接管；旧实例卡死收不到
   退出消息，2 秒后自动强杀兜底。升级新版也是同样双击即可
+
+## 系统要求
+
+- Windows 10 / 11（x64）
+- 无需管理员权限——自启动与注册表读写均在当前用户域（HKCU）
+- 无需 VC++ 运行库——crt-static 静态链接单文件，仅依赖系统自带库
+- 磁盘占用约 3MB，常驻内存约 70MB
 
 ## 安装
 
@@ -104,6 +113,15 @@ windres 等额外工具。
 
 数据位置：`%APPDATA%\DeskFence`（配置、壁纸与图标缓存），删除即重置。
 程序不联网、不收集任何数据——完全开源，可自行审计。
+
+## 命令行参数
+
+| 参数 | 说明 |
+|---|---|
+| `--restore-desktop` | 恢复原生桌面图标后退出（无 UI）；执行前会先清退正在运行的旧实例，适合桌面异常时自救 |
+| `--icondump <file> <out-prefix>` | 诊断用：导出指定文件两条图标提取路径的 BMP + BGRA 像素，供与原生桌面截图对比 |
+
+不带参数启动即正常运行（先自动替换旧实例，再接管桌面）。
 
 ## 常见问题
 

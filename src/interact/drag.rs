@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
@@ -15,99 +15,53 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TRACKMOUSEEVENT_FLAGS, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT,
     VK_UP,
 };
-// windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
+// windows crate 未导出的 WinEvent 标志(0.62 仍缺),按 WinUser.h 补定义
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::menu::{dispatch_desktop_command, fence_menu};
 use crate::model::{self, Fence, Hit, Rect};
 use crate::ole;
 use crate::render;
-use crate::selfheal::*;
 use crate::shell;
 
+use crate::hosts::*;
+use crate::logging::log;
+use crate::monitors::*;
+use crate::present::*;
 use crate::rename::*;
+use crate::settings::*;
+use crate::state::*;
 use crate::ui::*;
-
-#[derive(Clone, Copy)]
-pub(crate) enum DragMode {
-    Move,
-    Resize { edges: [char; 2] },
-    Icon(usize),
-    Marquee,
-    ScrollThumb { grab: f32 },
+use crate::undo::*;
+use crate::winids::*;
+/// 方向键微调的方向/步进决策(纯核):Ctrl=1px 精调,否则按图标网格步进;
+/// 非方向键返回 None
+pub fn nudge_delta(vk: u32, ctrl: bool, grid: (f32, f32)) -> Option<(f32, f32)> {
+    let step_x = if ctrl { 1.0 } else { grid.0 };
+    let step_y = if ctrl { 1.0 } else { grid.1 };
+    if vk == VK_LEFT.0 as u32 {
+        Some((-step_x, 0.0))
+    } else if vk == VK_RIGHT.0 as u32 {
+        Some((step_x, 0.0))
+    } else if vk == VK_UP.0 as u32 {
+        Some((0.0, -step_y))
+    } else if vk == VK_DOWN.0 as u32 {
+        Some((0.0, step_y))
+    } else {
+        None
+    }
 }
 
-/// 拖拽插入方案(2026-09-02:行内槽位模型)。几何在 model.rs
-/// (rows_from_rects/row_slot_of/row_insert_layout,有单测),此处只做适配。
-#[derive(Clone)]
-pub(crate) struct InsertPlan {
-    /// 全体可见栅栏的新位置(逐 start_layout 可见成员,含被拖者)
-    pub(crate) assign: Vec<(u32, (f32, f32))>,
-    /// 被拖者落点
-    pub(crate) land: (f32, f32),
-    /// 指示线 (x, y, w, h)
-    pub(crate) line: (f32, f32, f32, f32),
-}
-
-#[derive(Clone)]
-pub(crate) struct Drag {
-    pub(crate) fence_id: u32,
-    pub(crate) mode: DragMode,
-    pub(crate) start_x: f32,
-    pub(crate) start_y: f32,
-    /// 按下时的屏幕坐标（Move/Resize 的位移基准，与窗口位置无关）
-    pub(crate) start_sx: f32,
-    pub(crate) start_sy: f32,
-    pub(crate) start_rect: Rect,
-    pub(crate) start_layout: Vec<Fence>,
-    pub(crate) dragged_out: bool,
-    /// 图标按下时该项是否已被选中(第二次点击已选中项 = Explorer 的慢双击重命名)
-    pub(crate) icon_was_selected: bool,
-    pub(crate) icon_path: String,
-    /// Move 拖拽最后一次有插入线的方案:松手瞬间滑出容差也必须能插进去
-    /// (以最后一次方案为准,2026-09-02)
-    pub(crate) last_insert: Option<InsertPlan>,
-}
-
-/// 拖拽实时预览状态:拖动中即时重排显示,松手才生效;取消/拖出释放则回滚
-#[derive(Clone)]
-pub(crate) struct GhostPreview {
-    pub(crate) fence_id: u32,
-    /// 按下时的完整显示顺序(回滚与重排的基准)
-    pub(crate) original: Vec<String>,
-    /// 按下时的排序模式(预览期间切"手动",回滚时恢复)
-    pub(crate) original_sort_mode: String,
-    /// 被拖路径集合；重排时按它们在 original 中的相对顺序组成块
-    pub(crate) dragged_paths: Vec<String>,
-    /// 当前预览目标槽位（删除拖动块后的列表中，范围 0..=剩余项数）
-    pub(crate) target: usize,
-}
-
-#[derive(Clone)]
-pub(crate) struct ArrivalAnimation {
-    pub(crate) fence_id: u32,
-    pub(crate) path: String,
-    pub(crate) name: String,
-    pub(crate) from: (f32, f32),
-    pub(crate) to: (f32, f32),
-    pub(crate) started_ms: u64,
-    pub(crate) duration_ms: u64,
+/// 位移是否越过 8px 拖动阈值(四处现场共用同一判定,勿再内联复制):
+/// 图标拖拽启动/慢双击否决/Move 提交/双击登记位移否决
+pub fn moved_beyond_threshold(dx: f32, dy: f32) -> bool {
+    (dx * dx + dy * dy) > 64.0
 }
 
 /// 方向键微调栅栏位置(光标悬停在栅栏上时生效;Ctrl = 1px 微调,否则按图标网格步进)
 pub(crate) fn nudge_fence(fence_id: u32, vk: u32) {
     let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-    let step_x = if ctrl { 1.0 } else { model::grid_x() };
-    let step_y = if ctrl { 1.0 } else { model::grid_y() };
-    let (dx, dy) = if vk == VK_LEFT.0 as u32 {
-        (-step_x, 0.0)
-    } else if vk == VK_RIGHT.0 as u32 {
-        (step_x, 0.0)
-    } else if vk == VK_UP.0 as u32 {
-        (0.0, -step_y)
-    } else if vk == VK_DOWN.0 as u32 {
-        (0.0, step_y)
-    } else {
+    let Some((dx, dy)) = nudge_delta(vk, ctrl, (model::grid_x(), model::grid_y())) else {
         return;
     };
     push_undo();
@@ -154,6 +108,8 @@ pub(crate) fn dispatch_file_key(fence_id: u32, packed: usize) {
             drop(s);
             refresh_fence(fence_id);
             update_overlay();
+            // SAFETY: ReleaseCapture 只作用于当前线程（UI 线程）的鼠标捕获，
+            // 无指针参数。
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -175,6 +131,7 @@ pub(crate) fn dispatch_file_key(fence_id: u32, packed: usize) {
                 }
                 s.marquee = None;
                 drop(s);
+                // SAFETY: 同上：当前线程捕获释放，无指针参数。
                 unsafe {
                     let _ = ReleaseCapture();
                 }
@@ -289,7 +246,7 @@ pub(crate) fn dispatch_file_key(fence_id: u32, packed: usize) {
             .windows
             .get(&fence_id)
             .copied()
-            .unwrap_or(HWND(0));
+            .unwrap_or(HWND(std::ptr::null_mut()));
         if shell::copy_files_to_desktop(hwnd, &paths) {
             ole::clipboard_clear();
             rescan();
@@ -302,7 +259,7 @@ pub(crate) fn dispatch_file_key(fence_id: u32, packed: usize) {
             .windows
             .get(&fence_id)
             .copied()
-            .unwrap_or(HWND(0));
+            .unwrap_or(HWND(std::ptr::null_mut()));
         shell::delete_to_recycle_bin_many(hwnd, &delete_paths);
         // 主动删除:扫描宽恕立即放行,删除当轮即生效
         mark_scan_removed(&delete_paths);
@@ -397,10 +354,23 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
         .filter(|f| !f.hidden && !f.collapsed)
         .map(|f| (f.id, f.rect))
         .collect();
+    // 被拖栅栏实时中心(随光标移动):插入判定用它而非光标本身
+    let lx = drag.start_rect.x + drag.start_rect.w * 0.5 + (cx - drag.start_sx);
+    let ly = drag.start_rect.y + drag.start_rect.h * 0.5 + (cy - drag.start_sy);
+    insertion_plan_at(&all, drag.fence_id, (lx, ly))
+}
+
+/// 插入计划纯核(2026-09-16 提取,集成测试可直接构造):可见栅栏快照(id,rect)
+/// + 被拖者 id + 被拖者实时中心 → 插入方案。all 含被拖者原位。
+pub fn insertion_plan_at(
+    all: &[(u32, Rect)],
+    drag_id: u32,
+    live_center: (f32, f32),
+) -> Option<InsertPlan> {
     if all.len() < 2 {
         return None;
     }
-    let a_idx = all.iter().position(|(id, _)| *id == drag.fence_id)?;
+    let a_idx = all.iter().position(|(id, _)| *id == drag_id)?;
     let rects: Vec<Rect> = all.iter().map(|(_, r)| *r).collect();
     let rows = model::rows_from_rects(&rects);
     // 被拖者原位(行,槽)
@@ -408,9 +378,7 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
         .iter()
         .enumerate()
         .find_map(|(ri, row)| row.iter().position(|&i| i == a_idx).map(|j| (ri, j)))?;
-    // 被拖栅栏实时中心(随光标移动):插入判定用它而非光标本身
-    let lx = drag.start_rect.x + drag.start_rect.w * 0.5 + (cx - drag.start_sx);
-    let ly = drag.start_rect.y + drag.start_rect.h * 0.5 + (cy - drag.start_sy);
+    let (lx, ly) = live_center;
     // 自由放置区:实时中心距最近行中心超过半高容差(至少 48)→ 无槽位。
     // 容差额外加一个 GAP:行间中线附近两侧行都恰好差半个 GAP,不加会
     // 留下一条竖直移动不出线的判定死区
@@ -453,7 +421,7 @@ fn fence_insertion_plan(drag: &Drag, cx: f32, cy: f32) -> Option<InsertPlan> {
 /// 邻居等距吸附(上下左右对称):左右贴齐/紧邻保持 GAP,上下同理。
 /// 只在对应方向有重叠时生效,取距离最近的候选一次应用。
 /// 用于自动档自由区与自由档;网格档(棋盘模式)不调用。
-fn snap_rect_to_neighbors(nr: &mut Rect, others: &[Rect]) {
+pub fn snap_rect_to_neighbors(nr: &mut Rect, others: &[Rect]) {
     const SNAP: f32 = 16.0;
     let mut best: Option<(f32, f32, f32)> = None; // (总距离, dx, dy)
     for r in others {
@@ -518,6 +486,8 @@ fn snap_drag(s: &UiState, fence_id: u32, nr: Rect) -> Rect {
 
 /// 虚拟桌面(所有显示器的包围盒,屏幕坐标)
 fn virtual_screen() -> (f32, f32, f32, f32) {
+    // SAFETY: 四个 GetSystemMetrics 均无指针参数；0/负值视为失败回退
+    // 工作区。
     unsafe {
         let x = GetSystemMetrics(SM_XVIRTUALSCREEN) as f32;
         let y = GetSystemMetrics(SM_YVIRTUALSCREEN) as f32;
@@ -534,12 +504,15 @@ fn virtual_screen() -> (f32, f32, f32, f32) {
 /// 确保全屏对齐参考线 overlay 窗口存在（懒创建）。
 pub(crate) fn ensure_guide_window(s: &mut UiState) {
     if s.guide_hwnd
-        .is_some_and(|hwnd| unsafe { IsWindow(hwnd).as_bool() })
+        .is_some_and(|hwnd| unsafe { IsWindow(Some(hwnd)).as_bool() })
     {
         return;
     }
     s.guide_hwnd = None;
     let (vx, vy, vw, vh) = virtual_screen();
+    // SAFETY: guide_class_name 是静态 NUL 宽串、hinstance 是本进程模块；
+    // lpParam=None；创建失败返回 null（判空后不使用）。窗口为
+    // WS_EX_LAYERED 全屏 overlay，由 refresh_guide 的 ULW 提供内容。
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -550,13 +523,14 @@ pub(crate) fn ensure_guide_window(s: &mut UiState) {
             vy as i32,
             vw as i32,
             vh as i32,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
+            None,
+            None,
+            Some(hinstance()),
             None,
         )
+        .unwrap_or_default()
     };
-    if hwnd.0 != 0 {
+    if !hwnd.0.is_null() {
         s.guide_hwnd = Some(hwnd);
     }
 }
@@ -587,6 +561,8 @@ pub(crate) fn refresh_guide(s: &mut UiState) {
             None => return,
         }
     }
+    // SAFETY: hwnd 是 guide_hwnd 槽位中的本进程 overlay 窗口（调用前已
+    // 确保 ensure_guide_window）；NOZORDER 纯移动缩放，不触发 z 守卫。
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -735,6 +711,7 @@ pub(crate) fn update_overlay() {
     let mut s = state().lock().unwrap();
     if s.drag_ghost.is_none() && s.arrival_animations.is_empty() && s.insert_line.is_none() {
         if let Some(h) = s.guide_hwnd {
+            // SAFETY: h 是本进程 overlay 窗口（guide_hwnd 槽位），纯可见性调用。
             unsafe {
                 let _ = ShowWindow(h, SW_HIDE);
             }
@@ -759,15 +736,15 @@ pub(crate) fn update_ghost(x: f32, y: f32) {
     refresh_guide(&mut s);
 }
 
-/// 高度自适应内容：未手动缩放过的栅栏，高度收敛到内容所需行数
-/// （空栅栏至少 2 行，保证拖放目标可见），上限为所在工作区可容纳的最大
-/// 整行数（超出保持滚动）。只调高度，位置由随后的 settle 夹回并解重叠。
+/// 高度归整：把超出所在工作区可容纳最大整行数的栅栏高度夹回
+/// （高度恒为"标题+整行数×行高+内边距"，余数不足一行是正常留白）。
+/// 只调高度，位置由随后的 settle 夹回并解重叠。
 pub(crate) fn refit_auto_fence_heights() {
     let areas = all_work_areas();
     let mut changed = false;
     {
         let mut s = state().lock().unwrap();
-        // 尺寸策略:默认 2列×5行,高度不随内容自适应(超出滚动);
+        // 尺寸策略:默认 2列×4行,高度不随内容自适应(超出滚动);
         // 这里只算"屏幕可容纳的最大高度"用于把超屏栅栏夹回。
         let targets: Vec<(u32, f32)> = s
             .fences
@@ -790,7 +767,7 @@ pub(crate) fn refit_auto_fence_heights() {
             .collect();
         for (id, target_h) in targets {
             if let Some(f) = s.fences.iter_mut().find(|f| f.id == id) {
-                // 只把超出屏幕的夹回,不放大、不随内容变化(默认 5 行,用户可调)
+                // 只把超出屏幕的夹回,不放大、不随内容变化(默认 4 行,用户可调)
                 if f.rect.h > target_h + 0.5 {
                     f.rect.h = target_h;
                     changed = true;
@@ -812,20 +789,146 @@ pub(crate) fn refit_auto_fence_heights() {
     }
 }
 
+/// 默认布局排列(2026-09-16):流式左/上对齐 + GAP,行内从左到右、右缘
+/// 放不下换行。首启建栅栏与托盘"恢复默认布局"共用,保证首次启动就是
+/// 整齐的默认布局(此前首启走 build_global_config 的写死横排,超屏后被
+/// 夹回右缘堆叠)。
+pub(crate) fn apply_default_layout(fences: &mut [Fence]) {
+    let (vx, vy, vw, vh) = work_area();
+    let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
+    model::auto_layout(&mut rects, vx, vy, vw, vh);
+    for (f, r) in fences.iter_mut().zip(rects) {
+        f.rect = r;
+    }
+}
+
+/// 重叠兜底(2026-09-16):换机/换图标尺寸后,夹回屏幕仍可能留下栅栏两两
+/// 相交(settle 推挤+夹回都解不掉=屏幕放不下当前尺寸,用户在别的电脑中
+/// 图标下实拍)。把行序靠下的栅栏按整行收缩,循环至无重叠或缩到最小,
+/// 内容转滚动——保证"任何电脑、任何图标大小,栅栏都不重叠"。
+/// 只在 boot 与 sync_icon_size 等非交互路径调用;不进 push_settle
+/// (防拖拽/移动中窗口被中途改尺寸),也不进 WM_DPICHANGED(跨屏瞬间
+/// 用 Windows 建议位,事后由 rescan/boot 的 settle+本函数收敛)。
+/// 返回收缩的栅栏数。
+pub(crate) fn resolve_overlaps_by_rows() -> usize {
+    let areas = all_work_areas();
+    let mut shrunk = 0usize;
+    {
+        let mut s = state().lock().unwrap();
+        let vis: Vec<usize> = s
+            .fences
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.hidden && !f.collapsed)
+            .map(|(i, _)| i)
+            .collect();
+        // min_h 按栅栏各自的 metrics 换算(system 回退),留出 +0.5 容差
+        let can_shrink = |s: &UiState, idx: usize| -> bool {
+            let f = &s.fences[idx];
+            let m = s
+                .metrics
+                .get(&f.id)
+                .copied()
+                .unwrap_or_else(model::DpiMetrics::system);
+            f.rect.h > model::min_h() + 0.5 && m.cell_h > 0.0
+        };
+        for _round in 0..24 {
+            // 每轮先 push_settle(推挤移动分开 + 行归一 + 夹回屏幕)——
+            // 重叠优先靠"挪位置"解(行间级联=把下行往下移保持固定 GAP),
+            // 屏幕底放不下、挪不开才收缩;收缩只减高度,不会制造新重叠,
+            // 但单独收缩对"双方都到最小高度"无解
+            push_settle(&mut s.fences, &areas);
+            let mut pair: Option<(usize, usize)> = None;
+            for (a, &i) in vis.iter().enumerate() {
+                for &j in vis.iter().skip(a + 1) {
+                    if model::intersects(&s.fences[i].rect, &s.fences[j].rect) {
+                        pair = Some((i, j));
+                        break;
+                    }
+                }
+                if pair.is_some() {
+                    break;
+                }
+            }
+            let Some((i, j)) = pair else { break };
+            // 收缩者 = 行序靠下者;其已到最小高度时改收缩另一成员;
+            // 两者都到底仍重叠 = 物理放不下,放弃(内容本就转滚动)
+            let (ri, rj) = (&s.fences[i].rect, &s.fences[j].rect);
+            let lower = if rj.y > ri.y || (rj.y == ri.y && rj.h > ri.h) {
+                j
+            } else {
+                i
+            };
+            let upper = if lower == i { j } else { i };
+            let target = if can_shrink(&s, lower) {
+                Some(lower)
+            } else if can_shrink(&s, upper) {
+                Some(upper)
+            } else {
+                None
+            };
+            let Some(t) = target else { break };
+            let cell_h = {
+                let f = &s.fences[t];
+                let m = s
+                    .metrics
+                    .get(&f.id)
+                    .copied()
+                    .unwrap_or_else(model::DpiMetrics::system);
+                m.cell_h
+            };
+            let f = &mut s.fences[t];
+            f.rect.h = (f.rect.h - cell_h).max(model::min_h());
+            shrunk += 1;
+        }
+        if shrunk > 0 {
+            // 循环出口处 push_settle 刚跑过,布局已归一且在屏内
+            let cfg = s.fences.clone();
+            let _ = model::save_config(&cfg);
+            log(&format!(
+                "resolve_overlaps_by_rows: shrunk {shrunk} fence(s) to fit screen"
+            ));
+        }
+    }
+    if shrunk > 0 {
+        refresh_all_fences();
+    }
+    shrunk
+}
+
+/// 北向拖高的顶边下限:与按下时同列上方(x 有重叠且底边在**按下顶边**之
+/// 上)的最近栅栏底+GAP;无则工作区顶 vy。口径必须用按下时顶边(勿改成
+/// 实时顶边):顶边一旦越过上方栅栏底,实时口径会把该栅栏排除出候选,
+/// 限制凭空失效→栅栏滑进上一行(2026-09-16 用户实测"第二行满屏乱跑")。
+/// mousemove 预览与松手落位两路共用,保证所见=所得。
+fn resize_top_limit(fences: &[Fence], self_id: u32, x: f32, w: f32, press_y: f32, vy: f32) -> f32 {
+    let mut limit = vy;
+    for other in fences {
+        if other.id == self_id || other.hidden || other.collapsed {
+            continue;
+        }
+        let o = &other.rect;
+        let x_overlap = o.x < x + w && o.x + o.w > x;
+        if x_overlap && o.y + o.h <= press_y + 1.0 {
+            limit = limit.max(o.y + o.h + model::GAP);
+        }
+    }
+    limit
+}
+
 pub(crate) fn settle_all_fences() {
     let areas = all_work_areas();
     let mut s = state().lock().unwrap();
     push_settle(&mut s.fences, &areas);
 }
 
-/// settle 归一(P1 布局规范化)：① 行贴顶——同一行(可见集,与拖拽/删除
-/// 槽位模型同口径)所有栅栏的 y 归一到该行最顶栅栏顶边;② 行间固定间隔
-/// ——自上而下级联,下行顶=上行最深底+GAP,过近推下过远拉上(首行顶锚
-/// 不动);③ 首行贴左——首行整体平移到行内最左栅栏所在工作区左缘,
-/// 整排从屏幕左侧起步(行内间距保持);④ 两两收敛推挤解除重叠(级联已
-/// 保证行间恰为 GAP,推挤只兜横向/夹回残冲突);⑤ 夹回屏幕。
-/// 不改变栅栏顺序/行结构,行内相对 y 会归一。
-pub(crate) fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
+/// settle 归一(2026-09-16 行语义定案)：① 行贴顶;② 行间固定间隔级联
+/// (下行顶=上行最深底+GAP,过近推下过远拉上,首行顶锚=尽量不动);
+/// ③ 首行贴左;④ 级联+超屏整行收缩(在 fit 之前做——fit 的上移会把超高
+/// 栅栏中心拉进行聚类容差,两行并一行后整排贴顶=乱套,2026-09-16 实测);
+/// ⑤ 同行内水平推挤(跨行冲突不水平解,防第一行被挤向右);⑥ 多显示器
+/// 夹回;⑦ 夹回后再复核一轮级联+收缩。行高只减不增,必然收敛。
+pub fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) {
     let n = fences.len();
     if n == 0 {
         return;
@@ -837,42 +940,37 @@ pub(crate) fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) 
         f.rect.w = w;
         f.rect.h = h;
     }
-    let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
+    let rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
     // 行规范化只作用于可见集:隐藏/折叠栅栏不参与行分组,也不会把历史
     // 位置的 y 带进来当行顶锚(与 fence_insertion_plan/delete_fence_ex
-    // 的 !hidden && !collapsed 口径一致)。① 行贴顶;② 行间固定间隔
-    // (级联,过近推下过远拉上);③ 首行贴左(锚=首行最左栅栏所在显示器
-    // 的工作区左缘,整行平移保行内间距);新引入的残余冲突仍由下面的
-    // 推挤与屏幕夹回兜底。
+    // 的 !hidden && !collapsed 口径一致)。
     let vis: Vec<usize> = (0..n)
         .filter(|&i| !fences[i].hidden && !fences[i].collapsed)
         .collect();
     let mut vis_rects: Vec<Rect> = vis.iter().map(|&i| rects[i]).collect();
-    let aligned = model::align_rows_top(&mut vis_rects);
-    let spaced = model::space_rows_gap(&mut vis_rects);
-    let anchored = match vis_rects
+    cascade_and_shrink(&mut vis_rects);
+    if let Some(leftmost) = vis_rects
         .iter()
         .min_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     {
-        Some(leftmost) => {
-            let (vxa, _, _, _) = work_area_for_rect(leftmost);
-            model::align_first_row_left(&mut vis_rects, vxa)
-        }
-        None => false,
-    };
-    if aligned || spaced || anchored {
-        for (k, &i) in vis.iter().enumerate() {
-            rects[i] = vis_rects[k];
-        }
+        let (vxa, _, _, _) = work_area_for_rect(leftmost);
+        model::align_first_row_left(&mut vis_rects, vxa);
     }
+    // 同行内水平推挤:只解同一行内的横向冲突。跨行冲突一律不在此解,
+    // 交给级联+整行收缩——此前跨行也走 push_away,竖向退出量大时单轴
+    // 最小位移会选水平推出,把第一行整体挤向右(2026-09-16 用户实测)。
+    let rows = model::rows_from_rects(&vis_rects);
     for _ in 0..24 {
         let mut moved = false;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let old = rects[j];
-                rects[j] = model::push_away(&rects[i], &old);
-                if rects[j] != old {
-                    moved = true;
+        for row in &rows {
+            for a in 0..row.len() {
+                for b in (a + 1)..row.len() {
+                    let (i, j) = (row[a], row[b]);
+                    let old = vis_rects[j];
+                    vis_rects[j] = model::push_away(&vis_rects[i], &old);
+                    if vis_rects[j] != old {
+                        moved = true;
+                    }
                 }
             }
         }
@@ -880,9 +978,52 @@ pub(crate) fn push_settle(fences: &mut [Fence], areas: &[(f32, f32, f32, f32)]) 
             break;
         }
     }
-    model::fit_to_monitors(&mut rects, areas);
-    for (f, r) in fences.iter_mut().zip(rects) {
-        f.rect = r;
+    // 多显示器归位:按中心就近夹回所在显示器工作区(纯夹回,不解重叠)
+    model::fit_to_monitors(&mut vis_rects, areas);
+    // 夹回后复核一轮(正常情况 fit 已无事可做;异常上移在此被重新级联)
+    cascade_and_shrink(&mut vis_rects);
+    for (k, &i) in vis.iter().enumerate() {
+        fences[i].rect = vis_rects[k];
+    }
+}
+
+/// 行级联 + 超屏整行收缩(2026-09-16 用户定案语义):第一行尽量不动
+/// (顶锚),每行顶=上一行最深底+GAP;行底超出该行所在显示器工作区→
+/// 整行成员一步收缩到"从本行顶到屏幕底能放下的整行高"(min_h 下限),
+/// 内容转滚动。收缩/级联交替至稳定(行高只减不增,必然收敛,第三行及
+/// 以下同理)。必须在 fit_to_monitors 之前跑:fit 的上移会改变行中心、
+/// 把两行并成一行。
+fn cascade_and_shrink(rects: &mut [Rect]) {
+    for _ in 0..16 {
+        model::align_rows_top(rects);
+        model::space_rows_gap(rects);
+        let rows = model::rows_from_rects(rects);
+        let mut shrunk_row = false;
+        for row in &rows {
+            let Some(&first) = row.first() else {
+                continue;
+            };
+            let (_, _, _, vh) = work_area_for_rect(&rects[first]);
+            let bottom = row
+                .iter()
+                .map(|&i| rects[i].y + rects[i].h)
+                .fold(f32::MIN, f32::max);
+            if bottom <= vh + 0.5 {
+                continue;
+            }
+            for &i in row {
+                // 一步收缩到位:从本栅栏顶到屏幕底能放下的整行高
+                let top = rects[i].y;
+                let fit_h = model::max_whole_row_h(vh - top).max(model::min_h());
+                if fit_h < rects[i].h - 0.5 {
+                    rects[i].h = fit_h;
+                    shrunk_row = true;
+                }
+            }
+        }
+        if !shrunk_row {
+            break;
+        }
     }
 }
 
@@ -898,6 +1039,8 @@ pub(crate) fn settle_preserve_positions() {
 
 /// 追踪鼠标离开(用于隐藏悬停卡片)
 pub(crate) fn track_mouse_leave(hwnd: HWND) {
+    // SAFETY: tme 为栈结构且 cbSize 按契约填充；hwndTrack 是收到
+    // WM_MOUSEMOVE 的本进程窗口；TrackMouseEvent 同步完成。
     unsafe {
         let mut tme = TRACKMOUSEEVENT {
             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -970,6 +1113,16 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     let mut tmp = [nr];
                     model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
                     nr = tmp[0];
+                    // 拖动中实时整行收缩(2026-09-16 用户定案):预览矩形底部
+                    // 超出所在显示器工作区→高度收缩到"从这里到屏幕底还能放
+                    // 下的整行数"(min_h 下限);拖回不超界处→无状态恢复原始
+                    // 高度(公式每帧从 start_rect.h 重算,天然可逆)。松手按
+                    // 收缩后的尺寸落位,Esc 取消由 start_layout 快照还原。
+                    // 放在 EDGE 吸附前:吸附与收缩用同一份高度,不互相抖动。
+                    {
+                        let fit_h = model::max_whole_row_h(vh - nr.y);
+                        nr.h = nr.h.min(fit_h);
+                    }
                     // 插入线/行槽落位=自动档专属(网格档棋盘化,2026-09-08)
                     let chain = auto_align_on();
                     let insert = if chain {
@@ -1031,10 +1184,14 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                             .and_then(|host| drag_elevate_anchor(host.hwnd, h));
                         if let Some(anchor) = anchor {
                             let _z = z_scope(ZIntent::Drag);
+                            // SAFETY: h 是本进程被拖栅栏窗口；anchor 来自
+                            // drag_elevate_anchor 解析（最高兄弟栅栏，仍在桌面
+                            // band 内）；z_scope 声明自家意图；NOMOVE|NOSIZE
+                            // 纯 z 调整。
                             unsafe {
                                 let _ = SetWindowPos(
                                     h,
-                                    anchor,
+                                    Some(anchor),
                                     0,
                                     0,
                                     0,
@@ -1100,7 +1257,42 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     let nr = snap_drag(&s, fence_id, nr);
                     let (vx, vy, vw, vh) = work_area_for_rect(&nr);
                     let mut tmp = [nr];
-                    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
+                    // 顶边下限=上方栅栏底+GAP(行模型:行顶由级联固定,向上
+                    // 长高会压进上一行,松手必被拉回——预览不给假象)。
+                    // 候选以按下时的顶边为界(见 resize_top_limit 注释)。
+                    {
+                        let limit = resize_top_limit(
+                            &s.fences,
+                            fence_id,
+                            tmp[0].x,
+                            tmp[0].w,
+                            drag.start_rect.y,
+                            vy,
+                        );
+                        if tmp[0].y < limit {
+                            tmp[0].y = limit;
+                        }
+                        // 北向拖高时底边钉在按下位置:顶边被顶住后高度要重算
+                        if chars.contains(&'n') {
+                            let bot = drag.start_rect.y + drag.start_rect.h;
+                            tmp[0].h = (bot - tmp[0].y).max(model::min_h());
+                        }
+                    }
+                    // 夹回水平与顶边(不用 fit_to_screen:南向拖长时它会把整个
+                    // 窗口往上挪=拖高变乱的另一半);高度以当前 y 为准收缩到
+                    // "从这里到屏幕底放得下的整行数"(2026-09-16,与 Move 同
+                    // 语义),拖不出去就不会压进上一行。
+                    if tmp[0].x < vx {
+                        tmp[0].x = vx;
+                    }
+                    if tmp[0].x + tmp[0].w > vx + vw {
+                        tmp[0].x = (vx + vw - tmp[0].w).max(vx);
+                    }
+                    if tmp[0].y < vy {
+                        tmp[0].y = vy;
+                    }
+                    let fit_h = model::max_whole_row_h(vh - tmp[0].y);
+                    tmp[0].h = tmp[0].h.min(fit_h).max(model::min_h());
                     let cur = s.fences.iter().find(|f| f.id == fence_id).map(|f| f.rect);
                     let unchanged = cur.is_some_and(|c| c == tmp[0]);
                     if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
@@ -1170,7 +1362,7 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         update_ghost(sx - model::icon_size() / 2.0, sy - model::icon_size() / 2.0);
                         return;
                     }
-                    if !drag.dragged_out && (dx * dx + dy * dy) > 64.0 {
+                    if !drag.dragged_out && moved_beyond_threshold(dx, dy) {
                         // 判断拖拽目标:仍在当前栅栏内 → 内部残影拖拽(松手重排);
                         // 拖出栅栏 → OLE 拖拽(可与资源管理器互拖)
                         // 防御(2026-09-08):栅栏若在按住期间被删除/重建(分类
@@ -1307,9 +1499,10 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             .unwrap_or(false)
     {
         s.fence_hover_pending.insert(fence_id, true);
+        // SAFETY: hwnd 是本窗口；纯定时器调用，无指针参数。
         unsafe {
             let _ = SetTimer(
-                hwnd,
+                Some(hwnd),
                 TIMER_HOVER,
                 mouse_hover_time_ms().max(50) as u32,
                 None,
@@ -1322,9 +1515,10 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         s.hover_pending.insert(fence_id, new_hover);
         if changed {
             drop(s);
+            // SAFETY: 同上：本窗口的悬停定时器。
             unsafe {
                 let _ = SetTimer(
-                    hwnd,
+                    Some(hwnd),
                     TIMER_HOVER,
                     mouse_hover_time_ms().max(50) as u32,
                     None,
@@ -1334,22 +1528,18 @@ pub(crate) fn handle_mousemove(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     } else {
         // 回到已提交的图标：取消未到期的延迟提交
         if s.hover_pending.remove(&fence_id).is_some() {
+            // SAFETY: 同上：本窗口的定时器，纯调用。
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_HOVER);
+                let _ = KillTimer(Some(hwnd), TIMER_HOVER);
             }
         }
     }
 }
 
-/// 单调毫秒时钟(resize 时间节流用)
-pub(crate) fn resize_now_ms() -> u64 {
-    use std::time::Instant;
-    static T0: OnceLock<Instant> = OnceLock::new();
-    T0.get_or_init(Instant::now).elapsed().as_millis() as u64
-}
-
 /// 系统悬停时间(SPI_GETMOUSEHOVERTIME,毫秒,默认 400)
 fn mouse_hover_time_ms() -> i32 {
+    // SAFETY: SPI_GETMOUSEHOVERTIME 契约：pvParam 指向 u32、uiParam 传
+    // 字节数；v 是栈变量，调用期间有效；失败走默认 400。
     unsafe {
         let mut v: u32 = 0;
         let ok = SystemParametersInfoW(
@@ -1373,8 +1563,10 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         (s.rename_edit, s.file_rename_edit)
     };
     if let Some(edit) = rename_edit {
+        // SAFETY: edit 是本进程的就地改名编辑框；PostMessage 异步提交，
+        // 由编辑框 wndproc 串行处理。
         unsafe {
-            let _ = PostMessageW(edit, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(edit), RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
         }
     }
     if let Some(edit) = file_edit {
@@ -1383,14 +1575,17 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             x: x as i32,
             y: y as i32,
         };
+        // SAFETY: p 是栈坐标，ClientToScreen 原位改写，调用期间有效；
+        // hwnd 是本窗口。
         let sp = unsafe {
             let _ = ClientToScreen(hwnd, &mut p);
             p
         };
         if !point_in_window_rect(edit, sp.x, sp.y) {
             log("COMMIT via lbuttondown");
+            // SAFETY: 同上：本进程编辑框的异步提交，无指针参数。
             unsafe {
-                let _ = PostMessageW(edit, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(edit), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
             }
         }
     }
@@ -1478,6 +1673,8 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     icon_path,
                     last_insert: None,
                 });
+                // SAFETY: SetCapture 把后续鼠标消息路由给本窗口（UI 线程调用），
+                // 与 handle_lbuttonup 的 ReleaseCapture 配对。
                 unsafe {
                     SetCapture(hwnd);
                 }
@@ -1507,6 +1704,7 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     icon_path: String::new(),
                     last_insert: None,
                 });
+                // SAFETY: 同上：本窗口捕获，配对见 ReleaseCapture 各出口。
                 unsafe {
                     SetCapture(hwnd);
                 }
@@ -1559,6 +1757,7 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 icon_path: String::new(),
                 last_insert: None,
             });
+            // SAFETY: 同前几个分支：本窗口捕获，配对见 ReleaseCapture 各出口。
             unsafe {
                 SetCapture(hwnd);
             }
@@ -1567,7 +1766,7 @@ pub(crate) fn handle_lbuttondown(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     }
 }
 
-pub(crate) fn is_edge(h: &Hit) -> bool {
+pub fn is_edge(h: &Hit) -> bool {
     matches!(
         *h,
         Hit::EdgeW
@@ -1581,7 +1780,7 @@ pub(crate) fn is_edge(h: &Hit) -> bool {
     )
 }
 
-pub(crate) fn edges_of(h: Hit) -> [char; 2] {
+pub fn edges_of(h: Hit) -> [char; 2] {
     match h {
         Hit::EdgeW => ['w', '\0'],
         Hit::EdgeE => ['e', '\0'],
@@ -1763,12 +1962,17 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 s.trash_target = false;
                 rollback_ghost_preview(&mut s);
                 s.marquee = None;
-                let hwnd = s.windows.get(&fence_id).copied().unwrap_or(HWND(0));
+                let hwnd = s
+                    .windows
+                    .get(&fence_id)
+                    .copied()
+                    .unwrap_or(HWND(std::ptr::null_mut()));
                 log(&format!(
                     "drop onto recycle bin: deleting {} items",
                     paths.len()
                 ));
                 drop(s);
+                // SAFETY: 释放 lbuttondown 的 SetCapture（当前线程），无指针参数。
                 unsafe {
                     let _ = ReleaseCapture();
                 }
@@ -1817,6 +2021,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 // 拖出栅栏后客户区坐标为负,WM 消息里以无符号解码会变成 ~65k;
                 // 用真实屏幕光标位置做命中才可靠
                 let mut pt = POINT::default();
+                // SAFETY: pt 是栈输出指针，调用期间有效。
                 unsafe {
                     let _ = GetCursorPos(&mut pt);
                 }
@@ -1830,12 +2035,17 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     .unwrap_or_default();
                 rollback_ghost_preview(&mut s);
                 s.marquee = None;
-                let hwnd = s.windows.get(&fence_id).copied().unwrap_or(HWND(0));
+                let hwnd = s
+                    .windows
+                    .get(&fence_id)
+                    .copied()
+                    .unwrap_or(HWND(std::ptr::null_mut()));
                 log(&format!(
                     "cross-fence drop onto recycle bin: deleting {} items",
                     paths.len()
                 ));
                 drop(s);
+                // SAFETY: 释放捕获（当前线程），无指针参数。
                 unsafe {
                     let _ = ReleaseCapture();
                 }
@@ -1852,6 +2062,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                 // 松手在其他栅栏上 = 把拖动的文件分配给那个栅栏
                 // (自定义分类模式的核心入口;自动分类下也可用来"收藏"到自建栅栏)
                 let mut pt = POINT::default();
+                // SAFETY: pt 是栈输出指针，调用期间有效。
                 unsafe {
                     let _ = GetCursorPos(&mut pt);
                 }
@@ -1906,6 +2117,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             rebuild_pins();
             refresh_all_fences();
             update_overlay();
+            // SAFETY: 释放拖拽捕获（当前线程），无指针参数。
             unsafe {
                 let _ = ReleaseCapture();
             }
@@ -1919,7 +2131,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             // 同一图标(非双击、无拖动、无Ctrl)→ 原位进入重命名
             if let DragMode::Icon(_) = drag.mode {
                 let ctrl = (unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } as u16 & 0x8000) != 0;
-                let moved = (dx * dx + dy * dy) > 64.0;
+                let moved = moved_beyond_threshold(dx, dy);
                 if moved || drag.dragged_out {
                     // 拖动过=非打开意图:取消 DBLCLK 登记的待打开(2026-09-09
                     // 用户实测"图标移动后还打开文件"——第二次点击判成双击
@@ -1943,6 +2155,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     drop(s);
                     refresh_fence(fence_id);
                     start_file_rename(path);
+                    // SAFETY: 慢双击改名路径：释放捕获（当前线程）。
                     unsafe {
                         let _ = ReleaseCapture();
                     }
@@ -1999,9 +2212,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     // model::row_insert_layout 的位置分配(尺寸保持各自,只动
                     // 受影响两行);无指示线 → 原地自由放置。
                     let (cx, cy) = screen_cursor();
-                    let moved = (cx - drag.start_sx) * (cx - drag.start_sx)
-                        + (cy - drag.start_sy) * (cy - drag.start_sy)
-                        > 64.0;
+                    let moved = moved_beyond_threshold(cx - drag.start_sx, cy - drag.start_sy);
                     // 插入线/行槽落位=自动档专属;网格档(棋盘模式)松手按
                     // 网格取整自由放置(走下面 else 分支)
                     let plan = if moved && auto_align_on() {
@@ -2117,32 +2328,41 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         f.manual_size = true;
                     }
                     let chars: Vec<char> = edges.iter().filter(|c| **c != '\0').copied().collect();
-                    let nr0 = model::apply_resize(&drag.start_rect, &chars, dx, dy);
-                    let nr0 = snap_drag(&s, fence_id, nr0);
                     let w_inv = chars.contains(&'w');
                     let n_inv = chars.contains(&'n');
-                    // Snap the final content area to the icon-cell grid so the
-                    // fence always fits exactly N×M icons.
-                    let (sw, sh) = model::snap_fence_size(nr0.w, nr0.h);
-                    let mut nr = nr0;
-                    nr.w = sw;
-                    nr.h = sh;
+                    // 松手落位=预览所见(WYSIWYG,2026-09-16):mousemove 已把
+                    // 顶边下限/屏底整行收缩等全部约束作用在 f.rect 上。绝不
+                    // 能从原始 dx/dy 重算——顶边被顶住时光标仍在越界位移,
+                    // 重算=松手瞬间越限,被行聚类并进上一行=全盘乱跑(用户
+                    // 实测"看着拖不动,一松手就乱")。这里只做整格吸附+同一
+                    // 套约束复核(model::resize_drop_rect)。
+                    let cur = s
+                        .fences
+                        .iter()
+                        .find(|f| f.id == fence_id)
+                        .map(|f| f.rect)
+                        .unwrap_or(drag.start_rect);
+                    let (vx, vy, vw, vh) = work_area_for_rect(&cur);
+                    let top_limit =
+                        resize_top_limit(&s.fences, fence_id, cur.x, cur.w, drag.start_rect.y, vy);
+                    let mut nr = model::resize_drop_rect(cur, n_inv, top_limit, vh);
                     if w_inv {
                         let far = drag.start_rect.x + drag.start_rect.w;
-                        nr.x = (far - sw).max(0.0);
+                        nr.x = (far - nr.w).max(vx);
                     }
-                    if n_inv {
-                        let bot = drag.start_rect.y + drag.start_rect.h;
-                        nr.y = (bot - sh).max(0.0);
+                    if nr.x < vx {
+                        nr.x = vx;
+                    } else if nr.x + nr.w > vx + vw {
+                        nr.x = vx + vw - nr.w;
                     }
-                    let (vx, vy, vw, vh) = work_area_for_rect(&nr);
-                    let mut tmp = [nr];
-                    model::fit_to_screen(&mut tmp, vx, vy, vw, vh);
+                    if nr.y < vy {
+                        nr.y = vy;
+                    }
                     // 保留用户缩放的尺寸，只解除重叠（其它栅栏不动）
                     let final_r = if auto_align_on() {
-                        tmp[0]
+                        nr
                     } else {
-                        model::avoid_overlap(&tmp[0], &others, vx, vy, vw, vh)
+                        model::avoid_overlap(&nr, &others, vx, vy, vw, vh)
                     };
                     if let Some(f) = s.fences.iter_mut().find(|f| f.id == fence_id) {
                         f.rect = final_r;
@@ -2154,6 +2374,10 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
             if auto_align_on() && matches!(drag.mode, DragMode::Resize { .. }) {
                 compact_neighbors_after_resize(&mut s.fences, fence_id);
                 changed_final = s.fences.iter().map(|f| f.id).collect();
+                // 缩放松手后同样走 settle 归一(2026-09-16):此前 Resize 不跑
+                // settle,拖乱/拖矮后的行结构一直保持到下次 boot——用户实测
+                // "拖短后第一行没自动排列回来"。级联+收缩把行恢复到规范态。
+                drop_move_settle = true;
             }
             let cfg = s.fences.clone();
             let _ = model::save_config(&cfg);
@@ -2179,6 +2403,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
         }
         // 松手后刷新 overlay(插入线/残影已清,无内容即隐藏)并清除框选矩形
         update_overlay();
+        // SAFETY: 释放拖拽捕获（当前线程），无指针参数。
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -2198,10 +2423,14 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                         if let Some(fh) = s.windows.get(&fence_id) {
                             if let Some(after) = band_attach_anchor(host.hwnd, *fh) {
                                 let _z = z_scope(ZIntent::Drag);
+                                // SAFETY: fh 是本进程栅栏窗口；after 是
+                                // band_attach_anchor 解析的安全锚点（Option，
+                                // None 时不动）；z_scope 声明自家归位意图；
+                                // NOSIZE 纯移动+z。
                                 unsafe {
                                     let _ = SetWindowPos(
                                         *fh,
-                                        after,
+                                        Some(after),
                                         rect.x.round() as i32,
                                         rect.y.round() as i32,
                                         0,
@@ -2225,7 +2454,7 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     // 拖动过=移动意图,取消打开(不改判快/慢,只否决"拖动后误开")
     if let Some((px, py)) = *PENDING_POS.lock().unwrap() {
         let (cx, cy) = screen_cursor();
-        if (cx - px) * (cx - px) + (cy - py) * (cy - py) > 64.0 {
+        if moved_beyond_threshold(cx - px, cy - py) {
             PENDING_POS.lock().unwrap().take();
             pending_open().lock().unwrap().take();
             return;
@@ -2271,6 +2500,7 @@ pub(crate) fn handle_dblclk(fence_id: u32, x: f32, y: f32) {
 
 pub(crate) fn handle_rbuttonup(hwnd: HWND, fence_id: u32, x: f32, y: f32) {
     // 客户区坐标 → 屏幕坐标(TrackPopupMenu 要屏幕坐标,否则菜单弹到错误位置)
+    // SAFETY: p 是栈坐标，ClientToScreen 原位改写；hwnd 是本窗口。
     let (sx, sy) = unsafe {
         let mut p = POINT {
             x: x as i32,
@@ -2409,9 +2639,12 @@ pub(crate) fn handle_setcursor(hwnd: HWND, fence_id: u32) {
         Hit::EdgeN | Hit::EdgeS => 32645,
         _ => 32512,
     };
+    // SAFETY: cid 是系统标准光标资源 id（MAKEINTRESOURCE 语义：把整数
+    // 打包进指针值，LoadCursorW 按资源 id 解读、不解引用）；系统光标
+    // 句柄由系统持有，无需销毁。
     unsafe {
         if let Ok(hc) = LoadCursorW(None, PCWSTR::from_raw(cid as *const u16)) {
-            SetCursor(hc);
+            SetCursor(Some(hc));
         }
     }
     let _ = hwnd;
@@ -2426,7 +2659,9 @@ pub fn on_fence_drop_cb(fence_id: u32, paths: Vec<String>, screen_x: i32, screen
     let (cx, cy) = {
         let s = state().lock().unwrap();
         match s.windows.get(&fence_id).copied() {
-            Some(hwnd) if hwnd.0 != 0 => unsafe {
+            // SAFETY: q 是栈坐标；hwnd 是 state.windows 里的本进程栅栏窗口
+            //（判空守卫在前）；ScreenToClient 同步原位改写。
+            Some(hwnd) if !hwnd.0.is_null() => unsafe {
                 let mut q = POINT {
                     x: screen_x,
                     y: screen_y,
@@ -2457,7 +2692,7 @@ pub fn on_fence_drop_cb(fence_id: u32, paths: Vec<String>, screen_x: i32, screen
             .windows
             .get(&fence_id)
             .copied()
-            .unwrap_or(HWND(0));
+            .unwrap_or(HWND(std::ptr::null_mut()));
         log(&format!(
             "OLE drop onto recycle bin: deleting {} items",
             paths.len()

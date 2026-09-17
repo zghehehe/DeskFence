@@ -11,25 +11,34 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, GetDC, GetMonitorInfoW, GetTextExtentPoint32W,
-    GetTextMetricsW, MonitorFromWindow, ReleaseDC, SelectObject, HFONT, LOGFONTW, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, TEXTMETRICW,
+    GetTextMetricsW, MonitorFromWindow, ReleaseDC, SelectObject, HFONT, HGDIOBJ, LOGFONTW,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, TEXTMETRICW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::logging::log;
 use crate::model::{self, Rect};
+use crate::monitors::*;
+use crate::present::*;
+use crate::settings::*;
 use crate::shell;
+use crate::state::*;
 use crate::ui::*;
+use crate::winids::*;
 
 static RENAME_OLD_PROC: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
 
+/// # Safety
+/// 子类兜底窗口过程（RENAME_OLD_PROC/FILE_RENAME_OLD_PROC 缺省时的替代）：
+/// 系统在 UI 线程同步回调；参数原样透传 DefWindowProcW，无自有前提。
 unsafe extern "system" fn default_edit_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 // ---------------- 重命名点击外部提交(与 Explorer 行为一致) ----------------
@@ -40,11 +49,13 @@ unsafe extern "system" fn default_edit_proc(
 // 2) 重命名期间安装的 WH_MOUSE_LL 钩子：任何真实鼠标按下(含壁纸/其它应用)
 // 3) 全局定时器兜底：检测到左键按下且光标在编辑框外
 
-static RENAME_MOUSE_HOOK: Mutex<Option<HHOOK>> = Mutex::new(None);
+static RENAME_MOUSE_HOOK: SyncHandle<Mutex<Option<HHOOK>>> = SyncHandle(Mutex::new(None));
 pub(crate) const TIMER_RENAME_WATCH: usize = 4;
 
 pub(crate) fn point_in_window_rect(hwnd: HWND, x: i32, y: i32) -> bool {
     let mut r = RECT::default();
+    // SAFETY: r 是栈输出指针（GetWindowRect 契约），调用期间有效；
+    // 失败保持全零矩形=判不在框内。
     unsafe {
         let _ = GetWindowRect(hwnd, &mut r);
     }
@@ -62,8 +73,10 @@ pub(crate) fn rename_click_outside_hit(x: i32, y: i32, _src: &str) -> bool {
         if point_in_window_rect(edit, x, y) {
             return false;
         }
+        // SAFETY: edit 是本进程的栅栏标题编辑框；PostMessage 异步提交，
+        // 由编辑框自己的 wndproc 串行处理。
         unsafe {
-            let _ = PostMessageW(edit, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(edit), RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
         }
         handled = true;
     }
@@ -71,15 +84,22 @@ pub(crate) fn rename_click_outside_hit(x: i32, y: i32, _src: &str) -> bool {
         if point_in_window_rect(edit, x, y) {
             return handled;
         }
+        // SAFETY: 同上：本进程文件改名编辑框的异步提交，无指针参数。
         unsafe {
-            let _ = PostMessageW(edit, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(edit), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
         }
         handled = true;
     }
     handled
 }
 
+/// # Safety
+/// WH_MOUSE_LL 低级鼠标钩子回调（重命名期间临时安装），系统在安装钩子的
+/// 线程（主线程）同步调用；ncode==HC_ACTION 时 lparam 指向系统所有的
+/// MSLLHOOKSTRUCT，回调期间可读；实现只取坐标做判定，快速返回。
 unsafe extern "system" fn rename_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY(整块): lparam 解引用依据上述钩子契约；其余调用无指针参数；
+    // CallNextHookEx 原样传参保持钩子链。
     unsafe {
         if ncode as u32 == HC_ACTION {
             let down = wparam.0 as u32 == WM_LBUTTONDOWN || wparam.0 as u32 == WM_RBUTTONDOWN;
@@ -93,14 +113,20 @@ unsafe extern "system" fn rename_mouse_proc(ncode: i32, wparam: WPARAM, lparam: 
 }
 
 fn install_rename_mouse_hook() {
+    // SAFETY(整块): rename_mouse_proc 是匹配 HOOKPROC ABI 的钩子函数，
+    // 低级鼠标钩子在安装线程（主线程）回调；句柄存 Mutex<Option>（装卸
+    // 配对，见 uninstall）；SetTimer 挂在托盘窗口（本进程所有），回调
+    // None=WM_TIMER 进 tray_wndproc。
     unsafe {
         {
             let mut slot = RENAME_MOUSE_HOOK.lock().unwrap();
             if slot.is_some() {
                 return;
             }
-            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(rename_mouse_proc), hinstance(), 0) {
-                if h.0 != 0 {
+            if let Ok(h) =
+                SetWindowsHookExW(WH_MOUSE_LL, Some(rename_mouse_proc), Some(hinstance()), 0)
+            {
+                if !h.0.is_null() {
                     *slot = Some(h);
                 }
             }
@@ -108,7 +134,7 @@ fn install_rename_mouse_hook() {
         // 高频兜底:40ms 轮询真实按键状态(钩子被系统摘除/事件被安全软件
         // 吞掉时仍能检测到"点击外部"并提交,与 Explorer 行为一致)
         if let Some(tray) = TRAY_HWND.get().copied() {
-            let _ = SetTimer(tray, TIMER_RENAME_WATCH, 40, None);
+            let _ = SetTimer(Some(tray), TIMER_RENAME_WATCH, 40, None);
         }
     }
 }
@@ -117,6 +143,8 @@ fn uninstall_rename_mouse_hook() {
     {
         let mut slot = RENAME_MOUSE_HOOK.lock().unwrap();
         if let Some(h) = slot.take() {
+            // SAFETY: h 是 SetWindowsHookExW 返回的合法句柄，take 保证
+            // 只卸载一次。
             unsafe {
                 let _ = UnhookWindowsHookEx(h);
             }
@@ -129,8 +157,9 @@ fn uninstall_rename_mouse_hook() {
     };
     if !any_edit {
         if let Some(tray) = TRAY_HWND.get().copied() {
+            // SAFETY: tray 是本进程托盘窗口；纯定时器调用，无指针参数。
             unsafe {
-                let _ = KillTimer(tray, TIMER_RENAME_WATCH);
+                let _ = KillTimer(Some(tray), TIMER_RENAME_WATCH);
             }
         }
     }
@@ -162,6 +191,11 @@ pub(crate) fn start_rename(fence_id: u32) {
             });
         (title, rect)
     };
+    // SAFETY(整块): edit_cls/title 为 NUL 宽串（同步调用期间存活）、
+    // hinstance 是本进程模块；EDIT 是系统已注册类；创建失败判空返回。
+    // 子类化三件套按契约配对：GWLP_WNDPROC 换成 rename_edit_proc 并把原
+    // 过程存 RENAME_OLD_PROC（WM_DESTROY 时还原），GWLP_USERDATA 存
+    // fence_id（编辑框存活期间不变）；TOPMOST 定位只改 z 不动位置。
     unsafe {
         // 用独立 popup 窗口代替子控件：分层窗口上的子控件渲染不可靠
         // 类名必须是合法的宽字符串（窄字节强转会变乱码导致找不到 EDIT 类）
@@ -175,12 +209,13 @@ pub(crate) fn start_rename(fence_id: u32) {
             rect.y as i32 + 3,
             150,
             20,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
             None,
-        );
-        if edit.0 == 0 {
+            None,
+            Some(hinstance()),
+            None,
+        )
+        .unwrap_or_default();
+        if edit.0.is_null() {
             return;
         }
         let w = shell::wide(&title);
@@ -195,11 +230,11 @@ pub(crate) fn start_rename(fence_id: u32) {
         }
         install_rename_mouse_hook();
         let _ = SetForegroundWindow(edit);
-        SetFocus(edit);
-        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+        let _ = SetFocus(Some(edit));
+        let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         let _ = SetWindowPos(
             edit,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -209,6 +244,13 @@ pub(crate) fn start_rename(fence_id: u32) {
     }
 }
 
+/// # Safety
+/// 栅栏标题编辑框的子类窗口过程（start_rename 经 GWLP_WNDPROC 安装），
+/// 系统在 UI 线程同步回调；hwnd 是本进程 EDIT 窗口。体内裸 unsafe 操作
+/// 的依据：PostMessageW 只用本窗口句柄；WM_DESTROY 还原 GWLP_WNDPROC
+/// （原值来自 RENAME_OLD_PROC，是合法过程指针或 default_edit_proc）；
+/// CallWindowProcW 的 old 经 transmute 自 isize——该值正是 SetWindowLongPtrW
+/// 写入时的原过程指针（ABI 同为 wndproc），指针宽度与 isize 一致。
 unsafe extern "system" fn rename_edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -222,25 +264,35 @@ unsafe extern "system" fn rename_edit_proc(
     match msg {
         WM_KEYDOWN => {
             if wparam.0 == VK_RETURN.0 as usize {
-                let _ = PostMessageW(hwnd, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                }
                 return LRESULT(0);
             }
             if wparam.0 == VK_ESCAPE.0 as usize {
-                let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                }
                 return LRESULT(0);
             }
         }
         WM_KILLFOCUS => {
-            let _ = PostMessageW(hwnd, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            }
             return LRESULT(0);
         }
         WM_CANCELMODE => {
-            let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+            }
             return LRESULT(0);
         }
         WM_ACTIVATE => {
             if (wparam.0 as u32 & 0xFFFF) == 0 {
-                let _ = PostMessageW(hwnd, RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                }
             }
             return LRESULT(0);
         }
@@ -253,26 +305,47 @@ unsafe extern "system" fn rename_edit_proc(
             return LRESULT(0);
         }
         WM_DESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-            return LRESULT(0);
+            // 还原子类过程后转发原过程(与 file_rename_edit_proc 统一,
+            // 2026-09-17 修不对称:EDIT 原过程的 WM_DESTROY 清理不再被跳过)
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            }
+            return unsafe {
+                CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            };
         }
         _ => {}
     }
-    CallWindowProcW(
-        Some(std::mem::transmute::<
-            isize,
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        >(old)),
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-    )
+    unsafe {
+        CallWindowProcW(
+            Some(std::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(old)),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
+    }
 }
 
 fn commit_rename(edit: HWND) {
+    // SAFETY: GWLP_USERDATA 是 start_rename 写入的 fence_id（编辑框存活
+    // 期间不变），句柄查询无指针参数。
     let fence_id = unsafe { GetWindowLongPtrW(edit, GWLP_USERDATA) as u32 };
     let mut buf = [0u16; 128];
+    // SAFETY: buf 是 256 字节栈缓冲；GetWindowTextW 契约按容量截断并保证
+    // NUL 结尾；按 NUL 截断解析。
     unsafe {
         let _ = GetWindowTextW(edit, &mut buf);
     }
@@ -294,6 +367,8 @@ fn commit_rename(edit: HWND) {
         let _ = model::save_config(&cfg);
     }
     uninstall_rename_mouse_hook();
+    // SAFETY: edit 是 state.rename_edit 登记的本进程编辑框（上方已清槽），
+    // 销毁恰好一次；WM_DESTROY 走子类过程还原 wndproc。
     unsafe {
         let _ = DestroyWindow(edit);
     }
@@ -307,6 +382,7 @@ fn cancel_rename(edit: HWND) {
         s.rename_edit = None;
     }
     uninstall_rename_mouse_hook();
+    // SAFETY: 同 commit_rename：本进程编辑框，清槽后销毁一次。
     unsafe {
         let _ = DestroyWindow(edit);
     }
@@ -324,7 +400,6 @@ const RENAME_FIT_TIMER: usize = 0x4DF5;
 const WM_IME_COMPOSITION: u32 = 0x010F;
 const FILE_RENAME_CANCEL_MSG: u32 = WM_USER + 4;
 static FILE_RENAME_OLD_PROC: OnceLock<isize> = OnceLock::new();
-pub(crate) static FILE_RENAME_PATH: Mutex<Option<String>> = Mutex::new(None);
 /// 提交防重入门闩:回车/失焦/WM_ACTIVATE/点击外部轮询可在同一帧叠加多条
 /// 提交消息,重入会对同一编辑框提交两次。历史上失败路径的模态 MessageBox
 /// 弹出→编辑框失焦→自动提交路径 Post 新提交→模态循环把新提交分发→重入
@@ -339,27 +414,6 @@ static FILE_RENAME_COMMITTING: std::sync::atomic::AtomicBool =
 /// 建分类栅栏"的根因:内存同步把变化对 rescan 藏住了)
 pub(crate) static RENAME_RESCAN_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-// ---------------- 扫描宽恕(2026-09-03) ----------------
-/// 路径→连续扫描未遇次数。刚消失的文件连续 SCAN_MISS_DROP 轮扫不到才真正
-/// 移除:新建/写入中的文件元数据可能被创建方进程短暂锁住,单轮扫描漏掉
-/// 就把在册文件当"消失"会引发栅栏重排、位置漂移(用户实测"文档自动移位")。
-/// 应用主动删除的路径用 mark_scan_removed 立即达阈值,不拖尾巴。
-pub(crate) const SCAN_MISS_DROP: u32 = 2;
-pub(crate) fn scan_miss_map() -> &'static Mutex<std::collections::HashMap<String, u32>> {
-    static M: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-pub(crate) fn mark_scan_removed(paths: &[String]) {
-    // 应用主动删除=内存状态在扫描器背后变了:作废在途异步快照,防止它把
-    // 已删路径当"新增"混回内存列表(见 ui.rs SCAN_EPOCH)
-    crate::ui::invalidate_pending_scans();
-    let mut miss = scan_miss_map().lock().unwrap();
-    for p in paths {
-        miss.insert(p.clone(), SCAN_MISS_DROP);
-    }
-}
 
 // ---------------- 双击打开延迟执行(2026-09-04 兼顾两种手势) ----------------
 // DBLCLK 先登记"待打开"而不立即执行;随后的 UP 判定:与上一次图标 UP 的
@@ -462,6 +516,11 @@ pub(crate) fn start_file_rename(path: String) {
     };
     // 先设 PATH 再建编辑框:绘制路径据此隐藏该成员标签(与原生一致)
     *FILE_RENAME_PATH.lock().unwrap() = Some(path.clone());
+    // SAFETY(整块): 参数契约同 start_rename（NUL 宽串+hinstance+EDIT 系统
+    // 类+判空返回）；子类化三件套对应 FILE_RENAME_OLD_PROC/
+    // file_rename_edit_proc；WM_SETFONT 的字体句柄存 state.rename_fonts，
+    // WM_NCDESTROY 时 DeleteObject 释放；所有 SendMessage/SetTimer 对象
+    // 均为本进程刚创建的编辑框。
     unsafe {
         let edit_cls = shell::wide("EDIT");
         let edit = CreateWindowExW(
@@ -491,12 +550,13 @@ pub(crate) fn start_file_rename(path: String) {
             edit_y,
             edit_w,
             edit_h,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
             None,
-        );
-        if edit.0 == 0 {
+            None,
+            Some(hinstance()),
+            None,
+        )
+        .unwrap_or_default();
+        if edit.0.is_null() {
             *FILE_RENAME_PATH.lock().unwrap() = None;
             return;
         }
@@ -513,31 +573,33 @@ pub(crate) fn start_file_rename(path: String) {
         });
         let font = CreateFontIndirectW(&lf);
         if !font.is_invalid() {
-            let _ = SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+            let _ = SendMessageW(
+                edit,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
         }
         {
             let mut s = state().lock().unwrap();
-            s.rename_metrics.insert(edit.0, edit_metrics);
-            s.rename_centers
-                .insert(edit.0, (edit_x as f32 + edit_w as f32 * 0.5).round() as i32);
+            s.rename_metrics.insert(edit.0 as isize, edit_metrics);
+            s.rename_centers.insert(
+                edit.0 as isize,
+                (edit_x as f32 + edit_w as f32 * 0.5).round() as i32,
+            );
             if !font.is_invalid() {
-                s.rename_fonts.insert(edit.0, font);
+                s.rename_fonts.insert(edit.0 as isize, font);
             }
         }
         let w = shell::wide(&name);
         let _ = SetWindowTextW(edit, PCWSTR::from_raw(w.as_ptr()));
-        // 与 Explorer 一致:预选扩展名之前的部分。注意 EM_SETSEL 用
-        // UTF-16 字符下标——旧实现直接用 UTF-8 字节下标,中文名会溢出到
-        // 末尾把扩展名也选中(与原生不一致)
-        let sel_end = name
-            .rfind('.')
-            .filter(|&p| p > 0)
-            .map(|p| name[..p].encode_utf16().count() as isize)
-            .unwrap_or(-1);
-        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(sel_end));
+        // 与 Explorer 一致:预选扩展名之前的部分(EM_SETSEL 用 UTF-16
+        // 字符下标,细节见 rename_selection_end_utf16 注释)
+        let sel_end = rename_selection_end_utf16(&name);
+        let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(sel_end)));
         // 初始名就是长名时(多行换行)先按行数增高;改名期间定时器兜底
         adjust_rename_edit_height(edit);
-        let _ = SetTimer(edit, RENAME_FIT_TIMER, 120, None);
+        let _ = SetTimer(Some(edit), RENAME_FIT_TIMER, 120, None);
         *FILE_RENAME_PATH.lock().unwrap() = Some(path);
         let old = SetWindowLongPtrW(
             edit,
@@ -545,10 +607,10 @@ pub(crate) fn start_file_rename(path: String) {
             file_rename_edit_proc as *const () as isize,
         );
         let _ = FILE_RENAME_OLD_PROC.set(old);
-        SetFocus(edit);
+        let _ = SetFocus(Some(edit));
         let _ = SetWindowPos(
             edit,
-            HWND_TOPMOST,
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
@@ -561,10 +623,17 @@ pub(crate) fn start_file_rename(path: String) {
         // 前台化编辑框:栅栏窗口是 WS_EX_NOACTIVATE,不抢焦点;若不前台化,
         // 真实键盘输入(Esc/回车/文字)会进到其它前台窗口,用户无法编辑
         let _ = SetForegroundWindow(edit);
-        SetFocus(edit);
+        let _ = SetFocus(Some(edit));
     }
 }
 
+/// # Safety
+/// 文件改名编辑框的子类窗口过程（start_file_rename 经 GWLP_WNDPROC 安装），
+/// 系统在 UI 线程同步回调；hwnd 是本进程 EDIT 窗口。体内裸 unsafe 依据与
+/// rename_edit_proc 相同：消息只用本窗口句柄；old 过程指针来自
+/// FILE_RENAME_OLD_PROC（SetWindowLongPtrW 的合法回传，transmute 回
+/// wndproc 签名 ABI 一致）；EM_REPLACESEL 的 lParam 指向 w（NUL 宽串，
+/// 同步调用期间存活）；WM_NCDESTROY 释放字体并还原 wndproc。
 unsafe extern "system" fn file_rename_edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -578,39 +647,47 @@ unsafe extern "system" fn file_rename_edit_proc(
     match msg {
         WM_KEYDOWN => {
             if wparam.0 == VK_RETURN.0 as usize {
-                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                }
                 return LRESULT(0);
             }
             if wparam.0 == VK_ESCAPE.0 as usize {
-                let _ = PostMessageW(hwnd, FILE_RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), FILE_RENAME_CANCEL_MSG, WPARAM(0), LPARAM(0));
+                }
                 return LRESULT(0);
             }
             // 多行重命名(与原生一致):删除键可能减少行数
-            let r = CallWindowProcW(
-                Some(std::mem::transmute::<
-                    isize,
-                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                >(old)),
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            );
+            let r = unsafe {
+                CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            };
             adjust_rename_edit_height(hwnd);
             return r;
         }
         WM_IME_COMPOSITION => {
             // 中文经输入法提交,不走 WM_CHAR——这里必须兜住
-            let r = CallWindowProcW(
-                Some(std::mem::transmute::<
-                    isize,
-                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                >(old)),
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            );
+            let r = unsafe {
+                CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            };
             adjust_rename_edit_height(hwnd);
             return r;
         }
@@ -625,20 +702,24 @@ unsafe extern "system" fn file_rename_edit_proc(
                 // 兜住(WM_KEYDOWN 已拦,但 IME/前台转移等路径可能把回车直接
                 // 以 WM_CHAR 形式送达;2026-09-11 实测漏网一次=文件名里混进
                 // 换行触发后续失败循环)
-                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                }
                 return LRESULT(0);
             }
             // 多行重命名(与原生一致):输入/粘贴后按实际换行行数增高编辑框
-            let r = CallWindowProcW(
-                Some(std::mem::transmute::<
-                    isize,
-                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                >(old)),
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            );
+            let r = unsafe {
+                CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            };
             adjust_rename_edit_height(hwnd);
             return r;
         }
@@ -650,33 +731,45 @@ unsafe extern "system" fn file_rename_edit_proc(
                 if !clean.is_empty() {
                     const EM_REPLACESEL: u32 = 0x00C2;
                     let w = shell::wide(&clean);
-                    let _ =
-                        SendMessageW(hwnd, EM_REPLACESEL, WPARAM(1), LPARAM(w.as_ptr() as isize));
+                    unsafe {
+                        let _ = SendMessageW(
+                            hwnd,
+                            EM_REPLACESEL,
+                            Some(WPARAM(1)),
+                            Some(LPARAM(w.as_ptr() as isize)),
+                        );
+                    }
                 }
                 adjust_rename_edit_height(hwnd);
                 return LRESULT(0);
             }
-            let r = CallWindowProcW(
-                Some(std::mem::transmute::<
-                    isize,
-                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                >(old)),
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            );
+            let r = unsafe {
+                CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            };
             adjust_rename_edit_height(hwnd);
             return r;
         }
         WM_KILLFOCUS | WM_CANCELMODE => {
-            let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+            }
             return LRESULT(0);
         }
         WM_ACTIVATE => {
             // 仅失活时提交;编辑框被激活(前台化)不能当作"点击外部"
             if (wparam.0 as u32 & 0xFFFF) == 0 {
-                let _ = PostMessageW(hwnd, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                }
             }
             return LRESULT(0);
         }
@@ -688,8 +781,8 @@ unsafe extern "system" fn file_rename_edit_proc(
             cancel_file_rename(hwnd);
             return LRESULT(0);
         }
-        WM_DESTROY => {
-            let _ = KillTimer(hwnd, RENAME_FIT_TIMER);
+        WM_DESTROY => unsafe {
+            let _ = KillTimer(Some(hwnd), RENAME_FIT_TIMER);
             return CallWindowProcW(
                 Some(std::mem::transmute::<
                     isize,
@@ -700,7 +793,7 @@ unsafe extern "system" fn file_rename_edit_proc(
                 wparam,
                 lparam,
             );
-        }
+        },
         WM_NCDESTROY => {
             let owned = state()
                 .lock()
@@ -713,8 +806,8 @@ unsafe extern "system" fn file_rename_edit_proc(
                 let ids = {
                     let mut s = state().lock().unwrap();
                     s.file_rename_edit = None;
-                    s.rename_metrics.remove(&hwnd.0);
-                    s.rename_centers.remove(&hwnd.0);
+                    s.rename_metrics.remove(&(hwnd.0 as isize));
+                    s.rename_centers.remove(&(hwnd.0 as isize));
                     s.fences
                         .iter()
                         .filter(|f| !f.hidden)
@@ -722,56 +815,70 @@ unsafe extern "system" fn file_rename_edit_proc(
                         .collect::<Vec<_>>()
                 };
                 uninstall_rename_mouse_hook();
-                let font = state().lock().unwrap().rename_fonts.remove(&hwnd.0);
+                let font = state()
+                    .lock()
+                    .unwrap()
+                    .rename_fonts
+                    .remove(&(hwnd.0 as isize));
                 if let Some(font) = font {
-                    let _ = DeleteObject(font);
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(font.0));
+                    }
                 }
                 for id in ids {
                     refresh_fence(id);
                 }
             }
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
-            return CallWindowProcW(
-                Some(std::mem::transmute::<
-                    isize,
-                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                >(old)),
-                hwnd,
-                msg,
-                wparam,
-                lparam,
-            );
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+                return CallWindowProcW(
+                    Some(std::mem::transmute::<
+                        isize,
+                        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                    >(old)),
+                    hwnd,
+                    msg,
+                    wparam,
+                    lparam,
+                );
+            }
         }
         _ => {}
     }
-    CallWindowProcW(
-        Some(std::mem::transmute::<
-            isize,
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        >(old)),
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-    )
+    unsafe {
+        CallWindowProcW(
+            Some(std::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(old)),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
+    }
 }
 
 /// 多行重命名框(与原生一致):按当前文本的实际换行行数增高编辑框。
 /// 输入/粘贴/删除后由编辑框子类过程调用。
 fn adjust_rename_edit_height(edit: HWND) {
+    // SAFETY(整块): edit 是 state 登记的本进程编辑框；GetDC/ReleaseDC 与
+    // SelectObject/还原成对；buf 按 GetWindowTextLengthW 的长度+1 分配
+    //（GetWindowTextW 保证 NUL 结尾）；EM_GETRECT 的 lParam 指向栈 RECT
+    // （SendMessage 同步完成）；MONITORINFO 按契约先填 cbSize。
     unsafe {
         const EM_GETLINECOUNT: u32 = 0x00BA;
         const EM_GETRECT: u32 = 0x00B2;
         const EM_SCROLLCARET: u32 = 0x00B7;
         let mut rc = RECT::default();
         let _ = GetWindowRect(edit, &mut rc);
-        let hdc = GetDC(edit);
+        let hdc = GetDC(Some(edit));
         if hdc.is_invalid() {
             return;
         }
-        let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0)).0;
+        let font = SendMessageW(edit, WM_GETFONT, Some(WPARAM(0)), Some(LPARAM(0))).0;
         let old_font = if font != 0 {
-            Some(SelectObject(hdc, HFONT(font as _)))
+            Some(SelectObject(hdc, HGDIOBJ(HFONT(font as _).0)))
         } else {
             None
         };
@@ -792,7 +899,7 @@ fn adjust_rename_edit_height(edit: HWND) {
             .lock()
             .unwrap()
             .rename_metrics
-            .get(&edit.0)
+            .get(&(edit.0 as isize))
             .copied()
             .unwrap_or_else(model::DpiMetrics::system);
         // Match the EDIT's own formatting rectangle instead of estimating its
@@ -812,7 +919,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         if new_w != rc.right - rc.left {
             let _ = SetWindowPos(
                 edit,
-                HWND(0),
+                None,
                 0,
                 0,
                 new_w,
@@ -833,17 +940,17 @@ fn adjust_rename_edit_height(edit: HWND) {
         if let Some(of) = old_font {
             SelectObject(hdc, of);
         }
-        ReleaseDC(edit, hdc);
+        ReleaseDC(Some(edit), hdc);
         let _ = GetWindowRect(edit, &mut rc); // 宽度改后刷新矩形(换行已同步)
         let mut format = RECT::default();
         let _ = SendMessageW(
             edit,
             EM_GETRECT,
-            WPARAM(0),
-            LPARAM((&mut format as *mut RECT) as isize),
+            Some(WPARAM(0)),
+            Some(LPARAM((&mut format as *mut RECT) as isize)),
         );
         let format_ok = format.right > format.left && format.bottom > format.top;
-        let lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0))
+        let lines = SendMessageW(edit, EM_GETLINECOUNT, Some(WPARAM(0)), Some(LPARAM(0)))
             .0
             .max(1) as f32;
         let mut mi: MONITORINFO = std::mem::zeroed();
@@ -868,7 +975,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         let current_center = {
             let s = state().lock().unwrap();
             s.rename_centers
-                .get(&edit.0)
+                .get(&(edit.0 as isize))
                 .copied()
                 .unwrap_or(rc.left + old_w / 2)
         };
@@ -895,7 +1002,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         if left != rc.left || top != rc.top {
             let _ = SetWindowPos(
                 edit,
-                HWND(0),
+                None,
                 left,
                 top,
                 0,
@@ -906,7 +1013,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         if new_h != rc.bottom - rc.top || new_w != old_w {
             let _ = SetWindowPos(
                 edit,
-                HWND(0),
+                None,
                 0,
                 0,
                 new_w,
@@ -918,7 +1025,7 @@ fn adjust_rename_edit_height(edit: HWND) {
         log(&format!(
             "rename fit: text_w={text_w} fmt_w={fmt_w} new_w={new_w} lines={lines} new_h={new_h} left={left} top={top}"
         ));
-        let _ = SendMessageW(edit, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+        let _ = SendMessageW(edit, EM_SCROLLCARET, Some(WPARAM(0)), Some(LPARAM(0)));
     }
 }
 
@@ -955,17 +1062,20 @@ struct CommitOutcome {
 /// 再弹框的自激死循环(2026-09-11 卡死根因)。
 fn rename_failure_feedback(edit: HWND) {
     use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+    // SAFETY: 三个调用只用本进程编辑框句柄，无指针参数。
     unsafe {
         let _ = MessageBeep(MB_ICONERROR);
-        let _ = SetFocus(edit);
-        let _ = SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+        let _ = SetFocus(Some(edit));
+        let _ = SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
     }
 }
 
 fn destroy_file_rename_edit(edit: HWND) {
     uninstall_rename_mouse_hook();
+    // SAFETY: edit 是本进程文件改名编辑框（调用前已按各出口清槽），
+    // 先停自适应定时器再销毁，恰好一次。
     unsafe {
-        let _ = KillTimer(edit, RENAME_FIT_TIMER);
+        let _ = KillTimer(Some(edit), RENAME_FIT_TIMER);
         let _ = DestroyWindow(edit);
     }
 }
@@ -980,8 +1090,11 @@ fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
             migration: None,
         };
     }
+    // SAFETY: 纯句柄查询，返回文本长度（无指针参数）。
     let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
     let mut buf = vec![0u16; len + 1];
+    // SAFETY: buf 按长度+1 分配，GetWindowTextW 保证 NUL 结尾；按 NUL
+    // 截断解析。
     unsafe {
         let _ = GetWindowTextW(edit, &mut buf);
     }
@@ -991,26 +1104,25 @@ fn commit_file_rename_once(edit: HWND) -> CommitOutcome {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    // 空名/没改:关闭编辑框,桌面状态不动(与原生一致)
-    if new_name.is_empty() || new_name == old_name {
-        destroy_file_rename_edit(edit);
-        return CommitOutcome {
-            renamed: false,
-            migration: None,
-        };
-    }
-    // 与 Explorer 相同的非法字符集合,外加全部控制字符(\n\r\t 等——
-    // NTFS 文件名禁控制字符,漏检会走到 rename 必败路径)
-    let invalid = new_name.chars().any(|c| {
-        c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-    });
-    if invalid {
-        log(&format!("file rename rejected (illegal chars): {new_name}"));
-        rename_failure_feedback(edit);
-        return CommitOutcome {
-            renamed: false,
-            migration: None,
-        };
+    // 空名/没改:关闭编辑框,桌面状态不动(与原生一致);
+    // 非法字符:保持打开+错误音(非模态,卡死修复语义见 classify_rename)
+    match classify_rename(&old_name, &new_name) {
+        RenameVerdict::NoChange => {
+            destroy_file_rename_edit(edit);
+            return CommitOutcome {
+                renamed: false,
+                migration: None,
+            };
+        }
+        RenameVerdict::Invalid => {
+            log(&format!("file rename rejected (illegal chars): {new_name}"));
+            rename_failure_feedback(edit);
+            return CommitOutcome {
+                renamed: false,
+                migration: None,
+            };
+        }
+        RenameVerdict::Ok => {}
     }
     let renamed = shell::rename_path(&old_path, &new_name);
     if !renamed {
@@ -1092,13 +1204,17 @@ fn sanitized_clipboard_text() -> Option<String> {
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
     const CF_UNICODETEXT: u32 = 13;
+    // SAFETY(整块): 剪贴板开/关配对（OpenClipboard 成功必 CloseClipboard，
+    // 闭包内任何提前返回都会先 GlobalUnlock）；GlobalLock 返回的指针在
+    // GlobalUnlock 前有效——NUL 扫描与 from_raw_parts 均在 unlock 之前
+    // 完成，长度以 NUL 为界不越界。
     unsafe {
         if OpenClipboard(None).is_err() {
             return None;
         }
         let text = (|| {
             let h = GetClipboardData(CF_UNICODETEXT).ok()?;
-            let hg = HGLOBAL(h.0 as *mut core::ffi::c_void);
+            let hg = HGLOBAL(h.0);
             let p = GlobalLock(hg) as *const u16;
             if p.is_null() {
                 return None;
@@ -1117,7 +1233,7 @@ fn sanitized_clipboard_text() -> Option<String> {
 }
 
 /// 粘贴清洗(与原生一致):换行/制表折叠为单个空格,其余控制字符剔除
-fn collapse_for_filename(s: &str) -> String {
+pub fn collapse_for_filename(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_space = false;
     for c in s.chars() {
@@ -1145,9 +1261,49 @@ fn collapse_for_filename(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// 与 Explorer 相同的非法字符集合,外加全部控制字符(\n\r\t 等——
+/// NTFS 文件名禁控制字符,漏检会走到 rename 必败路径)
+pub fn is_valid_file_name(name: &str) -> bool {
+    !name.chars().any(|c| {
+        c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    })
+}
+
+/// 改名提交前的纯判定(2026-09-16 提取,供集成测试钉住卡死修复语义):
+/// 输入已 trim 的新名——空名/与原名相同 = NoChange(直接关框不叮);
+/// 含非法字符 = Invalid(保持打开+错误音);其余 = Ok。
+pub enum RenameVerdict {
+    NoChange,
+    Invalid,
+    Ok,
+}
+
+pub fn classify_rename(old_name: &str, new_name_trimmed: &str) -> RenameVerdict {
+    if new_name_trimmed.is_empty() || new_name_trimmed == old_name {
+        return RenameVerdict::NoChange;
+    }
+    if !is_valid_file_name(new_name_trimmed) {
+        return RenameVerdict::Invalid;
+    }
+    RenameVerdict::Ok
+}
+
+/// 与 Explorer 一致的就地改名预选区:选中扩展名之前的部分,返回 EM_SETSEL
+/// 用的 UTF-16 字符下标;无扩展名(或点前移如 ".gitignore")返回 -1=全选。
+/// 注意必须用 UTF-16 下标——旧实现直接用 UTF-8 字节下标,中文名会溢出到
+/// 末尾把扩展名也选中(与原生不一致)。
+pub fn rename_selection_end_utf16(name: &str) -> isize {
+    name.rfind('.')
+        .filter(|&p| p > 0)
+        .map(|p| name[..p].encode_utf16().count() as isize)
+        .unwrap_or(-1)
+}
+
 fn cancel_file_rename(edit: HWND) {
     log("file rename cancel");
     uninstall_rename_mouse_hook();
+    // SAFETY: edit 是本进程文件改名编辑框（取消前路径状态由 WM_NCDESTROY
+    // 清理），销毁恰好一次。
     unsafe {
         let _ = DestroyWindow(edit);
     }

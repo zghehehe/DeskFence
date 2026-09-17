@@ -5,51 +5,139 @@ use std::sync::atomic::Ordering;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 
 use crate::drag::*;
+use crate::logging::log;
 use crate::model::{self, Fence, Rect};
+use crate::monitors::*;
+use crate::present::*;
 use crate::rename::start_rename;
 use crate::render;
+use crate::settings::*;
 use crate::shell;
+use crate::state::*;
 use crate::ui::*;
+use crate::undo::*;
+use crate::wallpaper::save_wallpaper_cache;
+use crate::winids::*;
 use windows::Win32::System::Ole::RevokeDragDrop;
 use windows::Win32::UI::Shell::{Shell_NotifyIconW, NIM_DELETE, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const MENU_ADD_FENCE: u32 = 0x5101;
-const MENU_RENAME: u32 = 0x5102;
-const MENU_TOGGLE_COLLAPSE: u32 = 0x5103;
-const MENU_LOCK: u32 = 0x5104;
-const MENU_DELETE_FENCE: u32 = 0x5105;
-const MENU_REFRESH: u32 = 0x5106;
-const MENU_HIDE_ALL: u32 = 0x5107;
-const MENU_SHOW_ALL: u32 = 0x5108;
-const MENU_QUIT: u32 = 0x5109;
-const MENU_RESET_LAYOUT: u32 = 0x510A;
-const MENU_TOGGLE_DESKTOP_ICONS: u32 = 0x510B;
-const MENU_AUTO_ALIGN: u32 = 0x510C;
-const MENU_UNDO: u32 = 0x510D;
-const MENU_AUTOSTART: u32 = 0x510E;
-const MENU_ALIGN_GRID: u32 = 0x5114;
-const MENU_ALIGN_FREE: u32 = 0x5115;
-const MENU_RESTORE_DESKTOP: u32 = 0x510F;
-const MENU_SORT_FREQ: u32 = 0x5110;
-const MENU_SORT_TIME: u32 = 0x5111;
-const MENU_SORT_NAME: u32 = 0x5112;
-const MENU_SORT_MANUAL: u32 = 0x5113;
-const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
-const MENU_RENDER_PRECISE: u32 = 0x5117;
-const MENU_AUTO_CATEGORY: u32 = 0x5118;
-const MENU_TOGGLE_CHROME: u32 = 0x511A;
+// 菜单命令 id(2026-09-16 提 pub 供 tests/ 断言唯一性/区间)
+pub const MENU_ADD_FENCE: u32 = 0x5101;
+pub const MENU_RENAME: u32 = 0x5102;
+pub const MENU_TOGGLE_COLLAPSE: u32 = 0x5103;
+pub const MENU_LOCK: u32 = 0x5104;
+pub const MENU_DELETE_FENCE: u32 = 0x5105;
+pub const MENU_REFRESH: u32 = 0x5106;
+pub const MENU_HIDE_ALL: u32 = 0x5107;
+pub const MENU_SHOW_ALL: u32 = 0x5108;
+pub const MENU_QUIT: u32 = 0x5109;
+pub const MENU_RESET_LAYOUT: u32 = 0x510A;
+pub const MENU_TOGGLE_DESKTOP_ICONS: u32 = 0x510B;
+pub const MENU_AUTO_ALIGN: u32 = 0x510C;
+pub const MENU_UNDO: u32 = 0x510D;
+pub const MENU_AUTOSTART: u32 = 0x510E;
+pub const MENU_ALIGN_GRID: u32 = 0x5114;
+pub const MENU_ALIGN_FREE: u32 = 0x5115;
+pub const MENU_RESTORE_DESKTOP: u32 = 0x510F;
+pub const MENU_SORT_FREQ: u32 = 0x5110;
+pub const MENU_SORT_TIME: u32 = 0x5111;
+pub const MENU_SORT_NAME: u32 = 0x5112;
+pub const MENU_SORT_MANUAL: u32 = 0x5113;
+pub const MENU_RENDER_TRANSPARENT: u32 = 0x5116;
+pub const MENU_RENDER_PRECISE: u32 = 0x5117;
+pub const MENU_AUTO_CATEGORY: u32 = 0x5118;
+pub const MENU_TOGGLE_CHROME: u32 = 0x511A;
 // 管理分类子菜单(2026-09-08 分类面板):表项=base+表内下标,上限 16 项
-const MENU_CATS_BASE: u32 = 0x5120;
-const MENU_CATS_ADD: u32 = 0x5130;
-const MENU_CHECK_UPDATE: u32 = 0x5131;
-const MENU_MODE_CUSTOM: u32 = 0x5133;
-const MENU_LANG_AUTO: u32 = 0x5134;
-const MENU_LANG_ZH: u32 = 0x5135;
-const MENU_LANG_EN: u32 = 0x5136;
+pub const MENU_CATS_BASE: u32 = 0x5120;
+pub const MENU_CATS_ADD: u32 = 0x5130;
+pub const MENU_CHECK_UPDATE: u32 = 0x5131;
+pub const MENU_MODE_CUSTOM: u32 = 0x5133;
+pub const MENU_LANG_AUTO: u32 = 0x5134;
+pub const MENU_LANG_ZH: u32 = 0x5135;
+pub const MENU_LANG_EN: u32 = 0x5136;
+
+/// 分类清单菜单项 id → 表内下标(越界/陈旧菜单=None)。
+/// 上限 16 项:菜单构建侧 take(MENU_CATS_ADD - MENU_CATS_BASE)。
+pub fn cats_menu_index(id: u32) -> Option<usize> {
+    if (MENU_CATS_BASE..MENU_CATS_ADD).contains(&id) {
+        Some((id - MENU_CATS_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+/// 桌面右键"对齐方式"循环切换:auto→grid→free→auto;脏值归位 auto
+pub fn next_align_mode(cur: &str) -> &'static str {
+    match cur {
+        "auto" => "grid",
+        "grid" => "free",
+        _ => "auto",
+    }
+}
+
+/// 桌面右键"渲染模式"翻转:precise⇄transparent;脏值归位 precise
+pub fn next_render_mode(cur: &str) -> &'static str {
+    if cur == "precise" {
+        "transparent"
+    } else {
+        "precise"
+    }
+}
+
+/// 分类改名合法性(管理面板/menu 同源):trim 后空名、与原名相同、
+/// 与表中他类重名均拒绝
+pub fn validate_category_rename(old: &str, new: &str, table: &[model::CategoryDef]) -> bool {
+    let new = new.trim();
+    if new.is_empty() || new == old {
+        return false;
+    }
+    !table.iter().any(|c| c.name == new)
+}
+
+/// 分类规则归一+占用冲突检测:trim/去点/小写/保序去重;与其他分类已占用
+/// 的扩展名冲突→整体 Err(不是跳过)。Ok 内为归一结果。
+pub fn normalize_exts_for(
+    name: &str,
+    exts: &[String],
+    table: &[model::CategoryDef],
+) -> Result<Vec<String>, String> {
+    let mut clean: Vec<String> = Vec::new();
+    for e in exts {
+        let e = e.trim().trim_start_matches('.').to_lowercase();
+        if e.is_empty() || clean.contains(&e) {
+            continue;
+        }
+        if table.iter().any(|c| c.name != name && c.exts.contains(&e)) {
+            return Err(e);
+        }
+        clean.push(e);
+    }
+    Ok(clean)
+}
+
+/// 分类新增自动加序号:base 冲突时依次尝试 base2/base3…;空 base=None
+pub fn unique_category_name(base: &str, existing: &[String]) -> Option<String> {
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let mut name = base.to_string();
+    let mut n = 2;
+    while existing.iter().any(|c| c == &name) {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    Some(name)
+}
 
 pub(crate) fn show_tray_menu(x: i32, y: i32) {
-    let hwnd = TRAY_HWND.get().copied().unwrap_or(HWND(0));
+    let hwnd = TRAY_HWND
+        .get()
+        .copied()
+        .unwrap_or(HWND(std::ptr::null_mut()));
+    // SAFETY: 创建弹出菜单，失败得 null 句柄由 unwrap_or_default 吸收
+    //（后续菜单调用对空句柄失败无害）。
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
     // 两个状态感知切换项(用户约定):
     // 按钮1 栅栏可见性:正常态"隐藏全部栅栏"(→纯净态:只剩壁纸),
@@ -92,6 +180,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
             crate::lang::restore_native_desktop(),
         );
     }
+    // SAFETY: 同上：创建弹出菜单，失败得 null 由 unwrap_or_default 吸收。
     let align = unsafe { CreatePopupMenu().unwrap_or_default() };
     let mode = align_mode();
     let modes = [
@@ -109,6 +198,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     shell::append_submenu(menu, crate::lang::align_submenu(), align);
     // 渲染模式:精确(默认,壁纸底+ClearType 与原生一致)在上;
     // 透明为兜底(动态壁纸不兼容时使用)
+    // SAFETY: 同上：创建弹出菜单，失败得 null 由 unwrap_or_default 吸收。
     let render = unsafe { CreatePopupMenu().unwrap_or_default() };
     let rmode = render_mode();
     let rmodes = [
@@ -136,6 +226,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     // 类别清单归自动模式——点击分类名进面板就地改名,底部"新增分类…"直接
     // 建空分类;删除用面板行内 ×(承载面板见 cats_panel.rs)。父项对钩
     // 显示当前是否自动模式。
+    // SAFETY: 同上：创建弹出菜单，失败得 null 由 unwrap_or_default 吸收。
     let auto = unsafe { CreatePopupMenu().unwrap_or_default() };
     // 自定义(拖入归类)在上、自动分类(按类型归类)在其下(2026-09-09 用户
     // 定案):分隔线之后紧贴的类别清单一眼可知归属自动分类;类别行用全角
@@ -197,6 +288,7 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
         shell::append_menu(menu, MENU_AUTOSTART, crate::lang::autostart());
     }
     // 界面语言(2026-09-11):跟随系统/中文/English,切换即时生效+落盘
+    // SAFETY: 同上：创建弹出菜单，失败得 null 由 unwrap_or_default 吸收。
     let lang_menu = unsafe { CreatePopupMenu().unwrap_or_default() };
     let lang_now = lang_setting_value();
     let langs = [
@@ -215,12 +307,14 @@ pub(crate) fn show_tray_menu(x: i32, y: i32) {
     shell::append_separator(menu);
     shell::append_menu(menu, MENU_QUIT, crate::lang::quit());
     let id = track(menu, hwnd, x, y);
+    // SAFETY: 四个菜单都是本函数创建、track 已返回（模态结束），销毁安全；
+    // WM_NULL 按 KB135788 收尾前台化状态；hwnd 是托盘窗口。
     unsafe {
         let _ = DestroyMenu(align);
         let _ = DestroyMenu(render);
         let _ = DestroyMenu(lang_menu);
         let _ = DestroyMenu(menu);
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
     }
     dispatch_tray_command(id);
 }
@@ -241,7 +335,7 @@ fn dispatch_tray_command(id: u32) {
             set_all_hidden(true);
             log("zen mode: all fences hidden, native icons stay hidden");
         }
-        MENU_UNDO => undo_layout(),
+        MENU_UNDO => undo_and_present(),
         MENU_RESET_LAYOUT => reset_fence_layout(),
         MENU_TOGGLE_DESKTOP_ICONS => toggle_desktop_icons(),
         MENU_RESTORE_DESKTOP => restore_original_desktop(),
@@ -253,11 +347,6 @@ fn dispatch_tray_command(id: u32) {
         MENU_AUTO_CATEGORY => set_category_mode(true),
         MENU_MODE_CUSTOM => set_category_mode(false),
         MENU_CATS_ADD => crate::cats_panel::open_panel(None, true),
-        id if (MENU_CATS_BASE..MENU_CATS_ADD).contains(&id) => {
-            // 点击分类名:打开面板并把该行置为编辑焦点(超出表长视为陈旧菜单)
-            let idx = (id - MENU_CATS_BASE) as usize;
-            crate::cats_panel::open_panel(Some(idx), false);
-        }
         MENU_TOGGLE_CHROME => {
             let on = !chrome_always_on();
             set_show_chrome_stored(on);
@@ -270,7 +359,14 @@ fn dispatch_tray_command(id: u32) {
         MENU_LANG_ZH => set_lang_stored("zh"),
         MENU_LANG_EN => set_lang_stored("en"),
         MENU_QUIT => quit_app(),
-        _ => log(&format!("unknown tray command: {}", id)),
+        id => {
+            if let Some(idx) = cats_menu_index(id) {
+                // 点击分类名:打开面板并把该行置为编辑焦点(超出表长视为陈旧菜单)
+                crate::cats_panel::open_panel(Some(idx), false);
+            } else {
+                log(&format!("unknown tray command: {}", id));
+            }
+        }
     }
 }
 
@@ -302,17 +398,17 @@ fn set_category_mode(v: bool) {
 /// 文件归属。重名/空名拒绝;不改布局几何,仅全量重渲染。
 pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
     let new = new.trim();
-    if new.is_empty() || new == old {
+    if !validate_category_rename(old, new, &model::category_table()) {
+        if !new.is_empty() && new != old {
+            log(&format!("category rename rejected, '{new}' already exists"));
+        }
         return false;
     }
-    if model::category_table().iter().any(|c| c.name == new) {
-        log(&format!("category rename rejected, '{new}' already exists"));
-        return false;
-    }
+    let new = new.to_string();
     let mut table = model::category_table();
     for c in table.iter_mut() {
         if c.name == old {
-            c.name = new.to_string();
+            c.name = new.clone();
         }
     }
     model::set_category_table(table.clone());
@@ -320,22 +416,22 @@ pub(crate) fn apply_category_rename(old: &str, new: &str) -> bool {
         s.categories = table;
         s.deleted_category_at.remove(old); // 改名后旧墓碑键无意义,顺带清理
     });
-    // 直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    // 直接改写内存分类:作废在途异步扫描快照(见 state.rs SCAN_EPOCH)
     invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
         for f in s.files.iter_mut() {
             if f.category == old {
-                f.category = new.to_string();
+                f.category = new.clone();
             }
         }
         for f in s.fences.iter_mut() {
             if f.category == old {
-                f.category = new.to_string();
+                f.category = new.clone();
                 // 标题跟随仅当与旧分类名相同(用户自定义过的标题不覆盖,
                 // 2026-09-09 体检 E7.1:两个方向行为对称)
                 if f.title == old {
-                    f.title = new.to_string();
+                    f.title = new.clone();
                 }
             }
         }
@@ -355,23 +451,15 @@ pub(crate) fn apply_category_exts(name: &str, exts: Vec<String>) -> bool {
     if name == model::FALLBACK_CATEGORY {
         return false;
     }
-    let mut clean: Vec<String> = Vec::new();
-    for e in &exts {
-        let e = e.trim().trim_start_matches('.').to_lowercase();
-        if e.is_empty() || clean.contains(&e) {
-            continue;
-        }
-        if model::category_table()
-            .iter()
-            .any(|c| c.name != name && c.exts.contains(&e))
-        {
+    let clean = match normalize_exts_for(name, &exts, &model::category_table()) {
+        Ok(c) => c,
+        Err(e) => {
             log(&format!(
                 "exts rejected: '{e}' already owned by another category"
             ));
             return false;
         }
-        clean.push(e);
-    }
+    };
     let mut table = model::category_table();
     for c in table.iter_mut() {
         if c.name == name {
@@ -380,7 +468,7 @@ pub(crate) fn apply_category_exts(name: &str, exts: Vec<String>) -> bool {
     }
     model::set_category_table(table.clone());
     update_stored_settings(|s| s.categories = table);
-    // 下面直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    // 下面直接改写内存分类:作废在途异步扫描快照(见 state.rs SCAN_EPOCH)
     invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
@@ -424,7 +512,7 @@ pub(crate) fn apply_category_delete(name: &str) -> bool {
         // 面板"新增"同名时同样会清墓碑,不会阻碍恢复
         delete_fence_ex(id, true);
     }
-    // 直接改写内存分类:作废在途异步扫描快照(见 ui.rs SCAN_EPOCH)
+    // 直接改写内存分类:作废在途异步扫描快照(见 state.rs SCAN_EPOCH)
     invalidate_pending_scans();
     {
         let mut s = state().lock().unwrap();
@@ -460,17 +548,10 @@ pub(crate) fn apply_category_delete(name: &str) -> bool {
 /// 分类新增(管理面板回调):空扩展名+非目录类,不吸走任何现有文件;
 /// 同名自动加序号;建同名栅栏(清历史墓碑=明确意图),文件靠拖入(pin)。
 pub(crate) fn apply_category_add(base: &str) -> Option<String> {
-    let base = base.trim();
-    if base.is_empty() {
-        return None;
-    }
-    let mut table = model::category_table();
-    let mut name = base.to_string();
-    let mut n = 2;
-    while table.iter().any(|c| c.name == name) {
-        name = format!("{base}{n}");
-        n += 1;
-    }
+    let table = model::category_table();
+    let existing: Vec<String> = table.iter().map(|c| c.name.clone()).collect();
+    let name = unique_category_name(base, &existing)?;
+    let mut table = table;
     table.push(model::CategoryDef {
         name: name.clone(),
         exts: vec![],
@@ -575,11 +656,14 @@ pub fn quit_app() {
             render::release_surface(sf);
         }
         if let Some(h) = s.guide_hwnd.take() {
+            // SAFETY: h 是 take() 摘下的本进程引导窗（清槽后销毁恰好一次）。
             unsafe {
                 let _ = DestroyWindow(h);
             }
         }
     }
+    // SAFETY: n 为全零+cbSize/hWnd/uID 三字段的栈结构——NIM_DELETE 契约
+    // 只用这三项定位托盘图标；hwnd 是本进程托盘窗口。
     unsafe {
         if let Some(&hwnd) = TRAY_HWND.get() {
             let mut n: NOTIFYICONDATAW = std::mem::zeroed();
@@ -589,6 +673,14 @@ pub fn quit_app() {
             let _ = Shell_NotifyIconW(NIM_DELETE, &n);
         }
         PostQuitMessage(0);
+    }
+}
+
+/// 撤销布局:undo 只回填数据(叶子,不依赖 ui),整面重建由本模块编排
+/// (2026-09-17 断 undo→ui 上行边;顺序与原 undo_layout 内联版一致)
+fn undo_and_present() {
+    if undo_pop_restore() {
+        show_all_fences();
     }
 }
 
@@ -630,12 +722,7 @@ fn reset_fence_layout() {
             base
         };
         // 一键恢复：流式左/上对齐排列（自动排列）
-        let (vx, vy, vw, vh) = work_area();
-        let mut rects: Vec<Rect> = fences.iter().map(|f| f.rect).collect();
-        model::auto_layout(&mut rects, vx, vy, vw, vh);
-        for (f, r) in fences.iter_mut().zip(rects) {
-            f.rect = r;
-        }
+        apply_default_layout(&mut fences);
         s.fences = fences;
     }
     settle_all_fences();
@@ -647,6 +734,10 @@ fn reset_fence_layout() {
 }
 
 fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
+    // SAFETY(整块): menu 是调用方构建的有效菜单；owner 用 menu_host_or
+    // 的隐形菜单宿主并经 menu_foreground 取得前台权（KB135788 前提）；
+    // 诊断段的 fb 是 64 字节栈缓冲（GetClassNameW 按容量写、返回截断）；
+    // TrackPopupMenu 同步模态返回命令 id。
     unsafe {
         mark_interaction();
         // 菜单模态循环期间不会可靠投递 WM_MOUSELEAVE。清状态之外必须
@@ -697,7 +788,7 @@ fn track(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
             x,
             y,
-            0,
+            None,
             menu_host_or(hwnd),
             None,
         );
@@ -723,7 +814,9 @@ pub(crate) fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
         };
         (fence.locked, fence.collapsed, fence.sort_mode.clone())
     };
+    // SAFETY: 同 tray_menu：创建弹出菜单，失败得 null 由 unwrap_or_default 吸收。
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
+    // SAFETY: 同上。
     let sort = unsafe { CreatePopupMenu().unwrap_or_default() };
     // 键=config.json 里存的排序值(用户数据,保持中文存储);label=界面文案
     let pairs = [
@@ -765,6 +858,7 @@ pub(crate) fn fence_menu(hwnd: HWND, fence_id: u32, x: i32, y: i32) {
     shell::append_separator(menu);
     shell::append_menu(menu, MENU_REFRESH, crate::lang::refresh());
     let id = track(menu, hwnd, x, y);
+    // SAFETY: 两个菜单均为本函数创建、track 已返回，销毁安全。
     unsafe {
         let _ = DestroyMenu(sort);
         let _ = DestroyMenu(menu);
@@ -973,6 +1067,8 @@ pub(crate) fn delete_fence_ex(fence_id: u32, tombstone: bool) {
         removed
     };
     if let Some(h) = hwnd {
+        // SAFETY: h 是从 state.windows 摘下的栅栏窗口（删除流程已清槽）；
+        // 先注销 OLE 拖放注册再销毁（顺序同 ui.rs 的孤儿清理）。
         unsafe {
             let _ = RevokeDragDrop(h);
             let _ = DestroyWindow(h);
@@ -1034,23 +1130,15 @@ pub(crate) fn dispatch_desktop_command(id: u32) {
         }
         shell::DL_CMD_SHOW_ALL => show_all_fences(),
         shell::DL_CMD_HIDE_ALL => set_all_hidden(true),
-        shell::DL_CMD_UNDO => undo_layout(),
+        shell::DL_CMD_UNDO => undo_and_present(),
         shell::DL_CMD_AUTO_ALIGN => {
             // 桌面菜单入口:循环切换三档
-            let next = match align_mode().as_str() {
-                "auto" => "grid",
-                "grid" => "free",
-                _ => "auto",
-            };
+            let next = next_align_mode(&align_mode());
             set_align_mode(next);
         }
         shell::DL_CMD_RENDER_MODE => {
             // 渲染模式切换:透明(动态壁纸兼容) ↔ 精确(壁纸底+ClearType)
-            let next = if render_mode() == "precise" {
-                "transparent"
-            } else {
-                "precise"
-            };
+            let next = next_render_mode(&render_mode());
             set_render_mode(next);
         }
         shell::DL_CMD_REFRESH => rescan(),

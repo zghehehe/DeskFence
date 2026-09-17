@@ -16,25 +16,65 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{model, shell, ui};
+use crate::winids::{SyncHandle, EM_SETSEL};
+use crate::{logging, model, shell, winids};
 
-/// EDIT 控件消息(windows 0.52 未在 WindowsAndMessaging 导出,手写常量)
-const EM_SETSEL: u32 = 0x00B1;
+/// EDIT 控件消息(windows crate 未导出(0.62 仍缺),手写常量;
+/// EM_SETSEL 与改名编辑框共用,统一收在 winids)
 const EM_SETREADONLY: u32 = 0x00CF;
 
 /// 面板窗口句柄(全局唯一;已开则置前而不是开第二个)
-static PANEL_HWND: Mutex<Option<HWND>> = Mutex::new(None);
+static PANEL_HWND: SyncHandle<Mutex<Option<HWND>>> = SyncHandle(Mutex::new(None));
 static CLASS_REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// 内部命令:已开面板上执行"新增分类"(托盘重复触发时复用)
 const WM_APP_ADD: u32 = WM_APP + 1;
-/// 子控件 ID 分配:第 i 行 edit=0x100+2i、×=0x101+2i(奇数即删除键)
+/// 子控件 ID 分配:第 i 行 name=0x100+3i、exts=0x101+3i、×=0x102+3i
+/// (余 2 且步长 3 即删除键);底部"新增"按钮=ID_ADD
 const ID_ADD: isize = 0x2FF;
+
+/// 第 i 行三个控件的 ID(编码唯一出口,与 decode_delete_id 互逆)
+pub fn row_control_ids(i: usize) -> (isize, isize, isize) {
+    let i = i as isize;
+    (0x100 + 3 * i, 0x101 + 3 * i, 0x102 + 3 * i)
+}
+
+/// 从命令 ID 解码"第几行的删除键";非删除键返回 None
+pub fn decode_delete_id(id: isize) -> Option<usize> {
+    if id >= 0x102 && (id - 0x102) % 3 == 0 {
+        Some(((id - 0x102) / 3) as usize)
+    } else {
+        None
+    }
+}
+
+/// 行数上限守卫(控件 ID 方案上限 0x100+3i,add=0x2FF:约 136 行,
+/// 实际取 130 封顶;到顶拒绝,防 ID 相撞)
+pub fn can_add_row(n: usize) -> bool {
+    n < 130
+}
+
+/// 规则文本解析归一(与 commit_exts 同源):逗号/空格/分号(含全角)分隔,
+/// 逐条 trim、去前导点、转小写,保序去重
+pub fn parse_exts(text: &str) -> Vec<String> {
+    let list: Vec<String> = text
+        .split([',', '，', ' ', '；', ';'])
+        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut uniq: Vec<String> = Vec::new();
+    for e in list {
+        if !uniq.contains(&e) {
+            uniq.push(e);
+        }
+    }
+    uniq
+}
 
 struct Row {
     edit: HWND,
     exts_edit: HWND, // 规则(扩展名清单,空格分隔)
-    del: HWND,       // 兜底行为 HWND(0)
+    del: HWND,       // 兜底行为 null 句柄
     name: String,
     exts: String,
     locked_name: bool, // 兜底行名称只读
@@ -54,7 +94,7 @@ pub fn panel_message(msg: &MSG) -> bool {
     let Some(h) = *PANEL_HWND.lock().unwrap() else {
         return false;
     };
-    if msg.message != WM_KEYDOWN || msg.hwnd.0 == 0 {
+    if msg.message != WM_KEYDOWN || msg.hwnd.0.is_null() {
         return false;
     }
     if !unsafe { IsChild(h, msg.hwnd) }.as_bool() {
@@ -62,9 +102,11 @@ pub fn panel_message(msg: &MSG) -> bool {
     }
     let vk = msg.wParam.0 as u32;
     if vk == VK_ESCAPE.0 as u32 {
-        let _ = unsafe { PostMessageW(h, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        // SAFETY: h 是本进程面板窗口；异步关闭，无指针参数。
+        let _ = unsafe { PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         true
     } else if vk == VK_RETURN.0 as u32 {
+        // SAFETY: 见 commit_focused_panel 的 Safety 段（h 是面板窗口）。
         unsafe { commit_focused_panel(h) };
         true
     } else {
@@ -73,8 +115,12 @@ pub fn panel_message(msg: &MSG) -> bool {
 }
 
 /// 提交当前获得焦点的编辑(名称或规则);WM_CLOSE 复用同一入口
+///
+/// # Safety
+/// 必须在 UI 线程调用（panel_of 依赖 GWLP_USERDATA 的 Box 指针只在 UI
+/// 线程消息路径访问）；hwnd 必须是本面板窗口（PANEL_HWND 登记）。
 unsafe fn commit_focused_panel(hwnd: HWND) {
-    if let Some(panel) = panel_of(hwnd) {
+    if let Some(panel) = unsafe { panel_of(hwnd) } {
         let focused = unsafe { GetFocus() };
         if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
             commit_row(panel, i);
@@ -88,6 +134,7 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
     let mut guard = PANEL_HWND.lock().unwrap();
     if let Some(h) = *guard {
         // 已开:置前即可,焦点/新增按需补发
+        // SAFETY(整段): h 是本进程面板窗口；置前/异步消息均无指针参数。
         unsafe {
             let _ = SetForegroundWindow(h);
         }
@@ -95,7 +142,8 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
             send_focus_row(h, i);
         }
         if create_new {
-            let _ = unsafe { PostMessageW(h, WM_APP_ADD, WPARAM(0), LPARAM(0)) };
+            // SAFETY: 同上。
+            let _ = unsafe { PostMessageW(Some(h), WM_APP_ADD, WPARAM(0), LPARAM(0)) };
         }
         return;
     }
@@ -104,6 +152,7 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
     let (w, h) = panel_size_for(scale, model::category_table().len());
     // 锚在鼠标附近(托盘子菜单触发点),夹回虚拟屏内
     let mut pt = POINT { x: 0, y: 0 };
+    // SAFETY: pt 是栈输出指针；四个 GetSystemMetrics 无指针参数。
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
@@ -115,6 +164,8 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
     let py = (pt.y - h - 12).clamp(vs_y, (vs_y + vs_h - h).max(vs_y));
     let cls = shell::wide("DeskFenceCatsPanel");
     let title = shell::wide(crate::lang::cats_title());
+    // SAFETY: cls/title 为 NUL 宽串（同步创建期间存活）、类已由
+    // ensure_class 注册、hinstance 是本进程模块；失败判空返回。
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -125,19 +176,23 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
             py,
             w,
             h,
-            HWND(0),
-            HMENU(0),
-            ui::hinstance(),
+            None,
+            None,
+            Some(winids::hinstance()),
             None,
         )
+        .unwrap_or_default()
     };
-    if hwnd.0 == 0 {
-        ui::log("cats panel: create window failed");
+    if hwnd.0.is_null() {
+        logging::log("cats panel: create window failed");
         return;
     }
     *guard = Some(hwnd);
     // 托盘菜单手势链路内的前台化(与 TrackPopupMenu 同法);守卫随作用域释放
+    // SAFETY: hwnd 是刚创建的本进程面板窗口（menu_foreground 的 Safety 前提
+    // 仅要求句柄可用，失败也无内存影响）；ShowWindow 同句柄。
     let _fg = unsafe { shell::menu_foreground(hwnd) };
+    // SAFETY: 同上。
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
@@ -145,7 +200,8 @@ pub fn open_panel(focus: Option<usize>, create_new: bool) {
         send_focus_row(hwnd, i);
     }
     if create_new {
-        let _ = unsafe { PostMessageW(hwnd, WM_APP_ADD, WPARAM(0), LPARAM(0)) };
+        // SAFETY: 同上：面板窗口的异步命令，无指针参数。
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_ADD, WPARAM(0), LPARAM(0)) };
     }
 }
 
@@ -157,20 +213,30 @@ fn ensure_class() {
             lpfnWndProc: Some(cats_wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
-            hInstance: ui::hinstance(),
-            hIcon: HICON(0),
-            hCursor: HCURSOR(0),
+            hInstance: winids::hinstance(),
+            hIcon: HICON(std::ptr::null_mut()),
+            hCursor: HCURSOR(std::ptr::null_mut()),
             // COLOR_BTNFACE+1 = 标准对话框底色
-            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as isize),
+            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut std::ffi::c_void),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: PCWSTR::from_raw(cls.as_ptr()),
         };
+        // SAFETY: cats_wndproc 是匹配 WNDPROC ABI 的窗口过程；cls 是 NUL
+        // 宽串；hbrBackground 的"系统颜色索引+1"编码是 WNDCLASSW 契约
+        //（不是真指针解引用）；OnceLock 保证只注册一次。
         unsafe {
             let _ = RegisterClassW(&wc);
         }
     });
 }
 
+/// # Safety
+/// 分类面板的窗口过程（ensure_class 注册，系统在 UI 线程同步回调）。
+/// 体内裸 unsafe 操作的依据：WM_CREATE 把 Box<Panel> 经
+/// Box::into_raw 存入 GWLP_USERDATA、WM_NCDESTROY 先取指针再清槽后
+/// Box::from_raw 释放（窗口存活期间指针有效，仅 UI 线程访问）；子控件
+/// 句柄由 Panel 持有且随面板同销毁（父窗口销毁自动销毁 WS_CHILD）；
+/// 字体句柄在替换/销毁时 DeleteObject 配对。
 unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -179,7 +245,7 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             let mut panel = Box::new(Panel {
                 rows: Vec::new(),
                 font,
-                add_btn: HWND(0),
+                add_btn: HWND(std::ptr::null_mut()),
                 scale,
             });
             for c in model::category_table() {
@@ -200,11 +266,13 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             }
             panel.add_btn = create_add_button(hwnd, &panel);
             layout_all(hwnd, &panel);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(panel) as isize);
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(panel) as isize);
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
-            if let Some(panel) = panel_of(hwnd) {
+            if let Some(panel) = unsafe { panel_of(hwnd) } {
                 let id = (wp.0 & 0xFFFF) as isize;
                 let code = ((wp.0 >> 16) & 0xFFFF) as u32;
                 let src = HWND(lp.0 as _);
@@ -218,8 +286,7 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 } else if code == BN_CLICKED {
                     if id == ID_ADD {
                         do_add(hwnd, panel);
-                    } else if id >= 0x102 && (id - 0x102) % 3 == 0 {
-                        let i = ((id - 0x102) / 3) as usize;
+                    } else if let Some(i) = decode_delete_id(id) {
                         if i < panel.rows.len() {
                             do_delete(panel, i);
                         }
@@ -229,22 +296,22 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             LRESULT(0)
         }
         WM_APP_ADD => {
-            if let Some(panel) = panel_of(hwnd) {
+            if let Some(panel) = unsafe { panel_of(hwnd) } {
                 do_add(hwnd, panel);
             }
             LRESULT(0)
         }
         WM_CLOSE => {
             // 关窗前提交在编辑中的行
-            commit_focused_panel(hwnd);
             unsafe {
+                commit_focused_panel(hwnd);
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
         WM_DPICHANGED => {
             // 跨屏拖动面板:重算缩放与字体,行内容原样保留
-            if let Some(panel) = panel_of(hwnd) {
+            if let Some(panel) = unsafe { panel_of(hwnd) } {
                 let s = model::dpi_scale();
                 if (s - panel.scale).abs() > 0.01 {
                     panel.scale = s;
@@ -253,14 +320,16 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                     }
                     panel.font = create_dialog_font(false);
                     let f = WPARAM(panel.font.0 as usize);
-                    for r in &panel.rows {
-                        let _ = SendMessageW(r.edit, WM_SETFONT, f, LPARAM(1));
-                        let _ = SendMessageW(r.exts_edit, WM_SETFONT, f, LPARAM(1));
-                        if r.del.0 != 0 {
-                            let _ = SendMessageW(r.del, WM_SETFONT, f, LPARAM(1));
+                    unsafe {
+                        for r in &panel.rows {
+                            let _ = SendMessageW(r.edit, WM_SETFONT, Some(f), Some(LPARAM(1)));
+                            let _ = SendMessageW(r.exts_edit, WM_SETFONT, Some(f), Some(LPARAM(1)));
+                            if !r.del.0.is_null() {
+                                let _ = SendMessageW(r.del, WM_SETFONT, Some(f), Some(LPARAM(1)));
+                            }
                         }
+                        let _ = SendMessageW(panel.add_btn, WM_SETFONT, Some(f), Some(LPARAM(1)));
                     }
-                    let _ = SendMessageW(panel.add_btn, WM_SETFONT, f, LPARAM(1));
                     layout_all(hwnd, panel);
                 }
             }
@@ -270,28 +339,36 @@ unsafe extern "system" fn cats_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
             // 先取出面板指针、立刻清 USERDATA:此后子窗口销毁触发的 EN_KILLFOCUS
             // 经 panel_of 拿到 None 安全空转;释放放在清空之后,保证真正执行
             // (旧写法先清再读同一槽位,释放分支永不执行=每次开面板漏一个字体+一块堆)。
-            let panel = panel_of(hwnd);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let panel = unsafe { panel_of(hwnd) };
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
             if let Some(p) = panel {
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(p.font.0));
                 }
-                drop(Box::from_raw(p));
+                drop(unsafe { Box::from_raw(p) });
             }
             *PANEL_HWND.lock().unwrap() = None;
             LRESULT(0)
         }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
 
 /// 从 GWLP_USERDATA 取面板(裸指针还原,仅 UI 线程消息路径访问)
+///
+/// # Safety
+/// hwnd 必须是本面板窗口且在 UI 线程调用；GWLP_USERDATA 的值只由
+/// WM_CREATE（Box::into_raw 写入）与 WM_NCDESTROY（先取后清 0）触碰，
+/// 窗口存活期间指向合法的堆上 Panel；返回的 &mut 只在本消息处理内使用，
+/// 不跨消息存活。
 unsafe fn panel_of(hwnd: HWND) -> Option<&'static mut Panel> {
-    let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     if p == 0 {
         None
     } else {
-        Some(&mut *(p as *mut Panel))
+        Some(unsafe { &mut *(p as *mut Panel) })
     }
 }
 
@@ -313,6 +390,8 @@ fn append_row(
     let y = pad as i32 + (i as f32 * (row_h + row_gap(s))) as i32;
     let cls_edit = shell::wide("EDIT");
     let name_t = shell::wide(name);
+    // SAFETY: cls_edit/name_t 为 NUL 宽串；parent 是本面板窗口、hinstance
+    // 是本进程模块、EDIT 是系统类；失败得 null 句柄（后续判空跳过）。
     let edit = unsafe {
         CreateWindowExW(
             WS_EX_CLIENTEDGE,
@@ -323,16 +402,18 @@ fn append_row(
             y,
             name_w as i32,
             row_h as i32,
-            parent,
-            HMENU(0),
-            ui::hinstance(),
+            Some(parent),
+            None,
+            Some(winids::hinstance()),
             None,
         )
+        .unwrap_or_default()
     };
     // 规则列:扩展名清单(空格分隔),目录/兜底行为只读占位
     let exts_x = (pad + name_w) as i32 + 4;
     let exts_w = (w - pad * 2.0 - del_w - name_w - 8.0) as i32;
     let exts_t = shell::wide(exts_text);
+    // SAFETY: 同上行编辑框的契约。
     let exts_edit = unsafe {
         CreateWindowExW(
             WS_EX_CLIENTEDGE,
@@ -343,17 +424,19 @@ fn append_row(
             y,
             exts_w,
             row_h as i32,
-            parent,
-            HMENU(0),
-            ui::hinstance(),
+            Some(parent),
+            None,
+            Some(winids::hinstance()),
             None,
         )
+        .unwrap_or_default()
     };
     let del = if locked_name {
-        HWND(0) // 兜底行不可删:不渲染 ×
+        HWND(std::ptr::null_mut()) // 兜底行不可删:不渲染 ×
     } else {
         let cls_btn = shell::wide("BUTTON");
         let xt = shell::wide("\u{d7}");
+        // SAFETY: 同上（BUTTON 系统类、NUL 宽串、失败得 null 判空）。
         unsafe {
             CreateWindowExW(
                 WS_EX_NOPARENTNOTIFY,
@@ -364,31 +447,36 @@ fn append_row(
                 y,
                 del_w as i32,
                 row_h as i32,
-                parent,
-                HMENU(0),
-                ui::hinstance(),
+                Some(parent),
+                None,
+                Some(winids::hinstance()),
                 None,
             )
+            .unwrap_or_default()
         }
     };
+    // SAFETY: edit/exts_edit/del 是刚创建的子控件（或兜底行 null 已判空）；
+    // WM_SETFONT 只借用字体句柄（所有权仍在 Panel.font）；GWLP_ID 写入
+    // 行号编码（row_control_ids 唯一出口）。
     unsafe {
         let f = WPARAM(panel.font.0 as usize);
-        let _ = SendMessageW(edit, WM_SETFONT, f, LPARAM(1));
-        let _ = SendMessageW(exts_edit, WM_SETFONT, f, LPARAM(1));
-        if del.0 != 0 {
-            let _ = SendMessageW(del, WM_SETFONT, f, LPARAM(1));
+        let _ = SendMessageW(edit, WM_SETFONT, Some(f), Some(LPARAM(1)));
+        let _ = SendMessageW(exts_edit, WM_SETFONT, Some(f), Some(LPARAM(1)));
+        if !del.0.is_null() {
+            let _ = SendMessageW(del, WM_SETFONT, Some(f), Some(LPARAM(1)));
         }
         if locked_name {
-            let _ = SendMessageW(edit, EM_SETREADONLY, WPARAM(1), LPARAM(0));
+            let _ = SendMessageW(edit, EM_SETREADONLY, Some(WPARAM(1)), Some(LPARAM(0)));
         }
         if locked_exts {
-            let _ = SendMessageW(exts_edit, EM_SETREADONLY, WPARAM(1), LPARAM(0));
+            let _ = SendMessageW(exts_edit, EM_SETREADONLY, Some(WPARAM(1)), Some(LPARAM(0)));
         }
-        // 控件 ID 承载行号:name=0x100+3i,exts=0x101+3i,del=0x102+3i
-        let _ = SetWindowLongPtrW(edit, GWLP_ID, 0x100 + 3 * i as isize);
-        let _ = SetWindowLongPtrW(exts_edit, GWLP_ID, 0x101 + 3 * i as isize);
-        if del.0 != 0 {
-            let _ = SetWindowLongPtrW(del, GWLP_ID, 0x102 + 3 * i as isize);
+        // 控件 ID 承载行号(编码唯一出口 row_control_ids)
+        let (name_id, exts_id, del_id) = row_control_ids(i);
+        let _ = SetWindowLongPtrW(edit, GWLP_ID, name_id);
+        let _ = SetWindowLongPtrW(exts_edit, GWLP_ID, exts_id);
+        if !del.0.is_null() {
+            let _ = SetWindowLongPtrW(del, GWLP_ID, del_id);
         }
     }
     panel.rows.push(Row {
@@ -406,6 +494,8 @@ fn create_add_button(parent: HWND, panel: &Panel) -> HWND {
     let s = panel.scale;
     let cls_btn = shell::wide("BUTTON");
     let t = shell::wide(crate::lang::cats_add_btn());
+    // SAFETY: 同 append_row 的控件创建契约；HMENU 参数承载控件 ID
+    //（WM_COMMAND 编码约定，非窗口句柄用途）。
     unsafe {
         let h = CreateWindowExW(
             WS_EX_NOPARENTNOTIFY,
@@ -416,12 +506,18 @@ fn create_add_button(parent: HWND, panel: &Panel) -> HWND {
             0, // 落位交 layout_all
             (panel_w(s) - pad(s) * 2.0) as i32,
             row_h(s) as i32,
-            parent,
-            HMENU(ID_ADD),
-            ui::hinstance(),
+            Some(parent),
+            Some(HMENU(ID_ADD as *mut std::ffi::c_void)),
+            Some(winids::hinstance()),
             None,
+        )
+        .unwrap_or_default();
+        let _ = SendMessageW(
+            h,
+            WM_SETFONT,
+            Some(WPARAM(panel.font.0 as usize)),
+            Some(LPARAM(1)),
         );
-        let _ = SendMessageW(h, WM_SETFONT, WPARAM(panel.font.0 as usize), LPARAM(1));
         h
     }
 }
@@ -436,6 +532,8 @@ fn layout_all(hwnd: HWND, panel: &Panel) {
         right: panel_w(s) as i32,
         bottom: client_h,
     };
+    // SAFETY: rc 是栈矩形（AdjustWindowRectEx 按样式改写）；hwnd 是本面板
+    // 窗口，SetWindowPos 只改尺寸（NOMOVE|NOZORDER）。
     unsafe {
         let _ = AdjustWindowRectEx(
             &mut rc,
@@ -445,7 +543,7 @@ fn layout_all(hwnd: HWND, panel: &Panel) {
         );
         let _ = SetWindowPos(
             hwnd,
-            HWND(0),
+            None,
             0,
             0,
             rc.right - rc.left,
@@ -464,6 +562,8 @@ fn layout_rows(panel: &Panel) -> i32 {
     let del_w = del_w(s) as i32;
     let w = panel_w(s) as i32;
     let n = panel.rows.len();
+    // SAFETY: 行内控件句柄来自 Panel.rows（面板存活期间有效，子控件
+    // 随面板创建/销毁）；MoveWindow 纯定位调用。
     unsafe {
         let name_w = name_w(s) as i32;
         for (i, r) in panel.rows.iter().enumerate() {
@@ -477,7 +577,7 @@ fn layout_rows(panel: &Panel) -> i32 {
                 row_h,
                 true,
             );
-            if r.del.0 != 0 {
+            if !r.del.0.is_null() {
                 let _ = MoveWindow(r.del, w - pad - del_w, y, del_w, row_h, true);
             }
         }
@@ -503,10 +603,12 @@ fn do_delete(panel: &mut Panel, i: usize) {
     if !crate::menu::apply_category_delete(&name) {
         return;
     }
+    // SAFETY: 三个句柄是该行现存子控件（删行前逐一销毁恰好一次；null
+    // 句柄已判空），随后 rows.remove 丢弃记录。
     unsafe {
         let _ = DestroyWindow(panel.rows[i].edit);
         let _ = DestroyWindow(panel.rows[i].exts_edit);
-        if panel.rows[i].del.0 != 0 {
+        if !panel.rows[i].del.0.is_null() {
             let _ = DestroyWindow(panel.rows[i].del);
         }
     }
@@ -515,13 +617,13 @@ fn do_delete(panel: &mut Panel, i: usize) {
 }
 
 fn do_add(hwnd: HWND, panel: &mut Panel) {
-    // 控件 ID 方案上限(0x100+3i,add=0x2FF):约 136 行,实际分类远少于此;
-    // 到顶拒绝并留痕,防 ID 相撞
-    if panel.rows.len() >= 130 {
-        ui::log("cats panel: row limit reached, add refused");
+    // 到顶拒绝并留痕(上限语义见 can_add_row)
+    if !can_add_row(panel.rows.len()) {
+        logging::log("cats panel: row limit reached, add refused");
         return;
     }
     // 先提交在编辑的行,避免新增与悬挂改名竞争
+    // SAFETY: 纯焦点查询，无指针参数（UI 线程调用）。
     let focused = unsafe { GetFocus() };
     if let Some(i) = panel.rows.iter().position(|r| r.edit == focused) {
         commit_row(panel, i);
@@ -530,9 +632,10 @@ fn do_add(hwnd: HWND, panel: &mut Panel) {
         append_row(hwnd, panel, &name, "", false, false);
         layout_all(hwnd, panel);
         if let Some(r) = panel.rows.last() {
+            // SAFETY: r.edit 是刚创建的行编辑框；置焦+全选均为纯消息调用。
             unsafe {
-                let _ = SetFocus(r.edit);
-                let _ = SendMessageW(r.edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                let _ = SetFocus(Some(r.edit));
+                let _ = SendMessageW(r.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
             }
         }
     }
@@ -574,19 +677,11 @@ fn commit_exts(panel: &mut Panel, i: usize) {
         set_text(panel.rows[i].exts_edit, &old);
         return;
     }
-    let list: Vec<String> = text
-        .split([',', '，', ' ', '；', ';'])
-        .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut uniq: Vec<String> = Vec::new();
-    for e in list {
-        if !uniq.contains(&e) {
-            uniq.push(e);
-        }
-    }
-    if crate::menu::apply_category_exts(&panel.rows[i].name, uniq) {
-        let joined = panel.rows[i].exts.clone();
+    let uniq = parse_exts(&text);
+    if crate::menu::apply_category_exts(&panel.rows[i].name, uniq.clone()) {
+        // 回显归一结果(2026-09-16 修复:旧代码克隆的是旧值再自赋值——
+        // 规则已生效但编辑框跳回旧文本,观感像被拒绝;行内状态也随之过期)
+        let joined = uniq.join(";");
         panel.rows[i].exts = joined.clone();
         set_text(panel.rows[i].exts_edit, &joined);
     } else {
@@ -595,17 +690,21 @@ fn commit_exts(panel: &mut Panel, i: usize) {
 }
 
 fn send_focus_row(hwnd: HWND, idx: usize) {
+    // SAFETY: 见 panel_of 的 Safety 段（UI 线程 + 面板窗口）。
     if let Some(panel) = unsafe { panel_of(hwnd) } {
         if let Some(r) = panel.rows.get(idx) {
+            // SAFETY: r.edit 是该行现存编辑框；纯消息调用。
             unsafe {
-                let _ = SetFocus(r.edit);
-                let _ = SendMessageW(r.edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                let _ = SetFocus(Some(r.edit));
+                let _ = SendMessageW(r.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
             }
         }
     }
 }
 
 fn get_text(h: HWND) -> String {
+    // SAFETY: buf 按长度+1 分配，GetWindowTextW 保证 NUL 结尾；按 NUL
+    // 截断解析；h 是本面板子控件。
     unsafe {
         let len = GetWindowTextLengthW(h).max(0) as usize;
         let mut buf = vec![0u16; len + 1];
@@ -617,6 +716,7 @@ fn get_text(h: HWND) -> String {
 
 fn set_text(h: HWND, s: &str) {
     let w = shell::wide(s);
+    // SAFETY: w 是 NUL 宽串，同步调用期间存活；h 是本面板子控件。
     unsafe {
         let _ = SetWindowTextW(h, PCWSTR::from_raw(w.as_ptr()));
     }
@@ -624,6 +724,9 @@ fn set_text(h: HWND, s: &str) {
 
 /// 创建对话框消息字体;bold=粗体(节头用)。regular/粗体两档共用一套度量
 pub(crate) fn create_dialog_font(bold: bool) -> HFONT {
+    // SAFETY: SPI_GETNONCLIENTMETRICS 契约——cbSize 先填结构大小、
+    // pvParam 指向调用方结构（栈上 ncm，调用期间有效）；返回的 HFONT
+    // 所有权移交调用方（由调用方 DeleteObject 配对）。
     unsafe {
         let mut ncm = NONCLIENTMETRICSW {
             cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
@@ -642,27 +745,27 @@ pub(crate) fn create_dialog_font(bold: bool) -> HFONT {
             }
             return CreateFontIndirectW(&ncm.lfMessageFont);
         }
-        HFONT(0) // 取系统字体失败时控件用默认字体,不影响功能
+        HFONT(std::ptr::null_mut()) // 取系统字体失败时控件用默认字体,不影响功能
     }
 }
 
 // ---- 尺寸(物理像素,按主屏 DPI 缩放) ----
-fn row_h(s: f32) -> f32 {
+pub fn row_h(s: f32) -> f32 {
     (26.0 * s).round().max(20.0)
 }
-fn row_gap(s: f32) -> f32 {
+pub fn row_gap(s: f32) -> f32 {
     (6.0 * s).round().max(4.0)
 }
-fn pad(s: f32) -> f32 {
+pub fn pad(s: f32) -> f32 {
     (10.0 * s).round().max(8.0)
 }
-fn del_w(s: f32) -> f32 {
+pub fn del_w(s: f32) -> f32 {
     (26.0 * s).round().max(22.0)
 }
-fn panel_w(s: f32) -> f32 {
+pub fn panel_w(s: f32) -> f32 {
     (430.0 * s).round().max(380.0)
 }
-fn name_w(s: f32) -> f32 {
+pub fn name_w(s: f32) -> f32 {
     (110.0 * s).round().max(90.0)
 }
 fn panel_size_for(scale: f32, rows: usize) -> (i32, i32) {
@@ -674,6 +777,7 @@ fn panel_size_for(scale: f32, rows: usize) -> (i32, i32) {
         right: panel_w(scale) as i32,
         bottom: client_h,
     };
+    // SAFETY: rc 是栈矩形，AdjustWindowRectEx 按样式原位改写。
     unsafe {
         let _ = AdjustWindowRectEx(
             &mut rc,

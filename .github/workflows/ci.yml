@@ -16,10 +16,16 @@ jobs:
       - uses: actions/checkout@v4
 
       # 工具链 pin 在 1.97.0(2026-09-11):CI 用 @stable 曾因 runner 比本地新
-      # (1.98 新 lint chunks_exact_to_as_chunks)四处红灯。本机 rustup 的显式
-      # 1.97.0 目录残缺(Missing manifest)故不能用 rust-toolchain.toml,
-      # 改在 CI 侧 pin;本地 stable 升级时主动同步这里。
-      - uses: dtolnay/rust-toolchain@1.97.0
+      # (1.98 新 lint chunks_exact_to_as_chunks)四处红灯。不用 dtolnay action
+      # (其版本分支止于 1.83,引用不可靠),显式 rustup 安装并带上 rustfmt+
+      # clippy 组件——rust-toolchain.toml 触发的懒安装走 default profile
+      # 不含这两个组件,fmt/clippy 首步即挂(2026-09-11 实锤)。与
+      # rust-toolchain.toml 双保险,升级两端同步。
+      - name: Install pinned toolchain (rustfmt + clippy)
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.97.0
 
       - uses: Swatinem/rust-cache@v2
 

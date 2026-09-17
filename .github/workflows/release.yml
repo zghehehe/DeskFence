@@ -17,7 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # 工具链与 CI 同款 pin 在 1.97.0(与 rust-toolchain.toml 三处同源):
+      # 本地/CI/发布用同一版本,避免 runner @stable 漂移引入新 lint/行为
+      # 差异;不用 dtolnay action(其版本分支止于 1.83,引用不可靠)。
+      # 发布流程不跑 fmt/clippy,保持 minimal 不装组件。
+      - name: Install pinned toolchain (1.97.0)
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
 
       - name: Extract release notes from tag message
         shell: bash

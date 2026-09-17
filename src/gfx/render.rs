@@ -5,11 +5,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-
-use windows::Win32::Foundation::{BOOL, COLORREF, HANDLE, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
-    D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory, ID2D1SolidColorBrush,
@@ -28,11 +26,12 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, DeleteDC, DeleteObject, DrawTextW,
     GetDC, GetDIBits, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
     BACKGROUND_MODE, BITMAPINFO, BLENDFUNCTION, DIB_RGB_COLORS, DT_CENTER, DT_EDITCONTROL,
-    DT_END_ELLIPSIS, DT_NOPREFIX, DT_WORDBREAK, HBITMAP, HBRUSH, HDC, HGDIOBJ, TRANSPARENT,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DrawIconEx, UpdateLayeredWindow, DI_NORMAL, HICON, ULW_ALPHA,
 };
+use windows_numerics::Vector2;
 
 use crate::model::{self, Fence, FileItem, Layout};
 use crate::shell;
@@ -48,7 +47,11 @@ pub struct Surface {
     pub target: ID2D1DCRenderTarget,
 }
 
-// bits 是纯内存指针,仅在 state 互斥锁内于 UI 线程访问;COM 接口本身可跨线程传递。
+// SAFETY(Send): bits 是 CreateDIBSection 返回的纯内存指针（无线程亲和），
+// 只在 state 互斥锁内于 UI 线程访问（Surface 的生产/释放/呈现全在 UI 线程）；
+// dc/dib/old 是 GDI 句柄，跨线程传递本身合法（GDI 句柄无线程束缚）；
+// target(D2D DC 渲染目标)与其它 COM 接口只在 UI 线程使用。Send 只是让
+// Surface 能存进全局 UiState，不代表可以并发使用。
 unsafe impl Send for Surface {}
 
 pub struct Renderer {
@@ -85,13 +88,22 @@ fn rounded(r: D2D_RECT_F, rad: f32) -> D2D1_ROUNDED_RECT {
 }
 
 pub fn as_brush(s: &ID2D1SolidColorBrush) -> &ID2D1Brush {
+    // SAFETY: COM 接口继承的规范强转——ID2D1SolidColorBrush 的 vtable 前
+    // 缀即 ID2D1Brush（派生接口首部布局与基接口一致），借用的生命周期
+    // 与入参相同，引用计数不受影响（仅改变借用视图）。
     unsafe { &*(s as *const ID2D1SolidColorBrush as *const ID2D1Brush) }
 }
 
+/// # Safety
+/// rt 必须是有效的 DC 渲染目标且处于可用状态（未在 EndDraw 错误后继续）；
+/// 调用发生在 UI 线程的绘制序列内。返回的 COM 画刷由包装的 drop Release。
 unsafe fn brush(rt: &ID2D1DCRenderTarget, c: &D2D1_COLOR_F) -> Option<ID2D1SolidColorBrush> {
-    rt.CreateSolidColorBrush(c, None).ok()
+    unsafe { rt.CreateSolidColorBrush(c, None) }.ok()
 }
 
+/// # Safety
+/// dw 必须是有效的 DWrite 工厂；family/locale 借用在本函数调用期间存活
+/// （同步调用）。返回的 TextFormat 是 COM 包装，drop 自动 Release。
 unsafe fn create_text_format(
     dw: &IDWriteFactory,
     family_name: &str,
@@ -100,15 +112,17 @@ unsafe fn create_text_format(
 ) -> Option<IDWriteTextFormat> {
     let family = shell::wide(family_name);
     let locale = shell::wide("zh-CN");
-    dw.CreateTextFormat(
-        PCWSTR::from_raw(family.as_ptr()),
-        None,
-        weight,
-        DWRITE_FONT_STYLE_NORMAL,
-        DWRITE_FONT_STRETCH_NORMAL,
-        size,
-        PCWSTR::from_raw(locale.as_ptr()),
-    )
+    unsafe {
+        dw.CreateTextFormat(
+            PCWSTR::from_raw(family.as_ptr()),
+            None,
+            weight,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            size,
+            PCWSTR::from_raw(locale.as_ptr()),
+        )
+    }
     .ok()
 }
 
@@ -116,6 +130,8 @@ unsafe fn create_text_format(
 /// GDI 的 |lfHeight| 对应 ascent+descent 的字符格高,而 DWrite SetFontSize 是
 /// em 高;同一数字直接传给 DWrite 会让名字比原生桌面大约 1/3。用字体实际
 /// metrics 换算才能与原生逐像素对齐(Segoe UI≈1.33,微软雅黑≈1.32)。
+/// # Safety
+/// 纯数值换算，无内存安全前提（unsafe 签名系历史沿用；实参未被使用）。
 unsafe fn gdi_px_to_em(_dw: &IDWriteFactory, _family: &str, px: f32) -> f32 {
     // GDI lfHeight(负值=字符高,已含 DPI 缩放) 与 DWrite em 的正确换算:
     // 渲染目标为 96 DPI(1 DIP=1px)时,DIP 字号 = |lfHeight|,直接使用。
@@ -125,6 +141,9 @@ unsafe fn gdi_px_to_em(_dw: &IDWriteFactory, _family: &str, px: f32) -> f32 {
 
 impl Renderer {
     pub fn new() -> Option<Renderer> {
+        // SAFETY(整块): D2D/DWrite 工厂与 TextFormat 均为 COM 包装（drop
+        // 自动 Release）；SINGLE_THREADED 工厂只在 UI 线程使用；wide 缓冲
+        // 在同步调用期间存活（create_text_format 内部）。
         unsafe {
             let factory: ID2D1Factory =
                 match D2D1CreateFactory::<ID2D1Factory>(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) {
@@ -175,14 +194,19 @@ impl Renderer {
 
 /// 为栅栏窗口创建 DIB + DCRenderTarget
 pub fn create_surface(factory: &ID2D1Factory, w: u32, h: u32) -> Option<Surface> {
+    // SAFETY(整块): GDI 资源成对——GetDC/ReleaseDC、CreateCompatibleDC/
+    // DeleteDC、CreateDIBSection 的 DIB/失败路径 DeleteObject、SelectObject
+    // 之后还原或随 Surface 存活（由 release_surface 收尾）；bits 指针在
+    // DIB 存活期间有效且布局=32bpp 自上而下（biHeight 取负）；BindDC 后
+    // 的渲染目标与 DC 绑定，二者同存亡（都由 Surface 持有）。
     unsafe {
-        let hdc_dst = GetDC(HWND(0));
-        if hdc_dst.0 == 0 {
+        let hdc_dst = GetDC(None);
+        if hdc_dst.0.is_null() {
             return None;
         }
-        let dc = CreateCompatibleDC(hdc_dst);
-        ReleaseDC(HWND(0), hdc_dst);
-        if dc.0 == 0 {
+        let dc = CreateCompatibleDC(Some(hdc_dst));
+        ReleaseDC(None, hdc_dst);
+        if dc.0.is_null() {
             return None;
         }
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -194,9 +218,8 @@ pub fn create_surface(factory: &ID2D1Factory, w: u32, h: u32) -> Option<Surface>
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = 0;
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        if let Ok(dib) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
-        {
-            let old = SelectObject(dc, dib);
+        if let Ok(dib) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(dc, HGDIOBJ(dib.0));
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -228,7 +251,7 @@ pub fn create_surface(factory: &ID2D1Factory, w: u32, h: u32) -> Option<Surface>
                 }
             }
             SelectObject(dc, old);
-            let _ = DeleteObject(dib);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
         }
         let _ = DeleteDC(dc);
         None
@@ -237,14 +260,18 @@ pub fn create_surface(factory: &ID2D1Factory, w: u32, h: u32) -> Option<Surface>
 
 /// 从 HICON 提取 size x size premultiplied BGRA 像素
 pub fn icon_pixels(hicon: HICON, size: u32) -> Option<Vec<u8>> {
+    // SAFETY(整块): GDI 成对（GetDC/ReleaseDC、DC/DeleteDC、DIB/
+    // DeleteObject、SelectObject 还原）；hicon 由调用方保证有效（用后
+    // 由调用方 DestroyIcon，本函数不消费）；DrawIconEx 画进 32bpp DIB，
+    // from_raw_parts 长度=size*size*4 与 DIB 布局一致，且在释放前完成拷贝。
     unsafe {
-        let hdc_screen = GetDC(HWND(0));
-        if hdc_screen.0 == 0 {
+        let hdc_screen = GetDC(None);
+        if hdc_screen.0.is_null() {
             return None;
         }
-        let dc = CreateCompatibleDC(hdc_screen);
-        ReleaseDC(HWND(0), hdc_screen);
-        if dc.0 == 0 {
+        let dc = CreateCompatibleDC(Some(hdc_screen));
+        ReleaseDC(None, hdc_screen);
+        if dc.0.is_null() {
             return None;
         }
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -256,9 +283,8 @@ pub fn icon_pixels(hicon: HICON, size: u32) -> Option<Vec<u8>> {
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = 0;
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        if let Ok(hbm) = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
-        {
-            let old = SelectObject(dc, hbm);
+        if let Ok(hbm) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(dc, HGDIOBJ(hbm.0));
             let _ = DrawIconEx(
                 dc,
                 0,
@@ -267,7 +293,7 @@ pub fn icon_pixels(hicon: HICON, size: u32) -> Option<Vec<u8>> {
                 size as i32,
                 size as i32,
                 0,
-                HBRUSH(0),
+                None,
                 DI_NORMAL,
             );
             let out = {
@@ -275,7 +301,7 @@ pub fn icon_pixels(hicon: HICON, size: u32) -> Option<Vec<u8>> {
                 src.to_vec()
             };
             SelectObject(dc, old);
-            let _ = DeleteObject(hbm);
+            let _ = DeleteObject(HGDIOBJ(hbm.0));
             let _ = DeleteDC(dc);
             return Some(out);
         }
@@ -286,10 +312,13 @@ pub fn icon_pixels(hicon: HICON, size: u32) -> Option<Vec<u8>> {
 
 /// Read an exact-size Shell HBITMAP into top-down 32-bit BGRA pixels.
 fn bitmap_pixels(bitmap: HBITMAP, size: u32) -> Option<Vec<u8>> {
+    // SAFETY(整块): bitmap 的所有权归本函数（无论成败 DeleteObject 恰好
+    // 一次）；GetDIBits 的 out 长度=size*size*4 与声明的 32bpp DIB 头一致
+    //（biHeight 取负=自上而下）；屏幕 DC 用后即还。
     unsafe {
-        let hdc = GetDC(HWND(0));
-        if hdc.0 == 0 {
-            let _ = DeleteObject(bitmap);
+        let hdc = GetDC(None);
+        if hdc.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
             return None;
         }
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -310,8 +339,8 @@ fn bitmap_pixels(bitmap: HBITMAP, size: u32) -> Option<Vec<u8>> {
             &mut bmi,
             DIB_RGB_COLORS,
         );
-        ReleaseDC(HWND(0), hdc);
-        let _ = DeleteObject(bitmap);
+        ReleaseDC(None, hdc);
+        let _ = DeleteObject(HGDIOBJ(bitmap.0));
         if lines == size as i32 {
             Some(out)
         } else {
@@ -360,6 +389,10 @@ type DrawShadowTextProc = unsafe extern "system" fn(
 static DRAW_SHADOW_TEXT: OnceLock<Option<DrawShadowTextProc>> = OnceLock::new();
 
 fn draw_shadow_text_proc() -> Option<DrawShadowTextProc> {
+    // SAFETY: 一次性初始化（OnceLock 保证单次执行）。LoadLibraryW 的模块
+    // 引用有意保持到进程结束（不 FreeLibrary——comctl32 常驻，卸载无收益
+    // 且有风险）；GetProcAddress 返回非空才 Some，transmute 两侧都是
+    // extern "system" 函数指针、仅签名不同（ABI 一致的规范转换）。
     *DRAW_SHADOW_TEXT.get_or_init(|| unsafe {
         use windows::core::PCSTR;
         use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -405,6 +438,12 @@ pub fn gdi_draw_labels_seeded(
     if s.bits.is_null() || sw == 0 || sh == 0 {
         return;
     }
+    // SAFETY(整块): lf 是 SystemParametersInfo 刚取回的栈 LOGFONTW（同步
+    // 调用期间有效）；字体/DC 状态成对还原（SelectObject/SetBkMode 记旧值
+    // 恢复、字体 DeleteObject）；bits 的可变切片按 DIB 布局（w*h*4、32bpp）
+    // 构造且写入全部落在表面内（矩形先按表面边界裁剪）；DrawShadowText 的
+    // 原型与 comctl32 v6 导出一致（见 draw_shadow_text_proc），降级路径
+    // DrawTextW 的 buf 是可变副本（API 要求可写缓冲）。
     unsafe {
         let hf = CreateFontIndirectW(&lf as *const _);
         if hf.is_invalid() {
@@ -575,6 +614,8 @@ pub fn get_icon_buffer(
     let buf = shell::get_system_icon_hicon(path, px)
         .and_then(|h| {
             let out = icon_pixels(h, px);
+            // SAFETY: h 是 get_system_icon_hicon 移交给本闭包的 HICON，
+            // 像素提取完成后恰好 DestroyIcon 一次。
             unsafe {
                 let _ = DestroyIcon(h);
             }
@@ -584,6 +625,7 @@ pub fn get_icon_buffer(
         .or_else(|| {
             shell::get_icon_hicon(path).and_then(|h| {
                 let out = icon_pixels(h, px);
+                // SAFETY: 同上：降级路径的 HICON 用后即毁。
                 unsafe {
                     let _ = DestroyIcon(h);
                 }
@@ -635,6 +677,10 @@ pub fn draw_fence(
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
     let w = fence.rect.w;
     let h = fence.rect.h;
+    // SAFETY(整块): D2D 绘制序列——BeginDraw/EndDraw 配对；所有 COM 对象
+    //（画刷/位图）为包装类型，drop 自动 Release；CreateBitmap 的源指针指向
+    // cached/arrival.icon 缓冲（长度 px*px*4，与声明的 32bpp premultiplied
+    // 布局一致），同步复制后不再持有；全部调用在 UI 线程。
     unsafe {
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
@@ -769,6 +815,8 @@ fn draw_text_shadow(
 ) {
     let w = shell::wide(txt);
     if w.len() > 1 {
+        // SAFETY: rt/format/画刷均为存活的有效 COM 对象（UI 线程绘制序列
+        // 内）；切片去掉了 wide() 的 NUL 终止符，长度显式传递。
         unsafe {
             let sr = rect(r.left + 1.0, r.top + 1.0, r.right + 1.0, r.bottom + 1.0);
             rt.DrawText(
@@ -831,6 +879,8 @@ pub fn trim_to_lines(
             return true;
         }
         // 与绘制同源:GDI 经典度量,保证截断判定与实际渲染一致
+        // SAFETY: dw/fmt 为存活 COM 对象；w16 切片在同步调用期间存活；
+        // 返回的 TextLayout 是 COM 包装（drop 自动 Release）。
         unsafe {
             dw.CreateGdiCompatibleTextLayout(
                 &w16[..w16.len() - 1],
@@ -839,11 +889,12 @@ pub fn trim_to_lines(
                 4096.0,
                 1.0,
                 None,
-                BOOL(0),
+                false,
             )
         }
         .map(|l| {
             let mut m = Default::default();
+            // SAFETY: m 是栈输出结构（DWRITE_TEXT_METRICS），调用期间有效。
             unsafe {
                 let _ = l.GetMetrics(&mut m);
             }
@@ -897,6 +948,9 @@ pub fn draw_guides(
     arrivals: &[ArrivalFrame],
 ) -> Vec<GdiLabelJob> {
     let mut jobs: Vec<GdiLabelJob> = Vec::new();
+    // SAFETY(整块): D2D 绘制序列（BeginDraw/EndDraw 配对）；CreateBitmap
+    // 的源缓冲为 arrival.icon / ghost icon（px*px*4 的 BGRA premultiplied，
+    // 与声明的位图属性一致），同步复制；COM 对象 drop 自动 Release。
     unsafe {
         rt.BeginDraw();
         rt.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
@@ -1032,9 +1086,9 @@ pub fn draw_guides(
     jobs
 }
 
-/// overlay(逐像素透明表面)上的 GDI 图标名绘制:与 gdi_draw_labels 同一路
-/// DrawShadowText/ClearType,但 alpha 只在"有墨水"的像素置 255(GDI 不写 alpha,
-/// 全置 255 会破坏表面的透明背景与 D2D 已画内容的预乘 alpha)。
+/// overlay(逐像素透明表面)上的 GDI 图标名绘制:与 gdi_draw_labels_seeded
+/// 同一路 DrawShadowText/ClearType,但 alpha 只在"有墨水"的像素置 255(GDI 不写
+/// alpha,全置 255 会破坏表面的透明背景与 D2D 已画内容的预乘 alpha)。
 pub fn gdi_draw_labels_transparent(s: &Surface, jobs: &[GdiLabelJob]) {
     if jobs.is_empty() {
         return;
@@ -1042,6 +1096,9 @@ pub fn gdi_draw_labels_transparent(s: &Surface, jobs: &[GdiLabelJob]) {
     let Some(lf) = shell::icon_title_logfont() else {
         return;
     };
+    // SAFETY(整块): 契约同 gdi_draw_labels_seeded（栈 LOGFONTW、DC 状态
+    // 成对还原、bits 可变切片按 DIB 布局且矩形先裁剪到表面内）；
+    // alpha 修复只写作业矩形内的像素。
     unsafe {
         let hf = CreateFontIndirectW(&lf as *const _);
         if hf.is_invalid() {
@@ -1123,6 +1180,9 @@ pub fn gdi_draw_labels_transparent(s: &Surface, jobs: &[GdiLabelJob]) {
 }
 
 fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h: f32) {
+    // SAFETY(整块): D2D 绘制序列内的同步调用（调用方已 BeginDraw）；
+    // PathGeometry 的 sink 按 COM 约定 Open→…→Close 成对使用；全部对象
+    // 为包装类型，drop 自动 Release。
     unsafe {
         let accent = fence.color();
         // A thin category rail is easier to scan than a large colored card.
@@ -1189,16 +1249,19 @@ fn draw_title(rt: &ID2D1DCRenderTarget, r: &Renderer, fence: &Fence, w: f32, _h:
                     if let Ok(geo) = r.factory.CreatePathGeometry() {
                         if let Ok(sink) = geo.Open() {
                             sink.BeginFigure(
-                                D2D_POINT_2F { x: tri[0].0, y: tri[0].1 },
+                                Vector2 {
+                                    X: tri[0].0,
+                                    Y: tri[0].1,
+                                },
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_FILLED,
                             );
-                            sink.AddLine(D2D_POINT_2F {
-                                x: tri[1].0,
-                                y: tri[1].1,
+                            sink.AddLine(Vector2 {
+                                X: tri[1].0,
+                                Y: tri[1].1,
                             });
-                            sink.AddLine(D2D_POINT_2F {
-                                x: tri[2].0,
-                                y: tri[2].1,
+                            sink.AddLine(Vector2 {
+                                X: tri[2].0,
+                                Y: tri[2].1,
                             });
                             sink.EndFigure(
                                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED,
@@ -1231,6 +1294,9 @@ fn draw_item(
     jobs: &mut Vec<GdiLabelJob>,
     hide_label: bool,
 ) {
+    // SAFETY(整块): D2D 绘制序列内的同步调用（调用方已 BeginDraw）；
+    // CreateBitmap 源指针指向 cached（px*px*4 BGRA premultiplied，与属性
+    // 一致）；COM 对象 drop 自动 Release。
     unsafe {
         let cs = metrics.icon_px;
         if hovered || selected {
@@ -1360,6 +1426,7 @@ fn draw_scrollbar(
     w: f32,
     h: f32,
 ) {
+    // SAFETY: D2D 绘制序列内的同步调用（调用方已 BeginDraw），纯绘制。
     unsafe {
         let content_top = model::TITLE_H + model::PAD;
         let content_bot = h - model::PAD;
@@ -1398,6 +1465,9 @@ pub fn display_name(name: &str) -> String {
 
 /// 将表面推送到分层窗口（栅栏是顶层 WS_EX_LAYERED 窗口，必须用 UpdateLayeredWindow）
 pub fn present_surface(surface: &Surface, hwnd: HWND, x: i32, y: i32) -> bool {
+    // SAFETY: surface.dc/dib 是 Surface 持有的有效 DC-DIB 对（SelectObject
+    // 已选入）；hwnd 是本进程 WS_EX_LAYERED 窗口；ULW_ALPHA 契约要求
+    // premultiplied 32bpp——与 DIB 创建参数一致；size/pos/blend 均为栈值。
     unsafe {
         let size = SIZE {
             cx: surface.w as i32,
@@ -1413,10 +1483,10 @@ pub fn present_surface(surface: &Surface, hwnd: HWND, x: i32, y: i32) -> bool {
         };
         UpdateLayeredWindow(
             hwnd,
-            HDC::default(),
+            None,
             Some(&pos),
             Some(&size),
-            surface.dc,
+            Some(surface.dc),
             Some(&src),
             COLORREF(0),
             Some(&blend),
@@ -1431,9 +1501,12 @@ pub fn present_existing_surface(surface: &Surface, hwnd: HWND, x: i32, y: i32) -
 }
 
 pub fn release_surface(s: Surface) {
+    // SAFETY: s 按值消费（所有权移入），三个 GDI 调用是 create_surface
+    // 资源链的逆序收尾：还原旧对象→删 DIB→删 DC，各恰好一次；
+    // bits 指针随 DIB 销毁失效，此后 Surface 已被 drop 不再可访问。
     unsafe {
         let _ = SelectObject(s.dc, s.old);
-        let _ = DeleteObject(s.dib);
+        let _ = DeleteObject(HGDIOBJ(s.dib.0));
         let _ = DeleteDC(s.dc);
     }
 }

@@ -48,6 +48,11 @@ pub fn resolve(setting: &str, system_zh: bool) -> Lang {
     }
 }
 
+/// InstallLanguage 码判定(纯核):08 开头 04 结尾=简体中文(0804)
+pub fn is_zh_install_code(code: &str) -> bool {
+    code.starts_with("08") && code.ends_with("04")
+}
+
 /// 系统安装语言是否简体中文(HKLM Nls\Language InstallLanguage 0804 判定,
 /// 与原 shell::inject_rename_item 的判据同源)。读不到=非简中(按英文兜底)。
 pub fn system_prefers_zh() -> bool {
@@ -72,7 +77,7 @@ pub fn system_prefers_zh() -> bool {
     }
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let code = String::from_utf16_lossy(&buf[..end]);
-    code.starts_with("08") && code.ends_with("04")
+    is_zh_install_code(&code)
 }
 
 /// 双语文案表:每个条目生成一个 `pub fn name() -> &'static str`,
@@ -165,6 +170,7 @@ bilingual! {
     firstrun_opts_head => ("以下推荐项已默认勾选,不需要请取消:", "The recommended options below are pre-checked; uncheck any you don't want:"),
     firstrun_chrome_cb => ("默认显示栅栏边框线(可随时在托盘菜单关闭)", "Show fence borders by default (toggle anytime from the tray menu)"),
     firstrun_autostart_cb => ("默认开机自启(可随时在托盘菜单关闭)", "Start with Windows by default (toggle anytime from the tray menu)"),
+    firstrun_noagain_cb => ("不再提示", "Don't show again"),
     firstrun_ok => ("开始使用", "Get started"),
 }
 

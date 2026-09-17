@@ -1,35 +1,22 @@
-//! 自愈/z 序子系统:走查、受限锚点解析、意图守卫、WinEvent 与快速下压。
-//! 栅栏由桌面宿主拥有;健康窗口不重排,不使用 topmost 免疫。
+//! 自愈/z 序子系统:走查、意图守卫、WinEvent 与快速下压。
+//! band 锚点解析与走查判据已迁 hosts.rs(2026-09-17,断与 present 的互相
+//! 依赖),经 `use crate::hosts::*` 消费;栅栏由桌面宿主拥有;健康窗口不
+//! 重排,不使用 topmost 免疫。
 //! 与 ui.rs 双向依赖(同 crate 内合法)。
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-// windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
+// windows crate 未导出的 WinEvent 标志(0.62 仍缺),按 WinUser.h 补定义
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
-use crate::drag::*;
+use crate::hosts::*;
+use crate::logging::log;
+use crate::present::*;
 use crate::render;
-use crate::ui::*;
+use crate::state::*;
+use crate::winids::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-
-/// 同一故障签名连续出现才累计拍数;恢复过渡期拦路者换窗即重置。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WalkFault {
-    /// 可见外来窗先于栅栏出现在宿主之上
-    Blocked { hwnd: isize, class: u64 },
-    /// 走查到栈顶未找到:栅栏在宿主之下,首拍即修
-    NotFoundTop,
-    /// 走查预算耗尽:状态不明,只记日志不动手
-    NotFoundBudget,
-}
-
-pub(crate) struct WalkStrike {
-    fault: WalkFault,
-    count: u32,
-}
-
 /// 计数未推进时不能重复消费第 3、13、23…拍的修复机会。
 fn walk_repair_due(fault: WalkFault, strikes: u32, advanced: bool) -> bool {
     match fault {
@@ -41,216 +28,15 @@ fn walk_repair_due(fault: WalkFault, strikes: u32, advanced: bool) -> bool {
     }
 }
 
-fn class_hash(cls: &[u16]) -> u64 {
+/// 窗口类名哈希(FNV-1a over UTF-16):日志里匿名化外来窗口类名用。
+/// (2026-09-16 提 pub 供 tests/ 断言确定性/区分度)
+pub fn class_hash(cls: &[u16]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &c in cls {
         h ^= c as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
     h
-}
-
-/// 栅栏窗口类名("DeskFenceFence",14 字符)——供无锁判定自家栅栏。
-const FENCE_CLASS: [u16; 14] = [
-    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65, 0x6E, 0x63, 0x65,
-];
-
-/// 锚点解析可在窗口过程或持状态锁时调用,此处不能再次取状态锁。
-pub(crate) fn is_own_fence_window(w: HWND) -> bool {
-    let mut cls_buf = [0u16; 16];
-    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-    n as usize == FENCE_CLASS.len() && cls_buf[..FENCE_CLASS.len()] == FENCE_CLASS
-}
-
-fn is_topmost_window(w: HWND) -> bool {
-    // WS_EX_TOPMOST = 0x8
-    (unsafe { GetWindowLongW(w, GWL_EXSTYLE) } & 0x8) != 0
-}
-
-// ---------------- UIPI 坏锚缓存 ----------------
-// 被拒过的锚点暂时排除;重试仍只能使用首个可见外来窗下方的安全候选。
-// 成功插入即清除。TTL 限制句柄复用造成的影响。
-const BAD_ANCHOR_TTL_MS: u64 = 60_000;
-static BAD_ANCHORS: Mutex<Vec<(isize, u64)>> = Mutex::new(Vec::new());
-
-fn bad_anchor_mark(h: HWND) {
-    let now = resize_now_ms();
-    let mut g = BAD_ANCHORS.lock().unwrap();
-    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
-    g.push((h.0, now));
-}
-
-fn bad_anchor_clear(h: HWND) {
-    let now = resize_now_ms();
-    let mut g = BAD_ANCHORS.lock().unwrap();
-    g.retain(|(k, t)| now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS && *k != h.0);
-}
-
-fn bad_anchor_recent(h: HWND) -> bool {
-    let now = resize_now_ms();
-    let g = BAD_ANCHORS.lock().unwrap();
-    g.iter()
-        .any(|(k, t)| *k == h.0 && now.saturating_sub(*t) < BAD_ANCHOR_TTL_MS)
-}
-
-/// 窗口查询与策略分离:纯策略只消费由宿主向上排列的窗口属性。
-#[derive(Clone, Copy, Default)]
-struct AnchorWindow {
-    handle: isize,
-    own: bool,
-    invisible: bool,
-    auxiliary: bool,
-    topmost: bool,
-    bad: bool,
-}
-
-/// 首个真实可见非 topmost 外来窗是不可越过的上界。能锚它就返回;
-/// 被拒时只用此前扫过的垫窗或兄弟。topmost 是终止边界,即使隐形/自家
-/// 也不能继续向上搜索。所有出口排除宿主、自身、topmost 和坏锚。
-fn resolve_band_anchor(
-    host: isize,
-    skip: isize,
-    windows: impl IntoIterator<Item = AnchorWindow>,
-) -> Option<isize> {
-    let mut padding = None;
-    let mut sibling = None;
-    for w in windows {
-        if w.handle == 0 || w.handle == host || w.topmost {
-            break;
-        }
-        if w.handle == skip {
-            continue;
-        }
-        if w.own {
-            if !w.bad && sibling.is_none() {
-                sibling = Some(w.handle);
-            }
-        } else if w.invisible || w.auxiliary {
-            if !w.bad {
-                padding = Some(w.handle);
-            }
-        } else {
-            return if w.bad {
-                padding.or(sibling)
-            } else {
-                Some(w.handle)
-            };
-        }
-    }
-    padding.or(sibling)
-}
-
-/// SetWindowPos(F, A) 将 F 放到 A 正下方。只向宿主上方扫描一次,由纯策略
-/// 选择普通带内的安全锚;没有合格候选就不移动,不回退宿主/self/topmost。
-pub(crate) fn band_attach_anchor(host: HWND, skip: HWND) -> Option<HWND> {
-    let vs = virtual_screen_rect();
-    let menu_host = MENU_HOST_HWND.get().copied();
-    let tray = TRAY_HWND.get().copied();
-    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-    let windows = std::iter::from_fn(|| {
-        if w.0 == 0 {
-            return None;
-        }
-        let current = w;
-        w = unsafe { GetWindow(current, GW_HWNDPREV) };
-        Some(AnchorWindow {
-            handle: current.0,
-            own: is_own_fence_window(current),
-            invisible: band_invisible(current, &vs),
-            auxiliary: band_aux(current, menu_host, tray),
-            topmost: is_topmost_window(current),
-            bad: bad_anchor_recent(current),
-        })
-    })
-    .take(1000);
-    resolve_band_anchor(host.0, skip.0, windows).map(HWND)
-}
-
-// ---------------- band 走查共享判据 ----------------
-// 主走查与快速下压使用相同的可忽略窗口语义。锚点解析额外把 topmost
-// 作为边界,避免将栅栏并入 topmost 带;真实失位仍由走查和下压负责恢复。
-
-struct VirtualScreen {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-}
-
-fn virtual_screen_rect() -> VirtualScreen {
-    unsafe {
-        VirtualScreen {
-            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
-            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
-            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        }
-    }
-}
-
-const MENU_CLASS: [u16; 6] = [0x23, 0x33, 0x32, 0x37, 0x36, 0x38]; // "#32768"
-const TRAY_CLASS: [u16; 13] = [
-    0x53, 0x68, 0x65, 0x6C, 0x6C, 0x5F, 0x54, 0x72, 0x61, 0x79, 0x57, 0x6E, 0x64,
-]; // "Shell_TrayWnd"
-   // 系统触摸/输入边缘条作为桌面辅助窗容忍。
-const EDGEUI_CLASS: [u16; 22] = [
-    0x45, 0x64, 0x67, 0x65, 0x55, 0x69, 0x49, 0x6E, 0x70, 0x75, 0x74, 0x54, 0x6F, 0x70, 0x57, 0x6E,
-    0x64, 0x43, 0x6C, 0x61, 0x73, 0x73,
-];
-
-// IME 候选/状态窗与线程宿主属于既有辅助窗容忍集,不作为真实应用窗边界。
-const MSCTFIME_CLASS: [u16; 11] = [
-    0x4D, 0x53, 0x43, 0x54, 0x46, 0x49, 0x4D, 0x45, 0x20, 0x55, 0x49,
-]; // "MSCTFIME UI"
-const DEFAULT_IME_CLASS: [u16; 11] = [
-    0x44, 0x65, 0x66, 0x61, 0x75, 0x6C, 0x74, 0x20, 0x49, 0x4D, 0x45,
-]; // "Default IME"
-   // 第三方输入法 TSF 基础设施窗组沿用同一辅助窗语义。
-const GENERIC_IME_CLASS: [u16; 3] = [0x49, 0x4D, 0x45]; // "IME"
-const SOIME_TSF_CLASS: [u16; 14] = [
-    0x53, 0x6F, 0x49, 0x6D, 0x65, 0x42, 0x53, 0x5F, 0x54, 0x53, 0x46, 0x5F, 0x55, 0x49,
-]; // "SoImeBS_TSF_UI"
-const SOBS_UI_CLASS: [u16; 7] = [0x53, 0x6F, 0x42, 0x53, 0x5F, 0x55, 0x49]; // "SoBS_UI"
-const SOBS_HINT_CLASS: [u16; 9] = [0x53, 0x6F, 0x42, 0x53, 0x5F, 0x48, 0x69, 0x6E, 0x74]; // "SoBS_Hint"
-const CATS_PANEL_CLASS: [u16; 18] = [
-    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x43, 0x61, 0x74, 0x73, 0x50, 0x61, 0x6E,
-    0x65, 0x6C,
-]; // "DeskFenceCatsPanel"
-
-/// band 走查的不可见判据:隐藏/最小化/离屏/退化尺寸(≤2px)/cloaked。
-fn band_invisible(w: HWND, vs: &VirtualScreen) -> bool {
-    let mut wr = RECT::default();
-    let rect_ok = unsafe { GetWindowRect(w, &mut wr) }.is_ok();
-    !rect_ok
-        || unsafe { IsIconic(w).as_bool() }
-        || !unsafe { IsWindowVisible(w).as_bool() }
-        || wr.right - wr.left <= 2
-        || wr.bottom - wr.top <= 2
-        || wr.right <= vs.x
-        || wr.bottom <= vs.y
-        || wr.left >= vs.x + vs.w
-        || wr.top >= vs.y + vs.h
-        || window_is_cloaked(w)
-}
-
-/// 自有辅助窗及既有系统辅助窗容忍集;真实应用窗不按尺寸或深度跳过。
-fn band_aux(w: HWND, menu_host: Option<HWND>, tray: Option<HWND>) -> bool {
-    if menu_host == Some(w) || tray == Some(w) {
-        return true;
-    }
-    let mut cls_buf = [0u16; 32];
-    let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-    (n == 6 && cls_buf[..6] == MENU_CLASS)
-        || (n == 13 && cls_buf[..13] == TRAY_CLASS)
-        || (n == 22 && cls_buf[..22] == EDGEUI_CLASS)
-        || (n == 11 && cls_buf[..11] == MSCTFIME_CLASS)
-        || (n == 11 && cls_buf[..11] == DEFAULT_IME_CLASS)
-        || (n == 3 && cls_buf[..3] == GENERIC_IME_CLASS)
-        || (n == 14 && cls_buf[..14] == SOIME_TSF_CLASS)
-        || (n == 7 && cls_buf[..7] == SOBS_UI_CLASS)
-        || (n == 9 && cls_buf[..9] == SOBS_HINT_CLASS)
-        // 分类面板可覆盖栅栏,不因此触发整组修复。
-        || (n == 18 && cls_buf[..18] == CATS_PANEL_CLASS)
 }
 
 /// 清理失效窗口、延迟创建、逐栅栏检查桌面带位。被拦截按同签名三拍确认,
@@ -266,7 +52,7 @@ pub(crate) fn ensure_all_attached() {
         let stale: Vec<u32> = s
             .windows
             .iter()
-            .filter(|(_, h)| !unsafe { IsWindow(**h).as_bool() })
+            .filter(|(_, h)| !unsafe { IsWindow(Some(**h)).as_bool() })
             .map(|(k, _)| *k)
             .collect();
         for id in stale {
@@ -312,10 +98,12 @@ pub(crate) fn ensure_all_attached() {
             let mut found = false;
             let mut blocker = (0isize, 0u64);
             // 覆盖宿主上方大量不可见辅助窗;到顶与预算耗尽分别处理。
-            let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+            // SAFETY(走查循环): GetWindow 沿 z 链同步取现存窗口（无指针
+            // 参数），失败得 null 由判空终止；cls_buf/dr 为栈缓冲。
+            let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) }.unwrap_or_default();
             let mut budget = 0usize;
             for _ in 0..1000 {
-                if w.0 == 0 {
+                if w.0.is_null() {
                     budget = usize::MAX;
                     break;
                 }
@@ -328,22 +116,22 @@ pub(crate) fn ensure_all_attached() {
                     || band_invisible(w, &vs)
                     || band_aux(w, host1, trayw)
                 {
-                    w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                    w = unsafe { GetWindow(w, GW_HWNDPREV) }.unwrap_or_default();
                     continue;
                 }
                 let mut cls_buf = [0u16; 32];
                 let n = unsafe { GetClassNameW(w, &mut cls_buf) };
                 out_of_band = true;
-                blocker = (w.0, class_hash(&cls_buf[..n.max(0) as usize]));
+                blocker = (w.0 as isize, class_hash(&cls_buf[..n.max(0) as usize]));
                 if to_move.is_empty() {
                     let mut dr = RECT::default();
                     let _ = unsafe { GetWindowRect(w, &mut dr) };
                     let own = s.windows.values().any(|v| *v == w);
                     log(&format!(
                         "walk-break: fence {id} host=0x{:x} blocked by cls={} own={} h=0x{:x} rect=({},{})-({},{}) vis={} iconic={}",
-                        host.hwnd.0,
+                        host.hwnd.0 as usize,
                         String::from_utf16_lossy(&cls_buf[..n.max(0) as usize]),
-                        own, w.0, dr.left, dr.top, dr.right, dr.bottom,
+                        own, w.0 as usize, dr.left, dr.top, dr.right, dr.bottom,
                         unsafe { IsWindowVisible(w).as_bool() },
                         unsafe { IsIconic(w).as_bool() }
                     ));
@@ -399,7 +187,7 @@ pub(crate) fn ensure_all_attached() {
                     };
                     log(&format!(
                         "walk-break: fence {id} host=0x{:x} NOT FOUND in {} steps ({}), strikes={}",
-                        host.hwnd.0, budget, why, strikes_n
+                        host.hwnd.0 as usize, budget, why, strikes_n
                     ));
                 }
                 if attempt {
@@ -417,6 +205,8 @@ pub(crate) fn ensure_all_attached() {
                 // z 序健康不代表未被最小化;纯 z 修复无法恢复 iconic 状态。
                 if unsafe { IsIconic(h) }.as_bool() {
                     let _z = z_scope(ZIntent::Restore);
+                    // SAFETY: h 是本进程栅栏窗口（walk 收集自 state.windows）；
+                    // z_scope 声明自家恢复意图，放行 z 守卫。
                     unsafe {
                         let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
                     }
@@ -448,10 +238,13 @@ pub(crate) fn ensure_all_attached() {
                         break;
                     }
                     tried += 1;
+                    // SAFETY: h 是本进程栅栏窗口；after 是 resolver 给出的
+                    // 安全锚点（绝不 topmost/坏锚）；z_scope(ZIntent::Repair)
+                    // 声明自家修复；NOMOVE|NOSIZE=纯 z 移动。
                     let attempt = unsafe {
                         SetWindowPos(
                             h,
-                            after,
+                            Some(after),
                             frect.x.round() as i32,
                             frect.y.round() as i32,
                             0,
@@ -466,7 +259,7 @@ pub(crate) fn ensure_all_attached() {
                             if tried > 1 {
                                 log(&format!(
                                     "repair fence {id} succeeded on retry #{tried} (anchor 0x{:x})",
-                                    after.0
+                                    after.0 as usize
                                 ));
                             }
                             break;
@@ -484,7 +277,7 @@ pub(crate) fn ensure_all_attached() {
                     if let Some((after, e)) = first_err {
                         log(&format!(
                             "repair FAILED fence {} h=0x{:x} after=0x{:x} err={:?}",
-                            id, h.0, after.0, e
+                            id, h.0 as usize, after.0 as usize, e
                         ));
                     }
                 }
@@ -492,15 +285,16 @@ pub(crate) fn ensure_all_attached() {
                     s.attached.insert(*id);
                     moved.push(*id);
                     // 修复后的局部遮挡诊断(64 步、矩形相交),不参与带位判定。
-                    let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) };
+                    // SAFETY: 走查链上同步查询，契约同上（栈缓冲/纯句柄调用）。
+                    let mut w = unsafe { GetWindow(host.hwnd, GW_HWNDPREV) }.unwrap_or_default();
                     for _ in 0..64 {
-                        if w.0 == 0 || w == h {
+                        if w.0.is_null() || w == h {
                             break;
                         }
                         let mut wr = RECT::default();
                         let _ = unsafe { GetWindowRect(w, &mut wr) };
                         if band_invisible(w, &vs) || band_aux(w, host1, trayw) {
-                            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+                            w = unsafe { GetWindow(w, GW_HWNDPREV) }.unwrap_or_default();
                             continue;
                         }
                         let fx0 = frect.x.round() as i32;
@@ -531,46 +325,6 @@ pub(crate) fn ensure_all_attached() {
     }
 }
 
-// ---------------- z 序意图守卫 ----------------
-
-/// 自家 SetWindowPos/ShowWindow 在 UI 线程同步触发定位消息,以线程局部
-/// 意图放行;外部经消息泵派发的操作到达时无此标记。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ZIntent {
-    /// 创建栅栏窗口并插入底带
-    Create,
-    /// 主动显示/刷新呈现
-    Show,
-    /// 拖拽提升/落点归位
-    Drag,
-    /// z 自愈修复
-    Repair,
-    /// 最小化兜底恢复
-    Restore,
-}
-
-thread_local! {
-    static Z_INTENT: std::cell::Cell<Option<ZIntent>> = const { std::cell::Cell::new(None) };
-}
-
-/// RAII 守卫:作用域内的窗口定位操作被拦截逻辑放行。嵌套时恢复前值。
-pub(crate) struct ZScope(Option<ZIntent>);
-
-pub(crate) fn z_scope(intent: ZIntent) -> ZScope {
-    let prev = Z_INTENT.with(|c| c.replace(Some(intent)));
-    ZScope(prev)
-}
-
-impl Drop for ZScope {
-    fn drop(&mut self) {
-        Z_INTENT.with(|c| c.set(self.0));
-    }
-}
-
-pub(crate) fn z_intent_active() -> bool {
-    Z_INTENT.with(|c| c.get().is_some())
-}
-
 /// 沉底兜底:从栅栏向上能遇宿主才归位。owned popup 由宿主管理下界;
 /// 此路径处理已经落地的异常,只选受限普通带锚点,没有 topmost 转换。
 /// 无状态锁,可在窗口过程直接调用。
@@ -581,9 +335,10 @@ pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
     if shell == hwnd {
         return;
     }
-    let mut w = unsafe { GetWindow(hwnd, GW_HWNDPREV) };
+    // SAFETY(走查链): GetWindow 同步向上取现存窗口，判空终止。
+    let mut w = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.unwrap_or_default();
     for _ in 0..400 {
-        if w.0 == 0 {
+        if w.0.is_null() {
             return;
         }
         if w == shell {
@@ -591,10 +346,12 @@ pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
                 return;
             };
             let _z = z_scope(ZIntent::Repair);
+            // SAFETY: hwnd 是本进程栅栏窗口；after 是受限锚点（resolver
+            // 排除宿主/自身/topmost/坏锚）；NOMOVE|NOSIZE=纯 z 修复。
             let attempt = unsafe {
                 SetWindowPos(
                     hwnd,
-                    after,
+                    Some(after),
                     0,
                     0,
                     0,
@@ -606,18 +363,18 @@ pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
                 bad_anchor_mark(after);
                 log(&format!(
                     "z-guard: re-anchor FAILED after=0x{:x} err={e:?} (anchor blacklisted)",
-                    after.0
+                    after.0 as usize
                 ));
                 return;
             }
             bad_anchor_clear(after);
             log(&format!(
                 "z-guard: fence re-anchored above host after external move (after=0x{:x})",
-                after.0
+                after.0 as usize
             ));
             return;
         }
-        w = unsafe { GetWindow(w, GW_HWNDPREV) };
+        w = unsafe { GetWindow(w, GW_HWNDPREV) }.unwrap_or_default();
     }
 }
 
@@ -625,9 +382,13 @@ pub(crate) fn fence_reanchor_if_below_host(hwnd: HWND) {
 // 外部 SHOW/HIDE/REORDER/MINIMIZE 事件只作触发器;合并后在 UI 线程实查。
 // SKIPOWNPROCESS 避免自家修复产生的事件再次触发自检。
 pub(crate) static ZCHECK_PENDING: AtomicBool = AtomicBool::new(false);
-pub(crate) static ZORDER_HOOKS: std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK)> =
-    std::sync::OnceLock::new();
+pub(crate) static ZORDER_HOOKS: SyncHandle<std::sync::OnceLock<(HWINEVENTHOOK, HWINEVENTHOOK)>> =
+    SyncHandle(std::sync::OnceLock::new());
 
+/// # Safety
+/// SetWinEventHook 的 OUTOFCONTEXT 回调：系统在**安装钩子的线程**（主线程
+/// 消息循环）同步调用；本实现不解引用任何实参（钩子句柄/事件参数全部
+/// 忽略），只做原子合并 + PostMessageW（无指针参数），O(1) 快速返回。
 unsafe extern "system" fn zorder_event_cb(
     _hook: HWINEVENTHOOK,
     _event: u32,
@@ -639,9 +400,14 @@ unsafe extern "system" fn zorder_event_cb(
 ) {
     // 批量事件只投递一条消息,回调保持 O(1)。
     if !ZCHECK_PENDING.swap(true, Ordering::Relaxed) {
-        let tray = TRAY_HWND.get().copied().unwrap_or(HWND(0));
-        if tray.0 != 0 {
-            let _ = PostMessageW(tray, WM_DL3_ZCHECK, WPARAM(0), LPARAM(0));
+        let tray = TRAY_HWND
+            .get()
+            .copied()
+            .unwrap_or(HWND(std::ptr::null_mut()));
+        if !tray.0.is_null() {
+            unsafe {
+                let _ = PostMessageW(Some(tray), WM_DL3_ZCHECK, WPARAM(0), LPARAM(0));
+            }
         } else {
             ZCHECK_PENDING.store(false, Ordering::Relaxed);
         }
@@ -650,11 +416,14 @@ unsafe extern "system" fn zorder_event_cb(
 
 /// 两组全局事件钩子覆盖桌面切换双向。LOCATIONCHANGE 过热,不采用。
 pub(crate) fn install_zorder_hooks() {
+    // SAFETY: zorder_event_cb 是匹配 WINEVENTPROC ABI 的回调；OUTOFCONTEXT
+    // 要求回调在安装线程（主线程）执行——由消息循环保证；句柄对存入
+    // OnceLock（进程终身不卸载）；SKIPOWNPROCESS 防自家修复自触发。
     let h1 = unsafe {
         SetWinEventHook(
             0x0016,
             0x0017,
-            HMODULE(0),
+            None,
             Some(zorder_event_cb),
             0,
             0,
@@ -665,14 +434,14 @@ pub(crate) fn install_zorder_hooks() {
         SetWinEventHook(
             0x8002,
             0x8004,
-            HMODULE(0),
+            None,
             Some(zorder_event_cb),
             0,
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
     };
-    if h1.0 == 0 || h2.0 == 0 {
+    if h1.0.is_null() || h2.0.is_null() {
         log("z-guard: winevent hook install failed");
     } else {
         let _ = ZORDER_HOOKS.set((h1, h2));
@@ -725,13 +494,14 @@ pub(crate) fn fence_lower_if_blocked(
     }
     let vs = virtual_screen_rect();
     let own: Vec<HWND> = state().lock().unwrap().windows.values().copied().collect();
-    let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) };
+    // SAFETY(走查链): GetWindow 同步向上取现存窗口；判空/遇自身即终止。
+    let mut w = unsafe { GetWindow(shell, GW_HWNDPREV) }.unwrap_or_default();
     for _ in 0..400 {
-        if w.0 == 0 || w == hwnd {
+        if w.0.is_null() || w == hwnd {
             return false;
         }
         if own.contains(&w) || band_invisible(w, &vs) || band_aux(w, *menu_host, *tray) {
-            w = unsafe { GetWindow(w, GW_HWNDPREV) };
+            w = unsafe { GetWindow(w, GW_HWNDPREV) }.unwrap_or_default();
             continue;
         }
         // 已有 blocker,不再以反向邻接检查把紧贴其上的栅栏放过。
@@ -740,10 +510,12 @@ pub(crate) fn fence_lower_if_blocked(
             return false;
         };
         let _z = z_scope(ZIntent::Repair);
+        // SAFETY: hwnd 是本进程栅栏窗口；after 是受限锚点（绝不 topmost/
+        // 坏锚）；z_scope(ZIntent::Repair) 声明自家修复；纯 z 移动。
         let attempt = unsafe {
             SetWindowPos(
                 hwnd,
-                after,
+                Some(after),
                 0,
                 0,
                 0,
@@ -755,14 +527,14 @@ pub(crate) fn fence_lower_if_blocked(
             bad_anchor_mark(after);
             log(&format!(
                 "z-guard: fence lower FAILED below 0x{:x} err={e:?} (anchor blacklisted)",
-                after.0
+                after.0 as usize
             ));
             return false;
         }
         bad_anchor_clear(after);
         log(&format!(
             "z-guard: fence lowered below anchor 0x{:x} (blocker=0x{:x})",
-            after.0, w.0
+            after.0 as usize, w.0 as usize
         ));
         return true;
     }
@@ -771,179 +543,10 @@ pub(crate) fn fence_lower_if_blocked(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_band_anchor, walk_repair_due, AnchorWindow, WalkFault};
+    use super::{walk_repair_due, WalkFault};
 
-    const HOST: isize = 1;
-    const FENCE: isize = 2;
-
-    fn window(handle: isize) -> AnchorWindow {
-        AnchorWindow {
-            handle,
-            ..Default::default()
-        }
-    }
-    fn padding(handle: isize) -> AnchorWindow {
-        AnchorWindow {
-            invisible: true,
-            ..window(handle)
-        }
-    }
     fn blocked() -> WalkFault {
         WalkFault::Blocked { hwnd: 3, class: 4 }
-    }
-
-    #[test]
-    fn shallow_visible_window_is_hard_boundary() {
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [window(3), padding(4), window(5)]),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn bad_visible_anchor_uses_only_preceding_padding() {
-        let bad = AnchorWindow {
-            bad: true,
-            ..window(4)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [padding(3), bad, padding(5), window(6)]),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn bad_anchor_without_safe_padding_returns_none() {
-        let bad = AnchorWindow {
-            bad: true,
-            ..window(3)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [bad, window(HOST), padding(4)]),
-            None
-        );
-    }
-
-    #[test]
-    fn host_boundary_cannot_be_crossed_or_used_as_anchor() {
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [window(HOST), padding(3)]),
-            None
-        );
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [padding(3), window(HOST), padding(4)]),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn topmost_boundary_returns_only_non_topmost_padding() {
-        for invisible in [false, true] {
-            let topmost = AnchorWindow {
-                topmost: true,
-                invisible,
-                ..window(4)
-            };
-            assert_eq!(
-                resolve_band_anchor(HOST, FENCE, [padding(3), topmost, window(5)]),
-                Some(3)
-            );
-        }
-    }
-
-    #[test]
-    fn topmost_without_padding_has_no_anchor() {
-        let topmost = AnchorWindow {
-            topmost: true,
-            ..window(3)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [topmost, padding(4)]),
-            None
-        );
-    }
-
-    #[test]
-    fn self_is_excluded_from_every_candidate_kind() {
-        for own in [false, true] {
-            for invisible in [false, true] {
-                let me = AnchorWindow {
-                    own,
-                    invisible,
-                    ..window(FENCE)
-                };
-                assert_eq!(resolve_band_anchor(HOST, FENCE, [me]), None);
-                assert_eq!(resolve_band_anchor(HOST, FENCE, [me, window(3)]), Some(3));
-            }
-        }
-    }
-
-    #[test]
-    fn bad_padding_and_bad_siblings_are_never_returned() {
-        let bad_padding = AnchorWindow {
-            bad: true,
-            ..padding(4)
-        };
-        let bad_sibling = AnchorWindow {
-            own: true,
-            bad: true,
-            ..window(5)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [padding(3), bad_padding, bad_sibling]),
-            Some(3)
-        );
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [bad_padding, bad_sibling]),
-            None
-        );
-    }
-
-    #[test]
-    fn safe_sibling_is_fallback_below_bad_visible_window() {
-        let sibling = AnchorWindow {
-            own: true,
-            ..window(3)
-        };
-        let bad = AnchorWindow {
-            bad: true,
-            ..window(4)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [sibling, bad, padding(5)]),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn retry_after_blacklisting_stays_below_original_boundary() {
-        let first = window(4);
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [padding(3), first, window(5)]),
-            Some(4)
-        );
-        let rejected = AnchorWindow { bad: true, ..first };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [padding(3), rejected, window(5)]),
-            Some(3)
-        );
-        let rejected_padding = AnchorWindow {
-            bad: true,
-            ..padding(3)
-        };
-        assert_eq!(
-            resolve_band_anchor(HOST, FENCE, [rejected_padding, rejected, window(5)]),
-            None
-        );
-    }
-
-    #[test]
-    fn adjacent_visible_blocker_remains_a_lowering_anchor() {
-        let me = AnchorWindow {
-            own: true,
-            ..window(FENCE)
-        };
-        assert_eq!(resolve_band_anchor(HOST, FENCE, [window(3), me]), Some(3));
     }
 
     #[test]
@@ -965,12 +568,5 @@ mod tests {
     fn sunk_fence_repairs_immediately_but_budget_exhaustion_does_not() {
         assert!(walk_repair_due(WalkFault::NotFoundTop, 1, false));
         assert!(!walk_repair_due(WalkFault::NotFoundBudget, 3, true));
-    }
-
-    /// 手编 UTF-16 类名须与分类面板实际注册名一致。
-    #[test]
-    fn cats_panel_class_encoding_matches_registered_name() {
-        let expect: Vec<u16> = "DeskFenceCatsPanel".encode_utf16().collect();
-        assert_eq!(super::CATS_PANEL_CLASS.to_vec(), expect);
     }
 }

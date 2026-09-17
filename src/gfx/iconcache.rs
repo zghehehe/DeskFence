@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::{model, ui};
+use crate::{logging, model, state};
 
 pub(crate) fn icon_cache_path() -> std::path::PathBuf {
     model::config_dir().join("iconcache.bin")
@@ -18,17 +18,16 @@ pub(crate) fn icon_cache_path() -> std::path::PathBuf {
 /// 加载时逐条校验,不符即丢弃该条(防御旧版/损坏文件)。
 const ICON_ENTRY_MAX_BYTES: usize = 4 * 256 * 256;
 
-/// 加载持久化图标/显示名缓存,返回 (图标命中表, 显示名命中表)。
-pub(crate) fn load_icon_cache_file(
-    raw: &[model::FileItem],
+/// 解码 iconcache.bin 字节流(纯核,2026-09-16 提取供集成测试):
+/// expect_mtime=本次扫描的 path→mtime(校验"路径在册且 mtime 一致")。
+/// 头不符/版本不符/px 荒谬=整表丢弃;单条不合规只跳过该条。
+pub fn decode_cache(
+    buf: &[u8],
+    expect_mtime: &HashMap<&str, u64>,
 ) -> (HashMap<String, Vec<u8>>, HashMap<String, String>) {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(icon_cache_path()) {
-        Ok(f) => f,
-        Err(_) => return Default::default(),
-    };
-    let mut buf = Vec::new();
-    if f.read_to_end(&mut buf).is_err() || buf.len() < 12 || &buf[0..4] != b"DFIC" {
+    let mut icons: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    if buf.len() < 12 || &buf[0..4] != b"DFIC" {
         return Default::default();
     }
     let ver = u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
@@ -47,9 +46,6 @@ pub(crate) fn load_icon_cache_file(
             .unwrap_or([0; 4]),
     ) as usize;
     let mut off = 16usize;
-    let mut icons: HashMap<String, Vec<u8>> = HashMap::new();
-    let expect_mtime: HashMap<&str, u64> =
-        raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
     for _ in 0..count.min(8192) {
         if off + 2 > buf.len() {
             break;
@@ -81,7 +77,6 @@ pub(crate) fn load_icon_cache_file(
         off += blen;
     }
     // 第二段:显示名表(path→display)。段头 magic 缺失不算错误(纯图标版兼容)。
-    let mut names: HashMap<String, String> = HashMap::new();
     if off + 4 <= buf.len() && &buf[off..off + 4] == b"DFNM" {
         off += 4;
         if off + 4 <= buf.len() {
@@ -116,7 +111,57 @@ pub(crate) fn load_icon_cache_file(
             }
         }
     }
-    ui::log(&format!(
+    (icons, names)
+}
+
+/// 编码 iconcache.bin 字节流(纯核,与 decode_cache 互逆):
+/// entries=(key,mtime,bytes),names=(path,display);文件头单值 px。
+pub fn encode_cache(
+    entries: &[(String, u64, Vec<u8>)],
+    names: &[(String, String)],
+    px: u32,
+) -> Vec<u8> {
+    let total: usize = entries.iter().map(|e| e.2.len()).sum();
+    let mut buf: Vec<u8> = Vec::with_capacity(total + 4096);
+    buf.extend_from_slice(b"DFIC");
+    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&px.to_le_bytes());
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (key, mtime, bytes) in entries {
+        buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&mtime.to_le_bytes());
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+    buf.extend_from_slice(b"DFNM");
+    buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for (p, d) in names {
+        buf.extend_from_slice(&(p.len() as u16).to_le_bytes());
+        buf.extend_from_slice(p.as_bytes());
+        buf.extend_from_slice(&(d.len() as u16).to_le_bytes());
+        buf.extend_from_slice(d.as_bytes());
+    }
+    buf
+}
+
+/// 加载持久化图标/显示名缓存,返回 (图标命中表, 显示名命中表)。
+pub(crate) fn load_icon_cache_file(
+    raw: &[model::FileItem],
+) -> (HashMap<String, Vec<u8>>, HashMap<String, String>) {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(icon_cache_path()) {
+        Ok(f) => f,
+        Err(_) => return Default::default(),
+    };
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return Default::default();
+    }
+    let expect_mtime: HashMap<&str, u64> =
+        raw.iter().map(|f| (f.path.as_str(), f.mtime_ms)).collect();
+    let (icons, names) = decode_cache(&buf, &expect_mtime);
+    logging::log(&format!(
         "boot icon cache loaded: icons={} names={}",
         icons.len(),
         names.len()
@@ -134,7 +179,7 @@ pub(crate) fn save_icon_cache_file_now(px_expected: u32) {
     let mut entries: Vec<(String, u64, std::sync::Arc<Vec<u8>>)> = Vec::new();
     let mut names: Vec<(String, String)> = Vec::new();
     {
-        let s = ui::state().lock().unwrap();
+        let s = state::state().lock().unwrap();
         let by_path: HashMap<&str, &model::FileItem> =
             s.files.iter().map(|f| (f.path.as_str(), f)).collect();
         for (key, buf) in s.icon_cache.iter() {
@@ -165,30 +210,14 @@ pub(crate) fn save_icon_cache_file_now(px_expected: u32) {
         entries.sort_by_key(|(_, mt, _)| *mt);
         entries.drain(..entries.len() - 512);
     }
-    // 2) 后台序列化+写盘
+    // 2) 后台序列化(纯核 encode_cache)+写盘
     std::thread::spawn(move || {
         use std::io::Write;
-        let total: usize = entries.iter().map(|e| e.2.len()).sum();
-        let mut buf: Vec<u8> = Vec::with_capacity(total + 4096);
-        buf.extend_from_slice(b"DFIC");
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&px_expected.to_le_bytes());
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        for (key, mtime, bytes) in &entries {
-            buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(&mtime.to_le_bytes());
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-        buf.extend_from_slice(b"DFNM");
-        buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
-        for (p, d) in &names {
-            buf.extend_from_slice(&(p.len() as u16).to_le_bytes());
-            buf.extend_from_slice(p.as_bytes());
-            buf.extend_from_slice(&(d.len() as u16).to_le_bytes());
-            buf.extend_from_slice(d.as_bytes());
-        }
+        let entries: Vec<(String, u64, Vec<u8>)> = entries
+            .iter()
+            .map(|(k, m, b)| (k.clone(), *m, b.as_ref().clone()))
+            .collect();
+        let buf = encode_cache(&entries, &names, px_expected);
         let path = icon_cache_path();
         let tmp = path.with_extension("bin.tmp");
         let ok = std::fs::File::create(&tmp)
@@ -199,7 +228,7 @@ pub(crate) fn save_icon_cache_file_now(px_expected: u32) {
             .and_then(|()| std::fs::rename(&tmp, &path))
             .is_ok();
         if !ok {
-            ui::log("icon cache save failed");
+            logging::log("icon cache save failed");
         }
     });
 }

@@ -4,13 +4,13 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::core::{ComInterface, PCSTR, PCWSTR, PSTR};
+use windows::core::{Interface, BOOL, PCSTR, PCWSTR, PSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    BITMAPINFO, DIB_RGB_COLORS, LOGFONTW,
+    BITMAPINFO, DIB_RGB_COLORS, HGDIOBJ, LOGFONTW,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, GetFileAttributesW, ReadDirectoryChangesW, FILE_ATTRIBUTE_HIDDEN,
@@ -55,18 +55,33 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// shell 模块日志(转 ui::log 落盘)
+/// shell 模块日志(转 logging::log 落盘)
 fn log(line: &str) {
-    crate::ui::log(line);
+    crate::logging::log(line);
 }
 
-/// 读取系统桌面原生图标尺寸（像素）：HKCU\...\Bags\1\Desktop\IconSize，失败回退 32
+/// 读取系统桌面原生图标尺寸（像素）：HKCU\...\Bags\1\Desktop\IconSize。
+/// 缺失/无效回退 48:Windows 默认视图就是"中等图标"=48,从未 Ctrl+滚轮
+/// 过的新配置档常常没有该值——回退 32 会让栅栏图标比原生小一号,而实测
+/// 格距的留白补偿会把格子尺寸修正到与原生一致,形成"格子对、图标小"
+/// 的掩蔽组合(2026-09-16 用户实拍,勿回退 32)。
+/// IconSize 注册表值归一(纯核):8..=256 生效,缺失/越界回退 48
+/// (48=Windows"中等图标"默认;勿回退 32,见 desktop_icon_size 注释)
+pub fn icon_size_or_default(v: Option<u32>) -> f32 {
+    match v {
+        Some(v) if (8..=256).contains(&v) => v as f32,
+        _ => 48.0,
+    }
+}
+
 pub fn desktop_icon_size() -> f32 {
     let mut v: u32 = 0;
     let mut sz = std::mem::size_of::<u32>() as u32;
     let key = wide(r"Software\Microsoft\Windows\Shell\Bags\1\Desktop");
     let val = wide("IconSize");
     let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+    // SAFETY: key/val 是 NUL 结尾宽串（wide()），调用期间存活；v/sz/ty 是
+    // 栈上输出槽位；RRF_RT_REG_DWORD 限定类型不匹配即失败，不写 v。
     let ok = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -79,16 +94,21 @@ pub fn desktop_icon_size() -> f32 {
         )
         .is_ok()
     };
-    if ok && (8..=256).contains(&v) {
-        v as f32
-    } else {
-        32.0
-    }
+    icon_size_or_default(if ok { Some(v) } else { None })
 }
 
 /// 读取 WindowMetrics\IconSpacing / IconVerticalSpacing（REG_SZ，如 "-1130"）。
 /// 两个值都转换为相对于 32px 图标的逻辑留白；缺失或无效时使用
 /// 紧凑的保守回退，避免把失效的系统值放大成栅栏内的大块空白。
+/// IconSpacing/IconVerticalSpacing 字符串解析(纯核):twips(如 "-1130")
+/// → |v|/15 像素 → 扣 32px 基准图标得留白 → 钳 16..96;不可解析=None
+pub fn spacing_pad_from_twips(s: &str) -> Option<f32> {
+    let v = s.trim().parse::<i32>().ok()?;
+    let px = (v.unsigned_abs() as f32) / 15.0; // twips → 像素
+    let pad = px - 32.0; // 扣除 32px 基准图标，得到留白
+    Some(pad.clamp(16.0, 96.0))
+}
+
 pub fn desktop_cell_pads() -> (f32, f32) {
     let read = |name: &str| -> Option<f32> {
         let key = wide(r"Control Panel\Desktop\WindowMetrics");
@@ -96,6 +116,9 @@ pub fn desktop_cell_pads() -> (f32, f32) {
         let mut buf = [0u16; 32];
         let mut sz = (buf.len() * 2) as u32;
         let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+        // SAFETY: 字符串参数同 desktop_icon_size；buf 是 64 字节栈缓冲、
+        // sz 先传字节数——值长于缓冲时 API 返回失败（不越界写），
+        // from_utf16 前按 NUL 截断。
         let ok = unsafe {
             RegGetValueW(
                 HKEY_CURRENT_USER,
@@ -113,10 +136,7 @@ pub fn desktop_cell_pads() -> (f32, f32) {
         }
         let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         let s = String::from_utf16_lossy(&buf[..end]);
-        let v = s.trim().parse::<i32>().ok()?;
-        let px = (v.unsigned_abs() as f32) / 15.0; // twips → 像素
-        let pad = px - 32.0; // 扣除 32px 基准图标，得到留白
-        Some(pad.clamp(16.0, 96.0))
+        spacing_pad_from_twips(&s)
     };
     (
         read("IconSpacing").unwrap_or(32.0),
@@ -131,6 +151,7 @@ fn explorer_dword(sub: &str, name: &str) -> Option<u32> {
     let mut v: u32 = 0;
     let mut sz = std::mem::size_of::<u32>() as u32;
     let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+    // SAFETY: 同 desktop_icon_size：NUL 宽串 + 栈输出槽位，类型限定失败即不写。
     let ok = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -161,9 +182,27 @@ pub fn show_super_hidden() -> bool {
         "ShowSuperHidden",
     ) == Some(1)
 }
+/// LOGFONT.lfHeight → 图标名字号像素(纯核):负值本身即像素字符高度
+/// (已随 DPI 缩放,不能再按磅值换算乘 DPI,否则字号双重放大);
+/// 0=回退 12;结果钳 8..48
+pub fn font_px_from_lfheight(lf_height: i32) -> f32 {
+    let px = if lf_height < 0 {
+        -(lf_height as f32)
+    } else if lf_height > 0 {
+        lf_height as f32
+    } else {
+        12.0
+    };
+    px.clamp(8.0, 48.0)
+}
+
 /// Read Explorer's configured desktop icon caption font.
 pub fn desktop_icon_font() -> (String, f32, i32) {
+    // SAFETY: 全零 LOGFONTW 是合法初始值（纯数据结构，无引用/指针字段）；
+    // SPI_GETICONTITLELOGFONT 契约：pvParam 指向 LOGFONTW、uiParam 传其
+    // 字节数；lf 是栈变量，调用期间有效；lfFaceName 定长数组按 NUL 截断。
     let mut lf: LOGFONTW = unsafe { std::mem::zeroed() };
+    // SAFETY: 同上。
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETICONTITLELOGFONT,
@@ -182,28 +221,22 @@ pub fn desktop_icon_font() -> (String, f32, i32) {
         .position(|c| *c == 0)
         .unwrap_or(lf.lfFaceName.len());
     let family = String::from_utf16_lossy(&lf.lfFaceName[..end]);
-    // LOGFONT.lfHeight 负值本身即为像素字符高度（已随 DPI 缩放，如 96DPI 下 -12≈9pt），
-    // 不能再按磅值换算乘 DPI，否则字号被双重放大
-    let px = if lf.lfHeight < 0 {
-        -(lf.lfHeight as f32)
-    } else if lf.lfHeight > 0 {
-        (lf.lfHeight as f32).abs()
-    } else {
-        12.0
-    };
     (
         if family.is_empty() {
             "Segoe UI".into()
         } else {
             family
         },
-        px.clamp(8.0, 48.0),
+        font_px_from_lfheight(lf.lfHeight),
         lf.lfWeight,
     )
 }
 
 /// 桌面目录（已知文件夹优先，回退 USERPROFILE\Desktop）
 pub fn desktop_dir() -> Option<std::path::PathBuf> {
+    // SAFETY(整块): SHGetKnownFolderPath 成功时返回 CoTaskMemAlloc 分配的
+    // PWSTR，所有权归调用方——本函数读完后必须且只用 CoTaskMemFree 释放
+    // 一次（p 不再被使用）；to_string 沿 NUL 扫描只读。
     let p: windows::core::PWSTR = unsafe {
         match SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) {
             Ok(pw) if !pw.is_null() => pw,
@@ -215,6 +248,7 @@ pub fn desktop_dir() -> Option<std::path::PathBuf> {
         }
     };
     let s = unsafe { p.to_string() }.unwrap_or_default();
+    // SAFETY: 承接上方所有权论证：释放 COM 分配的路径串（仅此一次）。
     unsafe {
         CoTaskMemFree(Some(p.as_ptr() as *const _));
     }
@@ -228,11 +262,14 @@ pub fn desktop_dir() -> Option<std::path::PathBuf> {
 }
 
 fn public_desktop_dir() -> Option<std::path::PathBuf> {
+    // SAFETY: 所有权约定同 desktop_dir：成功路径的 PWSTR 由本函数
+    // CoTaskMemFree 配对释放一次。
     let p = unsafe { SHGetKnownFolderPath(&FOLDERID_PublicDesktop, KF_FLAG_DEFAULT, None).ok()? };
     if p.is_null() {
         return None;
     }
     let s = unsafe { p.to_string() }.unwrap_or_default();
+    // SAFETY: 承接上方：COM 分配的串只释放这一次。
     unsafe {
         CoTaskMemFree(Some(p.as_ptr() as *const _));
     }
@@ -245,8 +282,12 @@ fn public_desktop_dir() -> Option<std::path::PathBuf> {
 
 /// Ask Shell for the same user-facing name Explorer uses (for example, hide .lnk).
 fn shell_display_name(path: &std::path::Path, fallback: &str) -> String {
+    // SAFETY: 全零 SHFILEINFOW 合法（纯数据结构）；SHGFI_DISPLAYNAME 契约：
+    // psfi 指向调用方缓冲、cbFileInfo 传其大小；w 是 NUL 宽串；
+    // szDisplayName 定长数组按 NUL 截断。
     let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let w = wide(&path.to_string_lossy());
+    // SAFETY: 同上。
     let ok = unsafe {
         SHGetFileInfoW(
             PCWSTR::from_raw(w.as_ptr()),
@@ -418,6 +459,9 @@ pub fn resolve_display_names(
             let (chunk, tail) = rest.split_at_mut(take);
             rest = tail;
             handles.push(scope.spawn(move || {
+                // SAFETY: COM 初始化/反初始化必须按线程配对：本块在本工作线程
+                // 开头 init、结尾 CoUninitialize，中间的 SHGFI 调用落在已初始化
+                // 的 STA 线程上；"已初始化"的返回被忽略（配对计数仍平衡）。
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 }
@@ -430,6 +474,7 @@ pub fn resolve_display_names(
                     let fallback = f.name.clone();
                     f.name = shell_display_name(&p, &fallback);
                 }
+                // SAFETY: 与线程开头的 CoInitializeEx 配对（见上）。
                 unsafe {
                     windows::Win32::System::Com::CoUninitialize();
                 }
@@ -465,6 +510,8 @@ pub fn prewarm_icon_cache(paths: &[String], px: f32) -> std::collections::HashMa
         for t in 0..threads {
             let slice = &paths[t * per..((t + 1) * per).min(n)];
             handles.push(scope.spawn(move || {
+                // SAFETY: COM init/uninit 按线程配对（论证同
+                // resolve_display_names 的工作线程）。
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 }
@@ -473,6 +520,7 @@ pub fn prewarm_icon_cache(paths: &[String], px: f32) -> std::collections::HashMa
                 for p in slice {
                     crate::render::get_icon_buffer(&mut local, p, px);
                 }
+                // SAFETY: 与线程开头的 CoInitializeEx 配对。
                 unsafe {
                     windows::Win32::System::Com::CoUninitialize();
                 }
@@ -512,6 +560,11 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
     // 首选:SHGFI_ICON|SHGFI_ADDOVERLAYS 一步拿到"已合成快捷方式箭头"的完整图标,
     // 尺寸随系统 DPI 缩放(150% 下即 48px,与原生桌面一致)。要求与目标尺寸吻合,
     // 否则会有二次缩放导致模糊。
+    // SAFETY(整块): 全零 SHFILEINFOW 合法；SHGetFileInfoW 的 psfi/cbFileInfo
+    // 按契约传栈缓冲与大小，w 为 NUL 宽串；成功时 hIcon 所有权移交本函数→
+    // 直接返回给调用方（由调用方 DestroyIcon）；SHGetImageList 返回的
+    // IImageList 是 COM 包装，离开作用域自动 Release；list.GetIcon 产出的
+    // HICON 同样移交调用方。
     let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let w = wide(path);
     let sys_icon_px = unsafe { GetSystemMetrics(SM_CXICON) } as u32;
@@ -525,13 +578,14 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
                 SHGFI_ICON | SHGFI_LARGEICON | SHGFI_ADDOVERLAYS,
             )
         } != 0;
-        if ok && sfi.hIcon.0 != 0 {
+        if ok && !sfi.hIcon.0.is_null() {
             return Some(sfi.hIcon);
         }
     }
     // 兜底:按"实测尺寸"挑最接近目标 px 的 shell 图像列表档位。
     // 不能按逻辑档位名挑(150% DPI 下 SHIL_LARGE 实际是 48px、EXTRALARGE 是 72px,
     // 按名字挑会拿 72px 图标再缩到 48 → 模糊)。
+    // SAFETY: 参数契约同上（栈缓冲+NUL 宽串）。
     let mut sfi2: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         SHGetFileInfoW(
@@ -557,6 +611,9 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
     ];
     let mut lists = Vec::new();
     for kind in KINDS {
+        // SAFETY: SHGetImageList 返回系统图像列表的 COM 包装（drop 自动
+        // Release）；GetIconSize 的 cx/cy 是栈输出槽位；GetIcon 的
+        // INDEXTOOVERLAYMASK 位拼装见上方 draw_flags。
         unsafe {
             let Ok(list) = SHGetImageList::<IImageList>(kind as i32) else {
                 continue;
@@ -574,6 +631,8 @@ pub fn get_system_icon_hicon(path: &str, target_px: u32) -> Option<HICON> {
     }
     let selected_size = select_image_size(lists.iter().map(|(_, size)| *size), target_px)?;
     let (list, _) = lists.into_iter().find(|(_, size)| *size == selected_size)?;
+    // SAFETY: list 是有效的系统图像列表 COM 包装；产出的 HICON 所有权
+    // 移交调用方（由调用方 DestroyIcon）。
     unsafe { list.GetIcon(image_index, draw_flags).ok() }
 }
 
@@ -609,6 +668,10 @@ pub fn icon_dump(path: &str, prefix: &str) {
     }
 
     fn hicon_size(h: HICON) -> (i32, i32) {
+        // SAFETY: ii/bm 为全零栈结构；GetIconInfo 契约——hIcon 有效、
+        // piconinfo 指向调用方 ICONINFO；成功时其中 hbmColor/hbmMask 两个
+        // GDI 位图所有权移交调用方（随后 DeleteObject 配对释放，失败路径
+        // 也释放）；GetObjectW 只按 BITMAP 大小读位图头。
         unsafe {
             let mut ii: ICONINFO = std::mem::zeroed();
             if GetIconInfo(h, &mut ii).is_ok() {
@@ -632,6 +695,10 @@ pub fn icon_dump(path: &str, prefix: &str) {
         }
     }
 
+    // SAFETY(整块): 诊断路径，与生产同一套契约：COM init 无配对 uninit
+    // （进程即将退出，诊断命令路径无影响）；zeroed 结构合法；SHGFI 参数
+    // 契约同 get_system_icon_hicon；GetIcon 产出的 HICON 用完当场
+    // DestroyIcon（不泄漏）。
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         // 与 ui::init 相同的 DPI 感知,否则 SM_CXICON 被虚拟化成 96dpi 的 32
@@ -651,7 +718,7 @@ pub fn icon_dump(path: &str, prefix: &str) {
             size_of_val(&sfi) as u32,
             SHGFI_ICON | SHGFI_LARGEICON | SHGFI_ADDOVERLAYS,
         ) != 0;
-        if ok && sfi.hIcon.0 != 0 {
+        if ok && !sfi.hIcon.0.is_null() {
             println!("v1_shgfi real_hicon_size={:?}", hicon_size(sfi.hIcon));
             if let Some(b) = crate::render::icon_pixels(sfi.hIcon, px) {
                 save_dump(&format!("{prefix}_v1_shgfi"), &b, px, px);
@@ -707,6 +774,9 @@ pub fn icon_dump(path: &str, prefix: &str) {
             }
         }
         println!("icondump done");
+        // SAFETY: 与函数开头的 CoInitializeEx 配对(2026-09-17 补,
+        // 让"init/uninit 按线程配对"在诊断路径同样成立)。
+        windows::Win32::System::Com::CoUninitialize();
     }
 }
 
@@ -719,6 +789,8 @@ pub fn get_icon_bitmap(
         return None;
     }
     let w = wide(path);
+    // SAFETY: w 是 NUL 宽串（SHCreateItemFromParsingName 同步读）；
+    // GetImage 产出的 HBITMAP 所有权移交调用方（由调用方 DeleteObject）。
     unsafe {
         let factory: IShellItemImageFactory =
             SHCreateItemFromParsingName(PCWSTR::from_raw(w.as_ptr()), None).ok()?;
@@ -736,9 +808,12 @@ pub fn get_icon_bitmap(
 
 /// 旧版 Shell 接口降级路径。仅在按尺寸图像工厂失败时使用。
 pub fn get_icon_hicon(path: &str) -> Option<HICON> {
+    // SAFETY: 全零 SHFILEINFOW 合法；SHGFI 参数契约同 get_system_icon_hicon；
+    // 成功时 hIcon 所有权移交调用方。
     let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
     let flags = SHGFI_ICON | SHGFI_LARGEICON | SHGFI_ADDOVERLAYS;
     let w = wide(path);
+    // SAFETY: 同上。
     unsafe {
         SHGetFileInfoW(
             PCWSTR::from_raw(w.as_ptr()),
@@ -748,7 +823,7 @@ pub fn get_icon_hicon(path: &str) -> Option<HICON> {
             flags,
         );
     }
-    if sfi.hIcon.0 == 0 {
+    if sfi.hIcon.0.is_null() {
         None
     } else {
         Some(sfi.hIcon)
@@ -758,6 +833,8 @@ pub fn get_icon_hicon(path: &str) -> Option<HICON> {
 /// 打开文件或目录（双击图标）
 pub fn open_path(path: &str) {
     let w = wide(path);
+    // SAFETY: info 为全零+cbSize 按契约填充；lpFile 指向 NUL 宽串 w
+    // （同步调用，期间存活）；SHELLEXECUTEINFOW 其余字段为 0/null 合法。
     unsafe {
         // 与 Explorer 双击一致:不给动词、带 SEE_MASK_INVOKEIDLIST,
         // 由 shell 调用默认动词(部分条目默认动词不是 "open")
@@ -775,9 +852,10 @@ pub fn open_path(path: &str) {
 pub fn open_recycle_bin() {
     let file = wide(crate::model::RECYCLE_BIN_PATH);
     let verb = wide("open");
+    // SAFETY: 三个宽串均 NUL 结尾且在同步调用期间存活；其余参数为 null 合法。
     unsafe {
         let _ = ShellExecuteW(
-            HWND(0),
+            None,
             PCWSTR::from_raw(verb.as_ptr()),
             PCWSTR::from_raw(file.as_ptr()),
             PCWSTR::null(),
@@ -793,9 +871,10 @@ pub fn open_in_explorer(path: &str) {
     let sel = format!("/select,\"{}\"", path);
     let params = wide(&sel);
     let op = wide("open");
+    // SAFETY: 同 open_recycle_bin：NUL 宽串在同步调用期间存活。
     unsafe {
         ShellExecuteW(
-            HWND::default(),
+            None,
             PCWSTR::from_raw(op.as_ptr()),
             PCWSTR::from_raw(w.as_ptr()),
             PCWSTR::from_raw(params.as_ptr()),
@@ -810,9 +889,10 @@ pub fn open_in_explorer(path: &str) {
 pub fn open_url(url: &str) {
     let verb = wide("open");
     let target = wide(url);
+    // SAFETY: 同 open_recycle_bin：NUL 宽串在同步调用期间存活。
     unsafe {
         let _ = ShellExecuteW(
-            HWND(0),
+            None,
             PCWSTR::from_raw(verb.as_ptr()),
             PCWSTR::from_raw(target.as_ptr()),
             PCWSTR::null(),
@@ -825,6 +905,7 @@ pub fn open_url(url: &str) {
 /// 追加一个菜单项
 pub fn append_menu(menu: HMENU, id: u32, text: &str) {
     let w = wide(text);
+    // SAFETY: menu 是调用方持有的有效菜单；AppendMenuW 同步复制 w 字符串。
     unsafe {
         let _ = AppendMenuW(
             menu,
@@ -838,12 +919,14 @@ pub fn append_menu(menu: HMENU, id: u32, text: &str) {
 /// 追加一个带勾选标记的菜单项
 pub fn append_menu_checked(menu: HMENU, id: u32, text: &str) {
     let w = wide(text);
+    // SAFETY: 同 append_menu：有效菜单 + 同步复制的 NUL 宽串。
     unsafe {
         let _ = AppendMenuW(menu, MF_CHECKED, id as usize, PCWSTR::from_raw(w.as_ptr()));
     }
 }
 
 pub fn append_separator(menu: HMENU) {
+    // SAFETY: 分隔项无字符串指针；menu 是调用方持有的有效菜单。
     unsafe {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
@@ -853,6 +936,8 @@ pub fn append_separator(menu: HMENU) {
 /// 如"✓ 自动分类 ▸"):父项点击只能展开子菜单,不承载命令(Win32 语义)
 pub fn append_submenu_checked(menu: HMENU, text: &str, submenu: HMENU) {
     let w = wide(text);
+    // SAFETY: MF_POPUP 下 usize 参数承载子菜单句柄（Win32 语义）；
+    // 其余同 append_menu。
     unsafe {
         let _ = AppendMenuW(
             menu,
@@ -866,6 +951,7 @@ pub fn append_submenu_checked(menu: HMENU, text: &str, submenu: HMENU) {
 /// 追加一个弹出式子菜单(如"排序 ▸")
 pub fn append_submenu(menu: HMENU, text: &str, submenu: HMENU) {
     let w = wide(text);
+    // SAFETY: 同 append_submenu_checked。
     unsafe {
         let _ = AppendMenuW(
             menu,
@@ -877,9 +963,11 @@ pub fn append_submenu(menu: HMENU, text: &str, submenu: HMENU) {
 }
 
 fn track_popup(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
+    // SAFETY: menu 是调用方构建的有效菜单、hwnd 是前台化过的 owner
+    //（见 menu_foreground 前置条件）；TPM_RETURNCMD 模式同步返回命令 id。
     unsafe {
         // 默认左键选择 + 返回命令 id（不带 TPM_RIGHTBUTTON，避免左键点菜单项不触发）
-        let r = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, 0, hwnd, None);
+        let r = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, None, hwnd, None);
         if r.0 != 0 {
             r.0 as u32
         } else {
@@ -892,18 +980,20 @@ fn track_popup(menu: HMENU, hwnd: HWND, x: i32, y: i32) -> u32 {
 
 // Shell 菜单命令 id 区间:idCmdFirst 必须小于 idCmdLast(曾因 0x8000>0x7FFF 的
 // 倒挂区间导致扩展与默认动词全部跳过注册,菜单只剩 8 项)。上限 0x5FFF 避开
-// DeskFence 自有命令 id(0x6001+)。
-const CMD_FIRST: u32 = 1;
-const CMD_LAST: u32 = 0x5FFF;
+// DeskFence 自有命令 id(0x6001+)。(2026-09-16 提 pub 供 tests/ 断言区间)
+pub const CMD_FIRST: u32 = 1;
+pub const CMD_LAST: u32 = 0x5FFF;
 /// 注入的"重命名"菜单项 id(在 shell 动词区间与 DL_CMD 之外)
-const DL_ITEM_RENAME_ID: u32 = 0x6008;
+pub const DL_ITEM_RENAME_ID: u32 = 0x6008;
 
 /// "重命名"由 Explorer 桌面视图层(DefView)注入,纯 IContextMenu 菜单不含它;
 /// 在"删除"与"属性"之间补上同款菜单项,保持与原生逐项一致。文案跟随系统
 /// 安装语言(zh-CN:重命名(&M),其余:Rename)。
 fn inject_rename_item(menu: HMENU, ctx: &IContextMenu) {
+    // SAFETY: menu 是有效菜单；GetMenuItemID/InsertMenuW 按位置操作菜单
+    // （同步）；w 是 NUL 宽串；ctx 只被 verb_is_rename 只读查询。
     unsafe {
-        let count = GetMenuItemCount(menu);
+        let count = GetMenuItemCount(Some(menu));
         if count < 3 {
             return;
         }
@@ -938,6 +1028,9 @@ pub fn forward_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<
     ACTIVE_CONTEXT_MENU.with(|slot| {
         let ctx = slot.borrow();
         let ctx = ctx.as_ref()?;
+        // SAFETY: ctx 是 ACTIVE_CONTEXT_MENU 里的有效 COM 对象（本线程
+        // 主持菜单模态循环期间存活）；HandleMenuMsg2 的 result 是栈上
+        // [out] 槽位；消息参数由 wndproc 原样转入（系统所有）。
         unsafe {
             if let Ok(menu3) = ctx.cast::<IContextMenu3>() {
                 let mut result = LRESULT(0);
@@ -957,12 +1050,13 @@ pub fn forward_menu_message(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<
         None
     })
 }
-// windows 0.52 未导出这个掩码,按 shlobj_core.h 补定义
+// windows crate 未导出这个掩码(0.62 仍缺),按 shlobj_core.h 补定义
 /// Explorer 桌面图标菜单带 CMF_CANRENAME,shell 因此输出视图级"重命名"动词
 const CMF_CANRENAME: u32 = 0x00100000;
 const CMIC_MASK_UNICODE: u32 = 0x00004000;
 
-/// DeskFence 子菜单命令 id(桌面背景右键菜单里注入,由 ui.rs 分派)
+/// DeskFence 子菜单命令 id(桌面背景右键菜单里注入,由 menu.rs 的
+/// dispatch_desktop_command 分派)
 pub const DL_CMD_ADD_FENCE: u32 = 0x6001;
 pub const DL_CMD_SHOW_ALL: u32 = 0x6002;
 pub const DL_CMD_HIDE_ALL: u32 = 0x6003;
@@ -975,7 +1069,10 @@ pub const DL_CMD_RENDER_MODE: u32 = 0x6009;
 
 /// 系统"图标标题"原始 LOGFONT(与 Explorer 桌面文字同源;精确模式 GDI 绘制用)
 pub fn icon_title_logfont() -> Option<LOGFONTW> {
+    // SAFETY: 契约同 desktop_icon_font：全零 LOGFONTW + SPI 按字节数写入
+    // 栈变量。
     let mut lf: LOGFONTW = unsafe { std::mem::zeroed() };
+    // SAFETY: 同上。
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETICONTITLELOGFONT,
@@ -988,7 +1085,7 @@ pub fn icon_title_logfont() -> Option<LOGFONTW> {
     ok.then_some(lf)
 }
 
-/// PW_RENDERFULLCONTENT:PrintWindow 捕获 DWM 合成内容(Win8.1+;0x52 未导出该常量)
+/// PW_RENDERFULLCONTENT:PrintWindow 捕获 DWM 合成内容(Win8.1+;windows crate 0.62 仍未导出该常量)
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x00000002);
 
 /// 捕获一个窗口的合成像素(顶层 32bpp BGRA,自上而下),alpha 全部置 255。
@@ -996,6 +1093,11 @@ const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(0x00000002);
 /// 捕获窗口像素。失败时返回原因字符串(PrintWindow 失败码/矩形异常等),
 /// 供启动期诊断"快照迟迟不可用"的具体环节。
 pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> {
+    // SAFETY(整块): GDI 资源全程成对：GetDC/ReleaseDC、CreateCompatibleDC/
+    // DeleteDC、CreateDIBSection 的 DIB/DeleteObject、SelectObject 之后必
+    // 还原旧对象再删除；CreateDIBSection 的 bits 指针在 DIB 存活期间有效，
+    // from_raw_parts 的长度=biWidth*biHeight*4 与 32bpp DIB 布局一致（biHeight
+    // 取负=自上而下行序）；PrintWindow 同步完成后立即拷贝像素再释放。
     unsafe {
         let mut r: RECT = std::mem::zeroed();
         if GetWindowRect(hwnd, &mut r).is_err() {
@@ -1006,13 +1108,13 @@ pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> 
         if w == 0 || h == 0 || w > 16384 || h > 16384 {
             return Err(format!("bad rect {w}x{h}"));
         }
-        let hdc_screen = GetDC(HWND(0));
-        if hdc_screen.0 == 0 {
+        let hdc_screen = GetDC(None);
+        if hdc_screen.0.is_null() {
             return Err("GetDC failed".into());
         }
-        let dc = CreateCompatibleDC(hdc_screen);
-        ReleaseDC(HWND(0), hdc_screen);
-        if dc.0 == 0 {
+        let dc = CreateCompatibleDC(Some(hdc_screen));
+        ReleaseDC(None, hdc_screen);
+        if dc.0.is_null() {
             return Err("CreateCompatibleDC failed".into());
         }
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -1024,8 +1126,7 @@ pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> 
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = 0;
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let dib = match CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
-        {
+        let dib = match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
             Ok(d) => d,
             Err(_) => {
                 let _ = DeleteDC(dc);
@@ -1033,11 +1134,11 @@ pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> 
             }
         };
         if bits.is_null() {
-            let _ = DeleteObject(dib);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
             let _ = DeleteDC(dc);
             return Err("CreateDIBSection null bits".into());
         }
-        let old = SelectObject(dc, dib);
+        let old = SelectObject(dc, HGDIOBJ(dib.0));
         let ok = PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT).as_bool();
         let mut out = Vec::new();
         if ok {
@@ -1045,13 +1146,10 @@ pub fn capture_window_pixels(hwnd: HWND) -> Result<(Vec<u8>, u32, u32), String> 
             out = src;
         }
         SelectObject(dc, old);
-        let _ = DeleteObject(dib);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
         let _ = DeleteDC(dc);
         if !ok {
-            let code = match GetLastError() {
-                Ok(()) => 0,
-                Err(e) => e.code().0 as u32,
-            };
+            let code = GetLastError().0;
             return Err(format!("PrintWindow false err={code}"));
         }
         // GDI 捕获的 alpha 不可靠:精确模式整窗不透明,统一置 255
@@ -1082,6 +1180,9 @@ fn request_rename(path: &str) -> bool {
 fn pidl_from_path(path: &str) -> Option<*mut ITEMIDLIST> {
     let w = wide(path);
     let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    // SAFETY: w 是 NUL 宽串；pidl 是栈上 [out] 槽位；成功时 SHParseDisplayName
+    // 分配的 PIDL 所有权移交调用方（由 build_item_menu/free_item_pidls 以
+    // CoTaskMemFree 配对释放）。
     unsafe {
         SHParseDisplayName(
             PCWSTR::from_raw(w.as_ptr()),
@@ -1102,6 +1203,9 @@ fn pidl_from_path(path: &str) -> Option<*mut ITEMIDLIST> {
 /// 命令 id 对应的 verb 是否为 "rename"
 fn verb_is_rename(ctx: &IContextMenu, verb_idx: u32) -> bool {
     let mut buf = [0u16; 64];
+    // SAFETY: ctx 是有效 COM 对象；GetCommandString 的 pszName 按 GCS_VERBW
+    // 契约写入宽字符（PSTR 视图 underlying 是 128 字节栈缓冲，cchMax=64
+    // 以宽字符计不越界）；按 NUL 截断后解析。
     unsafe {
         ctx.GetCommandString(
             verb_idx as usize,
@@ -1123,6 +1227,11 @@ fn verb_is_rename(ctx: &IContextMenu, verb_idx: u32) -> bool {
 /// 取不到时回退 MAKEINTRESOURCEW(verb_idx)。HRESULT 落盘便于诊断。
 /// 返回实际下发的 verb 字符串(取不到时 "#idx"),供调用方识别删除类动词。
 fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32) -> String {
+    // SAFETY(整块): ctx 是有效 COM 对象；info 全零+cbSize 按契约填充；
+    // wverb 是 128 字节栈缓冲（GCS_VERBW 以宽字符写，cchMax=64 不越界）；
+    // MAKEINTRESOURCEW 路径把 verb_idx 打包进指针值——shell 侧按整数解读、
+    // 不解引用（官方文档的规范传递方式）；hwnd 是本进程窗口；info 生命周期
+    // 覆盖同步的 InvokeCommand 调用。
     unsafe {
         // 取字符串 verb
         let mut wverb = [0u16; 64];
@@ -1152,7 +1261,7 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
         // 命令产生的 UI(删除确认框/进度框)需要前台宿主,否则可能压在桌面底下看不见。
         // 用隐形菜单宿主:前台化栅栏窗口会提升其 z-band,自愈定时器拉回时
         // 分层窗口跨 band 移动引发重合成闪屏
-        let _ = SetForegroundWindow(crate::ui::menu_host_or(hwnd));
+        let _ = SetForegroundWindow(crate::winids::menu_host_or(hwnd));
         let hr = ctx.InvokeCommand(&info as *const CMINVOKECOMMANDINFOEX as *const _);
         let verb_desc = if has_str {
             String::from_utf16_lossy(&wverb[..wverb.iter().position(|c| *c == 0).unwrap_or(64)])
@@ -1170,6 +1279,11 @@ fn invoke_command(hwnd: HWND, ctx: &IContextMenu, verb_idx: u32, x: i32, y: i32)
 fn build_item_menu(hwnd: HWND, paths: &[String]) -> Option<(IContextMenu, Vec<*mut ITEMIDLIST>)> {
     // 注:Explorer 的 WM_GETOBJECT 跨进程不回 IShellView,无法直接取 DefView
     // 选中项菜单;走桌面文件夹 GetUIObjectOf 路线 + 注入"重命名"对齐原生。
+    // SAFETY(整块): PIDL 所有权链——pidl_from_path 分配的全部 PIDL 在每条
+    // 失败出口逐一 CoTaskMemFree，成功路径移交返回值（调用方 free_item_pidls
+    // 释放）；SHBindToParent 的 child 出参指向 PIDL 内部别名（不单独释放，
+    // child0 同理）；GetUIObjectOf 返回的 IContextMenu 是 COM 包装，drop
+    // 自动 Release；children 数组只被同步调用借用。
     unsafe {
         let mut pidls: Vec<*mut ITEMIDLIST> = Vec::new();
         for p in paths {
@@ -1206,8 +1320,7 @@ fn build_item_menu(hwnd: HWND, paths: &[String]) -> Option<(IContextMenu, Vec<*m
             }
         };
         let _ = child0; // child0 是 pidls[0] 内部别名,不能单独释放
-        let ctx: IContextMenu = match parent.GetUIObjectOf::<_, IContextMenu>(hwnd, &children, None)
-        {
+        let ctx: IContextMenu = match parent.GetUIObjectOf::<IContextMenu>(hwnd, &children, None) {
             Ok(c) => c,
             Err(_) => {
                 log("item menu: GetUIObjectOf failed");
@@ -1224,6 +1337,8 @@ fn build_item_menu(hwnd: HWND, paths: &[String]) -> Option<(IContextMenu, Vec<*m
 /// 释放菜单源持有的资源并恢复桌面选中状态
 fn free_item_pidls(pidls: Vec<*mut ITEMIDLIST>) {
     for q in pidls {
+        // SAFETY: q 来自 pidl_from_path（SHParseDisplayName 的 COM 分配器
+        // 分配），逐条各释放一次、移出所有权（消费 Vec）。
         unsafe {
             CoTaskMemFree(Some(q as *const _));
         }
@@ -1237,19 +1352,25 @@ fn free_item_pidls(pidls: Vec<*mut ITEMIDLIST>) {
 /// 定时器拉回时分层窗口跨 band 移动引发重合成闪屏)。SetForegroundWindow
 /// 在进程无前台权限时会静默失败(如合成回调、长时间无真实输入),此时用
 /// AttachThreadInput 暂借前台线程的输入状态重试。
+///
+/// # Safety
+/// 仅调用 Win32 窗口/线程 API；`hwnd` 无效时只是前台化失败（守卫照旧返回，
+/// 由调用方决定后续），无内存安全前提。
 pub unsafe fn menu_foreground(hwnd: HWND) -> MenuForegroundGuard {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    if !SetForegroundWindow(hwnd).as_bool() {
-        let fg = GetForegroundWindow();
-        if fg.0 != 0 {
-            let cur = GetCurrentThreadId();
-            let fg_thread = GetWindowThreadProcessId(fg, None);
+    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        let fg = unsafe { GetForegroundWindow() };
+        if !fg.0.is_null() {
+            let cur = unsafe { GetCurrentThreadId() };
+            let fg_thread = unsafe { GetWindowThreadProcessId(fg, None) };
             if fg_thread != 0
                 && fg_thread != cur
-                && AttachThreadInput(cur, fg_thread, true).as_bool()
+                && unsafe { AttachThreadInput(cur, fg_thread, true) }.as_bool()
             {
-                let _ = SetForegroundWindow(hwnd);
-                let _ = AttachThreadInput(cur, fg_thread, false);
+                unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = AttachThreadInput(cur, fg_thread, false);
+                }
             }
         }
     }
@@ -1262,26 +1383,35 @@ pub struct MenuForegroundGuard {
 
 impl Drop for MenuForegroundGuard {
     fn drop(&mut self) {
+        // SAFETY: self.hwnd 是构造守卫时记录的有效窗口；PostMessage 无指针
+        // 参数（KB135788 菜单收尾标准做法）。
         unsafe {
             // 菜单关闭也算交互:2.5s 内推迟壁纸捕获,避开宿主未稳定态的
             // 强制重绘(±4% 亮度闪)
-            crate::ui::mark_interaction();
-            let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+            crate::state::mark_interaction();
+            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         }
     }
 }
 
 /// 弹出并等待菜单选择,返回命令 id(0=取消)。期间保留 COM 菜单对象,
 /// WndProc 可转发动态/自绘子菜单消息(WM_INITMENUPOPUP 等)。
+/// # Safety
+/// 必须在 UI 线程调用（ACTIVE_CONTEXT_MENU 是 thread_local，TrackPopupMenu
+/// 模态循环期间 wndproc 的 forward_menu_message 在同线程取它）；hwnd 是
+/// 本进程窗口、menu 是调用方构建且尚未销毁的菜单、ctx 在整个调用期间存活；
+/// 函数负责销毁 menu 并清空 thread_local 槽位。
 unsafe fn run_item_menu(hwnd: HWND, ctx: &IContextMenu, menu: HMENU, x: i32, y: i32) -> u32 {
     ACTIVE_CONTEXT_MENU.with(|slot| *slot.borrow_mut() = Some(ctx.clone()));
     // owner 用隐形菜单宿主,避免前台化栅栏窗口引发 z-band 往返的闪屏
-    let host = crate::ui::menu_host_or(hwnd);
-    let _guard = menu_foreground(host);
+    let host = crate::winids::menu_host_or(hwnd);
+    let _guard = unsafe { menu_foreground(host) };
     let id = track_popup(menu, host, x, y);
     ACTIVE_CONTEXT_MENU.with(|slot| *slot.borrow_mut() = None);
-    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
-    let _ = DestroyMenu(menu);
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+    }
     id
 }
 
@@ -1292,6 +1422,9 @@ pub fn show_shell_context_menu_paths(hwnd: HWND, paths: &[String], x: i32, y: i3
         }
         return;
     }
+    // SAFETY(整块): 所有权链同 build_item_menu/run_item_menu/invoke_command
+    // 各自的论证：PIDL 逐出口释放；菜单对象 DestroyMenu；COM 包装 drop 自动
+    // Release；全部同步调用。
     unsafe {
         let (ctx, pidls) = match build_item_menu(hwnd, paths) {
             Some(v) => v,
@@ -1334,6 +1467,8 @@ pub fn show_shell_context_menu_paths(hwnd: HWND, paths: &[String], x: i32, y: i3
 /// 图标右键:与 Explorer 完全一致的原生上下文菜单(含"重命名");菜单里的
 /// "重命名"被拦截改由栅栏内就地编辑完成。回收站等虚拟条目跳过"重命名"注入。
 pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
+    // SAFETY(整块): 同 show_shell_context_menu_paths：PIDL/菜单/COM 所有权
+    // 在各子函数内配对，本块只做同步编排。
     unsafe {
         let (ctx, pidls) = match build_item_menu(hwnd, &[path.to_string()]) {
             Some(v) => v,
@@ -1357,7 +1492,7 @@ pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
             fallback_menu(hwnd, path, x, y);
             return;
         }
-        let item_count = GetMenuItemCount(menu);
+        let item_count = GetMenuItemCount(Some(menu));
         log(&format!("item menu: {item_count} entries"));
         if !crate::model::is_recycle_bin(path) {
             inject_rename_item(menu, &ctx);
@@ -1378,9 +1513,18 @@ pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
                 // 主动重扫让栅栏跟上;删除类再走"主动删除"标记,扫描宽恕当轮
                 // 放行。其余动词经 rescan 的无变化早退,不会引发无谓重绘。
                 if verb.eq_ignore_ascii_case("delete") {
-                    crate::rename::mark_scan_removed(&[path.to_string()]);
+                    crate::state::mark_scan_removed(&[path.to_string()]);
                 }
-                crate::ui::rescan();
+                // 经托盘窗异步请求重扫(WM_DL3_RESCAN 由 UI 线程消息泵处理):
+                // shell 不反向依赖 ui,消息一跳的延迟对"重扫跟上桌面"无感
+                if let Some(tray) = crate::winids::TRAY_HWND.get().copied() {
+                    let _ = PostMessageW(
+                        Some(tray),
+                        crate::winids::WM_DL3_RESCAN,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
             }
         }
         free_item_pidls(pidls);
@@ -1389,6 +1533,10 @@ pub fn show_shell_context_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
 
 fn defview_ishellview() -> Option<IShellView> {
     use windows::Win32::UI::Accessibility::ObjectFromLresult;
+    // SAFETY(整块): dv 是 Explorer 桌面 DefView 窗口（现查现用）；WM_GETOBJECT
+    // 跨进程请求接口——iid 是栈上 GUID（调用期间存活）、res 是栈 [out]；
+    // ObjectFromLresult 把返回的 LRESULT 转成已 AddRef 的接口指针 psv，
+    // transmute 成 COM 包装即接管该引用（drop 自动 Release）。
     unsafe {
         let dv = match find_defview_window() {
             Some(d) => d,
@@ -1398,7 +1546,7 @@ fn defview_ishellview() -> Option<IShellView> {
             }
         };
         const WM_GETOBJECT: u32 = 0x003D;
-        let iid = <IShellView as ComInterface>::IID;
+        let iid = <IShellView as Interface>::IID;
         let mut res = 0usize;
         let ok = SendMessageTimeoutW(
             dv,
@@ -1418,7 +1566,7 @@ fn defview_ishellview() -> Option<IShellView> {
             return None;
         }
         let mut psv: *mut std::ffi::c_void = std::ptr::null_mut();
-        if let Err(e) = ObjectFromLresult(LRESULT(res as isize), &iid, None, &mut psv) {
+        if let Err(e) = ObjectFromLresult(LRESULT(res as isize), &iid, WPARAM(0), &mut psv) {
             log(&format!("dv isv: ObjectFromLresult failed: {e}"));
             return None;
         }
@@ -1429,6 +1577,8 @@ fn defview_ishellview() -> Option<IShellView> {
 
 fn defview_background_menu() -> Option<IContextMenu> {
     use windows::Win32::UI::Shell::SVGIO_BACKGROUND;
+    // SAFETY: psv 是 defview_ishellview 返回的存活 COM 包装；
+    // GetItemObject 返回的 IContextMenu 同为 COM 包装（drop 自动 Release）。
     unsafe {
         let psv = defview_ishellview()?;
         psv.GetItemObject::<IContextMenu>(SVGIO_BACKGROUND).ok()
@@ -1437,26 +1587,32 @@ fn defview_background_menu() -> Option<IContextMenu> {
 
 /// 查找桌面 SHELLDLL_DefView 窗口(Progman 直属,或 WorkerW 下)。
 fn find_defview_window() -> Option<HWND> {
+    // SAFETY: 三个类名均为 NUL 宽串（同步查找期间存活）；EnumWindows 的
+    // lparam 承载栈槽位 slot 的指针——EnumWindows 同步枚举，回调在调用
+    // 返回前全部执行完毕，slot 生命周期覆盖。
     unsafe {
         let progman = wide("Progman");
         let defview = wide("SHELLDLL_DefView");
         let workerw = wide("WorkerW");
         let cur = FindWindowExW(
-            FindWindowW(PCWSTR::from_raw(progman.as_ptr()), None),
+            FindWindowW(PCWSTR::from_raw(progman.as_ptr()), None).ok(),
             None,
             PCWSTR::from_raw(defview.as_ptr()),
             None,
-        );
-        if cur.0 != 0 {
+        )
+        .unwrap_or_default();
+        if !cur.0.is_null() {
             return Some(cur);
         }
-        let mut host = FindWindowW(PCWSTR::from_raw(workerw.as_ptr()), None);
-        while host.0 != 0 {
-            let dv = FindWindowExW(host, None, PCWSTR::from_raw(defview.as_ptr()), None);
-            if dv.0 != 0 {
+        let mut host = FindWindowW(PCWSTR::from_raw(workerw.as_ptr()), None).unwrap_or_default();
+        while !host.0.is_null() {
+            let dv = FindWindowExW(Some(host), None, PCWSTR::from_raw(defview.as_ptr()), None)
+                .unwrap_or_default();
+            if !dv.0.is_null() {
                 return Some(dv);
             }
-            host = FindWindowExW(None, host, PCWSTR::from_raw(workerw.as_ptr()), None);
+            host = FindWindowExW(None, Some(host), PCWSTR::from_raw(workerw.as_ptr()), None)
+                .unwrap_or_default();
         }
         let mut slot: Option<HWND> = None;
         let _ = EnumWindows(
@@ -1467,14 +1623,24 @@ fn find_defview_window() -> Option<HWND> {
     }
 }
 
+/// # Safety
+/// EnumWindows 的回调契约：lparam 是 EnumWindows 调用方透传的原值——
+/// 即 find_defview_window 栈槽位 Option<HWND> 的指针，EnumWindows 同步
+/// 执行期间有效；本回调只读写该槽位，返回 FALSE 终止枚举。
 unsafe extern "system" fn enum_find_defview(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let slot: &mut Option<HWND> = &mut *(lparam.0 as *mut Option<HWND>);
+    let slot: &mut Option<HWND> = unsafe { &mut *(lparam.0 as *mut Option<HWND>) };
     if slot.is_some() {
         return BOOL(0);
     }
-    let defview = wide("SHELLDLL_DefView");
-    let dv = FindWindowExW(hwnd, None, PCWSTR::from_raw(defview.as_ptr()), None);
-    if dv.0 != 0 {
+    // 类名宽串只编码一次(静态),枚举每个顶层窗的回调不再重复分配
+    // (2026-09-17 优化;字符串仅作 FindWindowExW 的只读比较入参)
+    static DEFVIEW: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+    let defview = DEFVIEW.get_or_init(|| wide("SHELLDLL_DefView"));
+    let dv = unsafe {
+        FindWindowExW(Some(hwnd), None, PCWSTR::from_raw(defview.as_ptr()), None)
+            .unwrap_or_default()
+    };
+    if !dv.0.is_null() {
         *slot = Some(dv);
         return BOOL(0);
     }
@@ -1490,6 +1656,9 @@ pub fn show_desktop_context_menu(
     align_mode: &str,
     render_mode: &str,
 ) -> u32 {
+    // SAFETY(整块): 菜单构建/弹出/命令执行的契约同前述各函数
+    // （append_menu/track_popup/invoke_command/run_item_menu）；
+    // thread_local 槽位在 track_popup 前后成对置位/清空。
     unsafe {
         let ctx: IContextMenu = match defview_background_menu() {
             Some(c) => c,
@@ -1498,7 +1667,7 @@ pub fn show_desktop_context_menu(
                     Ok(f) => f,
                     Err(_) => return 0,
                 };
-                match psf.GetUIObjectOf::<_, IContextMenu>(hwnd, &[], None) {
+                match psf.GetUIObjectOf::<IContextMenu>(hwnd, &[], None) {
                     Ok(c) => c,
                     Err(_) => return 0,
                 }
@@ -1546,11 +1715,11 @@ pub fn show_desktop_context_menu(
             PCWSTR::from_raw(label.as_ptr()),
         );
         ACTIVE_CONTEXT_MENU.with(|slot| *slot.borrow_mut() = Some(ctx.clone()));
-        let host = crate::ui::menu_host_or(hwnd);
+        let host = crate::winids::menu_host_or(hwnd);
         let _ = SetForegroundWindow(host);
         let id = track_popup(menu, host, x, y);
         ACTIVE_CONTEXT_MENU.with(|slot| *slot.borrow_mut() = None);
-        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
         if (CMD_FIRST..=CMD_LAST).contains(&id) {
             invoke_command(hwnd, &ctx, id - CMD_FIRST, x, y);
             let _ = DestroyMenu(menu);
@@ -1570,6 +1739,8 @@ fn fallback_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
     const F_DELETE: u32 = 5;
     const F_PROPERTIES: u32 = 6;
     const F_COPY: u32 = 7;
+    // SAFETY: 无参创建菜单，失败得 null 句柄由 unwrap_or_default 吸收
+    //（后续菜单调用对空句柄失败无害）。
     let menu = unsafe { CreatePopupMenu().unwrap_or_default() };
     append_menu(menu, F_OPEN, crate::lang::open());
     append_menu(menu, F_OPENWITH, crate::lang::open_with());
@@ -1581,8 +1752,10 @@ fn fallback_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
     append_menu(menu, F_DELETE, crate::lang::delete());
     append_separator(menu);
     append_menu(menu, F_PROPERTIES, crate::lang::properties());
-    let host = crate::ui::menu_host_or(hwnd);
+    let host = crate::winids::menu_host_or(hwnd);
     let id = track_popup(menu, host, x, y);
+    // SAFETY: menu 是本函数创建、track_popup 已返回（模态结束）的菜单，
+    // 此时销毁安全。
     unsafe {
         let _ = DestroyMenu(menu);
     };
@@ -1606,9 +1779,10 @@ fn fallback_menu(hwnd: HWND, path: &str, x: i32, y: i32) {
 /// 与"read_dir 瞬态漏读"互补——文件仍在盘上时属性查询依然成功,那才是
 /// 扫描宽恕要保护的情形。
 pub fn path_gone_from_disk(path: &str) -> bool {
-    // windows 0.52 未导出 FILE_ATTRIBUTE_INVALID,失败值即 u32::MAX
+    // windows crate 未导出 FILE_ATTRIBUTE_INVALID(0.62 仍缺),失败值即 u32::MAX
     const FILE_ATTR_INVALID: u32 = u32::MAX;
     let w = wide(path);
+    // SAFETY: w 是 NUL 宽串；GetFileAttributesW 只读返回属性值，无输出指针。
     unsafe { GetFileAttributesW(PCWSTR::from_raw(w.as_ptr())) == FILE_ATTR_INVALID }
 }
 
@@ -1616,9 +1790,10 @@ pub fn path_gone_from_disk(path: &str) -> bool {
 pub fn open_with(path: &str) {
     let w = wide(path);
     let op = wide("openas");
+    // SAFETY: 同 open_recycle_bin：NUL 宽串在同步调用期间存活。
     unsafe {
         let _ = ShellExecuteW(
-            HWND::default(),
+            None,
             PCWSTR::from_raw(op.as_ptr()),
             PCWSTR::from_raw(w.as_ptr()),
             PCWSTR::null(),
@@ -1633,7 +1808,8 @@ pub fn delete_to_recycle_bin(hwnd: HWND, path: &str) {
     delete_to_recycle_bin_many(hwnd, &[path.to_string()]);
 }
 
-fn multistring(paths: &[String]) -> Vec<u16> {
+/// SHFileOperation 的双 NUL 结尾宽字符路径串(2026-09-16 提 pub 供 tests/)
+pub fn multistring(paths: &[String]) -> Vec<u16> {
     let mut data = Vec::new();
     for path in paths {
         data.extend(wide(path).into_iter().take_while(|c| *c != 0));
@@ -1653,12 +1829,15 @@ pub fn copy_files_to_desktop(hwnd: HWND, paths: &[String]) -> bool {
     let from = multistring(paths);
     let mut to = wide(&target.to_string_lossy());
     to.push(0);
+    // SAFETY: op 全零+关键字段填充；pFrom/pTo 均为双 NUL 结尾缓冲
+    //（multistring 契约/手动补 NUL），SHFileOperationW 同步调用期间存活。
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.hwnd = hwnd;
     op.wFunc = FO_COPY;
     op.pFrom = PCWSTR::from_raw(from.as_ptr());
     op.pTo = PCWSTR::from_raw(to.as_ptr());
     op.fFlags = (FOF_ALLOWUNDO | FOF_RENAMEONCOLLISION).0 as u16;
+    // SAFETY: 同上。
     unsafe { SHFileOperationW(&mut op) == 0 && !op.fAnyOperationsAborted.as_bool() }
 }
 
@@ -1667,11 +1846,14 @@ pub fn delete_to_recycle_bin_many(hwnd: HWND, paths: &[String]) {
         return;
     }
     let from = multistring(paths);
+    // SAFETY: op 全零+关键字段填充；pFrom 双 NUL 结尾（multistring 契约），
+    // 同步调用期间存活；返回码忽略（错误走 rescan 收敛）。
     let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
     op.hwnd = hwnd;
     op.wFunc = FO_DELETE;
     op.pFrom = PCWSTR::from_raw(from.as_ptr());
     op.fFlags = FOF_ALLOWUNDO.0 as u16;
+    // SAFETY: 同上。
     unsafe {
         let _ = SHFileOperationW(&mut op);
     }
@@ -1681,6 +1863,7 @@ pub fn delete_to_recycle_bin_many(hwnd: HWND, paths: &[String]) {
 pub fn show_properties(path: &str) {
     let w = wide(path);
     let op = wide("properties");
+    // SAFETY: 同 open_path：全零+cbSize 的结构、NUL 宽串、同步调用。
     unsafe {
         let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
         sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -1716,6 +1899,7 @@ pub fn is_light_theme() -> bool {
     let mut v: u32 = 0;
     let mut sz = std::mem::size_of::<u32>() as u32;
     let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+    // SAFETY: 同 desktop_icon_size 的 RegGetValueW 契约（NUL 宽串+栈输出）。
     let ok = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -1738,6 +1922,7 @@ pub fn system_accent() -> [f32; 3] {
     let mut v: u32 = 0;
     let mut sz = std::mem::size_of::<u32>() as u32;
     let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
+    // SAFETY: 同 desktop_icon_size 的 RegGetValueW 契约（NUL 宽串+栈输出）。
     let ok = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -1771,12 +1956,109 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "DeskFence";
 /// 旧版本(DeskLens3)的自启项名,设置新自启时顺手清掉
 const RUN_VALUE_LEGACY: &str = "DeskLens3";
+/// 计划任务名(2026-09-16 起自启首选计划任务):任务计划程序服务的登录
+/// 触发不经 Explorer 的 Run 键排队,冷开机可比 Run 键早数十秒拉起进程
+/// (2026-09-16 实测本机 Run 键路径 Explorer 出桌面后 86s 才轮到)。
+/// 创建失败(如组策略禁用 schtasks)自动回退 HKCU Run 键,旧路径原样保留。
+const TASK_NAME: &str = "DeskFence";
 
-pub fn get_autostart() -> bool {
+/// 跑一条 schtasks 子命令:隐藏窗口、10s 超时,返回退出码是否为 0
+fn run_schtasks(args: &[&str]) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let line = format!("\"{}\\System32\\schtasks.exe\" {}", windir, args.join(" "));
+    let mut wide_line = wide(&line);
+    // SAFETY(整块): lpCommandLine 必须指向**可写**缓冲（CreateProcessW 契约，
+    // wide_line.as_mut_ptr() 满足）；si/pi 为栈结构、pi 是 [out] 槽位；
+    // 成功后 hProcess/hThread 各 CloseHandle 一次（含失败退出码路径）。
+    unsafe {
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+        let mut pi = PROCESS_INFORMATION::default();
+        if CreateProcessW(
+            None,
+            Some(windows::core::PWSTR::from_raw(wide_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_NO_WINDOW,
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let _ = WaitForSingleObject(pi.hProcess, 10_000);
+        let mut code: u32 = 1;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
+        code == 0
+    }
+}
+
+/// 计划任务是否已注册(/Query 退出码 0;其他失败一律按"无任务"回退)
+fn scheduled_task_exists() -> bool {
+    run_schtasks(&["/Query", "/TN", TASK_NAME])
+}
+
+/// schtasks 注册失败的机器标记(组策略禁用任务计划并不罕见,2026-09-16 本机
+/// 实测 schtasks/Register-ScheduledTask 均"拒绝访问"):迁移只尝试一次,
+/// 失败即写此标记,避免每次开机白跑 schtasks 子进程拖慢启动;用户显式
+/// 关/开自启或任务创建成功时清掉。
+fn task_fail_marker() -> std::path::PathBuf {
+    crate::model::config_dir().join("autostart_task_unavailable")
+}
+
+/// 删除 HKCU Run 键里的自启值(任务路径成功后清掉,避免双启动)
+fn delete_run_autostart() {
+    let key = wide(RUN_KEY);
+    let name = wide(RUN_VALUE);
+    let legacy = wide(RUN_VALUE_LEGACY);
+    // SAFETY: 注册表键句柄配对：RegOpenKeyExW 成功后 RegCloseKey 一次；
+    // NUL 宽串参数；删除不存在的值返回错误被忽略。
+    unsafe {
+        let mut lhkey: HKEY = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(key.as_ptr()),
+            None,
+            KEY_SET_VALUE,
+            &mut lhkey,
+        )
+        .0 == 0
+            && !lhkey.0.is_null()
+        {
+            let _ = RegDeleteValueW(lhkey, PCWSTR::from_raw(legacy.as_ptr()));
+            let _ = RegDeleteValueW(lhkey, PCWSTR::from_raw(name.as_ptr()));
+            let _ = RegCloseKey(lhkey);
+        }
+    }
+}
+
+/// get_autostart 结果缓存(0=未知,1=开,2=关):schtasks /Query 每次要拉起
+/// 子进程(冷盘+杀软下可到几百 ms),托盘菜单每次现建都查会卡顿。进程内
+/// 缓存一份,set_autostart 成功后同步更新;外部手动改任务/注册表,重启
+/// 后可见。
+static AUTOSTART_CACHE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// HKCU Run 键里是否还有自启值(旧路径,迁移判断用)
+fn run_key_autostart_exists() -> bool {
     let key = wide(RUN_KEY);
     let name = wide(RUN_VALUE);
     let mut ty: REG_VALUE_TYPE = REG_VALUE_TYPE(0);
     let mut sz: u32 = 0;
+    // SAFETY: 查存在性：pvData 传 None（只探测不取值），sz 出参可为栈值；
+    // NUL 宽串同前。
     unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
@@ -1791,7 +2073,44 @@ pub fn get_autostart() -> bool {
     }
 }
 
+pub fn get_autostart() -> bool {
+    match AUTOSTART_CACHE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    // 先查注册表(零开销),没有再查计划任务(拉子进程)
+    let on = run_key_autostart_exists() || scheduled_task_exists();
+    AUTOSTART_CACHE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    on
+}
+
+/// 一次性迁移(2026-09-16):升级前用 Run 键自启的老用户,检测到 Run 键值
+/// 存在而计划任务未注册时,走一次 set_autostart(true)(建任务+清 Run 键)。
+/// schtasks 不可用的机器上 set_autostart 会回退回写 Run 键,无副作用;
+/// 迁移完成后启动路径只剩一次注册表读。
+pub fn migrate_autostart_to_task() {
+    if task_fail_marker().exists() || !run_key_autostart_exists() {
+        return;
+    }
+    if scheduled_task_exists() {
+        // 任务已存在(如外部建过):清掉 Run 键值避免双启动即可
+        delete_run_autostart();
+        return;
+    }
+    log("autostart: migrating run key to scheduled task");
+    set_autostart(true);
+}
+
 pub fn set_autostart(on: bool) -> bool {
+    let ok = set_autostart_impl(on);
+    if ok {
+        AUTOSTART_CACHE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    }
+    ok
+}
+
+fn set_autostart_impl(on: bool) -> bool {
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -1803,28 +2122,45 @@ pub fn set_autostart(on: bool) -> bool {
     let legacy = wide(RUN_VALUE_LEGACY);
     let value = format!("\"{}\"", exe);
     let vw = wide(&value);
+    // SAFETY(整块): 注册表句柄全部开/关配对；RegSetValueExW 的数据指针是
+    // vw 的字节视图（from_raw_parts 长度=元素数*2，NUL 宽串含终止符一起写）；
+    // schtasks 走子进程（见 run_schtasks 论证）。
     unsafe {
         // 无论开/关,都先清掉旧版 DeskLens3 的自启项,避免新旧并存重复启动
         let mut lhkey: HKEY = HKEY::default();
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             PCWSTR::from_raw(key.as_ptr()),
-            0,
+            None,
             KEY_SET_VALUE,
             &mut lhkey,
         )
-        .is_ok()
-            && lhkey.0 != 0
+        .0 == 0
+            && !lhkey.0.is_null()
         {
             let _ = RegDeleteValueW(lhkey, PCWSTR::from_raw(legacy.as_ptr()));
             let _ = RegCloseKey(lhkey);
         }
         if on {
+            // 首选计划任务:登录即触发,注册后 /Query 复核;成功则清掉 Run 键值
+            // 避免双启动
+            let tr = format!("\"{}\"", exe);
+            let created = run_schtasks(&[
+                "/Create", "/F", "/TN", TASK_NAME, "/TR", &tr, "/SC", "ONLOGON", "/RL", "LIMITED",
+            ]);
+            if created && scheduled_task_exists() {
+                delete_run_autostart();
+                let _ = std::fs::remove_file(task_fail_marker());
+                log("autostart: scheduled task registered, run key removed");
+                return true;
+            }
+            let _ = std::fs::write(task_fail_marker(), b"1");
+            log("autostart: scheduled task unavailable, fallback to run key");
             let mut hkey: HKEY = HKEY::default();
             let ok = RegCreateKeyExW(
                 HKEY_CURRENT_USER,
                 PCWSTR::from_raw(key.as_ptr()),
-                0,
+                None,
                 PCWSTR::null(),
                 REG_OPTION_NON_VOLATILE,
                 KEY_WRITE,
@@ -1832,39 +2168,30 @@ pub fn set_autostart(on: bool) -> bool {
                 &mut hkey,
                 None,
             )
-            .is_ok();
+            .0 == 0;
             if !ok {
                 return false;
             }
             let set = RegSetValueExW(
                 hkey,
                 PCWSTR::from_raw(name.as_ptr()),
-                0,
+                None,
                 REG_SZ,
                 Some(std::slice::from_raw_parts(
                     vw.as_ptr() as *const u8,
                     vw.len() * 2,
                 )),
             )
-            .is_ok();
+            .0 == 0;
             let _ = RegCloseKey(hkey);
             set
         } else {
-            let mut hkey: HKEY = HKEY::default();
-            let ok = RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                PCWSTR::from_raw(key.as_ptr()),
-                0,
-                KEY_SET_VALUE,
-                &mut hkey,
-            )
-            .is_ok();
-            if !ok {
-                return false;
-            }
-            let del = RegDeleteValueW(hkey, PCWSTR::from_raw(name.as_ptr())).is_ok();
-            let _ = RegCloseKey(hkey);
-            del
+            // 关闭:计划任务与 Run 键值都清,不存在则忽略;失败标记一并清,
+            // 下次开启时重新优先尝试任务路径
+            let _ = run_schtasks(&["/Delete", "/F", "/TN", TASK_NAME]);
+            delete_run_autostart();
+            let _ = std::fs::remove_file(task_fail_marker());
+            true
         }
     }
 }
@@ -1882,6 +2209,10 @@ pub fn take_desktop_dirty() -> bool {
 /// 与 30 秒轮询并存:监听提供即时刷新,轮询兜底。
 fn start_directory_watcher(dir: std::path::PathBuf) {
     let wdir = wide(&dir.to_string_lossy());
+    // SAFETY(整块): 专属监听线程内：CreateFileW 的句柄由 CloseHandle 收尾
+    //（含 break 路径）；ReadDirectoryChangesW 同步（无 OVERLAPPED）使用
+    // buf——buf 归线程闭包所有、在循环期间不被移动；ret 是栈 [out]；
+    // 目录句柄打开失败直接 return（无泄漏）。
     std::thread::spawn(move || unsafe {
         let handle = CreateFileW(
             PCWSTR::from_raw(wdir.as_ptr()),
@@ -1890,12 +2221,20 @@ fn start_directory_watcher(dir: std::path::PathBuf) {
             None,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0),
-            HANDLE::default(),
+            None,
         );
-        let Ok(handle) = handle else { return };
-        if handle.is_invalid() {
-            return;
-        }
+        // 打不开目录=桌面变更即时刷新整段静默失效(只剩 30s 轮询兜底),
+        // 用户感知"新增文件半天不出现"却无迹可查——留一行现场。
+        let handle = match handle {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                log(&format!(
+                    "desktop dir watcher open failed: {}",
+                    dir.display()
+                ));
+                return;
+            }
+        };
         let mut buf: Vec<u8> = vec![0u8; 65536];
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_DIR_NAME
@@ -1908,13 +2247,16 @@ fn start_directory_watcher(dir: std::path::PathBuf) {
                 handle,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
                 buf.len() as u32,
-                BOOL(0),
+                false,
                 filter,
                 Some(&mut ret),
                 None,
                 None,
             );
             if ok.is_err() {
+                // 监视线程异常终止:此后桌面变更静默退回轮询兜底,记一行
+                // 才能解释"刷新怎么突然变慢了"。
+                log("desktop dir watcher stopped (read error)");
                 break;
             }
             DESKTOP_DIRTY.store(true, Ordering::Relaxed);
@@ -1958,8 +2300,14 @@ pub fn start_wallpaper_watcher(notify_hwnd: HWND, notify_msg: u32) {
     let Some(dir) = themes_dir() else {
         return;
     };
+    // HWND 在 windows 0.62 起不再实现 Send;按指针位捕获,线程内重建,语义不变
+    let notify_hwnd_bits = notify_hwnd.0 as usize;
     let wdir = wide(&dir.to_string_lossy());
+    // SAFETY(整块): 同 start_directory_watcher 的句柄/缓冲论证；HWND 按
+    // 位在线程内重建（跨线程只传数值，PostMessage 是窗口跨线程的唯一
+    // 合法触碰方式，托盘窗口由本进程 UI 线程持有）。
     std::thread::spawn(move || unsafe {
+        let notify_hwnd = HWND(notify_hwnd_bits as *mut std::ffi::c_void);
         let handle = CreateFileW(
             PCWSTR::from_raw(wdir.as_ptr()),
             FILE_LIST_DIRECTORY.0,
@@ -1967,12 +2315,21 @@ pub fn start_wallpaper_watcher(notify_hwnd: HWND, notify_msg: u32) {
             None,
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0),
-            HANDLE::default(),
+            None,
         );
-        let Ok(handle) = handle else { return };
-        if handle.is_invalid() {
-            return;
-        }
+        // 打不开主题目录=壁纸轮换的毫秒级信号源静默失效(只剩
+        // WM_SETTINGCHANGE+10min 兜底轮询),幻灯片壁纸切换明显滞后却
+        // 无迹可查——留一行现场。
+        let handle = match handle {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                log(&format!(
+                    "wallpaper dir watcher open failed: {}",
+                    dir.display()
+                ));
+                return;
+            }
+        };
         let mut buf: Vec<u8> = vec![0u8; 16384];
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_SIZE
@@ -1984,7 +2341,7 @@ pub fn start_wallpaper_watcher(notify_hwnd: HWND, notify_msg: u32) {
                 handle,
                 buf.as_mut_ptr() as *mut std::ffi::c_void,
                 buf.len() as u32,
-                BOOL(1), // 递归:CachedImageFiles 也要覆盖
+                true, // 递归:CachedImageFiles 也要覆盖
                 filter,
                 Some(&mut ret),
                 None,
@@ -1993,7 +2350,7 @@ pub fn start_wallpaper_watcher(notify_hwnd: HWND, notify_msg: u32) {
             if ok.is_err() {
                 break;
             }
-            let _ = PostMessageW(notify_hwnd, notify_msg, WPARAM(0), LPARAM(0));
+            let _ = PostMessageW(Some(notify_hwnd), notify_msg, WPARAM(0), LPARAM(0));
             // Explorer 写缓存是"临时文件+改名"多步操作,这里只粗合并;
             // 精确防抖由 UI 侧 250ms 定时器完成
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2008,12 +2365,17 @@ pub fn start_wallpaper_watcher(notify_hwnd: HWND, notify_msg: u32) {
 /// 纯字符串比较,即可秒级感知变化,替代高频像素级重捕获。
 /// DesktopWallpaper 协同类的 CLSID(windows crate 未导出此常量,取 shlguid.h;
 /// 注意是 C2CF**3**110,写错一位 CoCreateInstance 静默失败)
-const CLSID_DESKTOP_WALLPAPER: windows::core::GUID =
+/// (2026-09-16 提 pub:tests/ 有 GUID 字符串比对回归测试)
+pub const CLSID_DESKTOP_WALLPAPER: windows::core::GUID =
     windows::core::GUID::from_u128(0xc2cf3110_0460_4fc1_b9d0_8a1c0c9cc4bd);
 
 pub fn wallpaper_signature() -> Option<String> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
     use windows::Win32::UI::Shell::IDesktopWallpaper;
+    // SAFETY(整块): CoCreateInstance 产出的 COM 包装 drop 自动 Release；
+    // GetMonitorDevicePathAt/GetWallpaper 返回的 PWSTR 由 CoTaskMemAlloc
+    // 分配、所有权移交调用方——每条各 CoTaskMemFree 一次（dev/wp 分开配对）；
+    // pwstr_to_string 只读不解引用越界（见其 Safety 段）。
     unsafe {
         // 注:部分受管控/定制系统(实测存在)该 coclass 未注册(REGDB_E_CLASSNOTREG),
         // 返回 None 由调用方一次性告警并依赖其它信号源,属预期降级
@@ -2045,15 +2407,19 @@ pub fn wallpaper_signature() -> Option<String> {
     }
 }
 
+/// # Safety
+/// `p` 必须指向以 NUL 结尾、可读的宽字符串（shell API 的 CoTaskMem 分配
+/// 约定）；本函数只读取（含 NUL 扫描），不释放、不拥有——释放由调用方
+/// 的 CoTaskMemFree 完成。
 unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> Option<String> {
     if p.is_null() {
         return None;
     }
     let mut len = 0usize;
-    while *p.0.add(len) != 0 {
+    while unsafe { *p.0.add(len) } != 0 {
         len += 1;
     }
-    String::from_utf16(std::slice::from_raw_parts(p.0, len)).ok()
+    String::from_utf16(unsafe { std::slice::from_raw_parts(p.0, len) }).ok()
 }
 
 // ---------------- 进程辅助(环境体检/自愈) ----------------
@@ -2068,6 +2434,8 @@ pub fn pids_by_name(name: &str) -> Vec<u32> {
     };
     let mut out = Vec::new();
     let me = std::process::id();
+    // SAFETY: 快照句柄 CloseHandle 收尾；PROCESSENTRY32W 契约：dwSize 必须
+    // 先填结构大小再迭代；szExeFile 定长数组按 NUL 截断。
     unsafe {
         if let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             let mut e = PROCESSENTRY32W {
@@ -2106,6 +2474,8 @@ pub fn terminate_by_name(name: &str, wait_ms: u64) -> Vec<u32> {
             return alive;
         }
         for pid in &alive {
+            // SAFETY: OpenProcess 成功返回的句柄各 CloseHandle 一次；
+            // 失败（进程已退出/权限不足）跳过即可，循环重试兜底。
             unsafe {
                 if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, *pid) {
                     let _ = TerminateProcess(h, 1);

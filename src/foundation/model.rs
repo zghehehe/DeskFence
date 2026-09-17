@@ -1,4 +1,5 @@
-//! 数据模型与纯逻辑层（不依赖 Win32，可独立单元测试）
+//! 数据模型与纯逻辑层（不直接依赖 Win32，可独立单元测试；
+//! 配置/设置持久化失败经 logging 记诊断日志，logging 自身依赖 Win32）
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -34,6 +35,13 @@ static DPI_SCALE: Mutex<f32> = Mutex::new(1.0);
 /// 默认 43/54 对应原生 32px 图标格 75x86;运行时由注册表 IconSpacing 覆盖。
 static CELL_PAD_X: Mutex<f32> = Mutex::new(43.0);
 static CELL_PAD_Y: Mutex<f32> = Mutex::new(54.0);
+/// 垂直留白硬下限(逻辑像素)=54:即本仓库像素对齐基准机"原生 32px 小图标
+/// 格 75x86"的实测留白,该值下两行标签墨水与下一行图标无重叠(经验验证
+/// 基准,勿凭推导上调——62.5 理论带高会破坏基准机与原生逐像素一致)。
+/// 探测失败/注册表 IconVerticalSpacing 过时的机器留白回退只有 40,标签
+/// 会压进下一行(2026-09-16 用户在他机中图标下实拍);钳到 54 修复之,
+/// 留白本就 ≥54 的机器为 no-op。
+pub const MIN_PAD_Y: f32 = 54.0;
 
 /// Physical render/layout metrics owned by one fence window.
 /// Live windows use explicit metrics so mixed-DPI fences do not share state.
@@ -168,6 +176,44 @@ pub fn snap_fence_size(w: f32, h: f32) -> (f32, f32) {
         cols as f32 * cell_w() + pad * 2.0 + 2.0,
         title_h + rows as f32 * cell_h() + pad * 2.0 + 2.0,
     )
+}
+
+/// 按当前格距等比重算矩形(行列数保持):config 存像素,跨图标尺寸/跨机器
+/// 沿用像素会让行列数漂移(4 行变 5 行/6 行);用户语义是"几个图标宽×几个
+/// 图标高"。old_cw/old_ch=保存配置时的格距(sidecar 记录)。
+pub fn rescale_rects_to_cells(rects: &mut [Rect], old_cw: f32, old_ch: f32) {
+    let (title_h, pad) = chrome(dpi_scale());
+    for r in rects.iter_mut() {
+        if old_cw <= 0.0 || old_ch <= 0.0 {
+            return;
+        }
+        let cols = (((r.w - pad * 2.0) / old_cw).round() as usize).max(1);
+        let rows = (((r.h - title_h - pad * 2.0) / old_ch).round() as usize).max(1);
+        r.w = cols as f32 * cell_w() + pad * 2.0 + 2.0;
+        r.h = title_h + rows as f32 * cell_h() + pad * 2.0 + 2.0;
+    }
+}
+
+/// Resize 松手整格落位(纯几何,2026-09-16):以**预览矩形**(已含全部约束)
+/// 为基准做整格吸附——北向=底边钉住,高度不超过"底边到顶边下限"且整行;
+/// 非北向=顶边钉住,高度不超过屏底且整行。落位=预览所见,绝不从原始位移
+/// 重算:顶边被顶住时光标仍在越界位移,重算=松手瞬间越限,被行聚类并进
+/// 上一行=全盘乱跑(2026-09-16 用户实测)。
+pub fn resize_drop_rect(cur: Rect, n_inv: bool, top_limit: f32, vh: f32) -> Rect {
+    let (sw, sh) = snap_fence_size(cur.w, cur.h);
+    let mut r = cur;
+    r.w = sw;
+    if n_inv {
+        let bot = cur.y + cur.h;
+        let avail = (bot - top_limit).max(min_h());
+        r.h = sh.min(max_whole_row_h(avail)).min(avail).max(min_h());
+        r.y = bot - r.h;
+    } else {
+        let avail = (vh - cur.y).max(min_h());
+        let fit = max_whole_row_h(avail);
+        r.h = sh.min(fit).min(avail).max(min_h());
+    }
+    r
 }
 
 /// 两个矩形是否相交
@@ -340,14 +386,19 @@ pub fn align_first_row_left(rects: &mut [Rect], anchor_x: f32) -> bool {
 
 // ---------- 拖拽插入落位(2026-09-02:行内槽位模型,纯几何可单测) ----------
 
-/// 行带聚类:按 y 中心排序,中心间距 > 0.6*min(高)(至少 24) 开新带;
-/// 带内按 x 升序。返回各带成员在输入中的下标,带序自上而下。
-/// 任意层数通用(三层/四层…只是多几个带)。
+/// 行带聚类(2026-09-16 改顶对齐口径):按 y 排序,顶边距当前行顶 >
+/// 0.6*min(高)(至少 24) 开新带;带内按 x 升序。返回各带成员在输入中的
+/// 下标,带序自上而下。任意层数通用(三层/四层…只是多几个带)。
+/// 旧版按 y 中心聚类:把行内某栅栏拖高后其中心下移,与右邻中心差超过
+/// 容差→右邻被判成新行→级联把它推到高栅栏下方="右边的被莫名其妙移动"
+/// (2026-09-16 用户实测)。行=顶对齐的带,与"第一行/第二行"的用户模型
+/// 一致:同顶即同行,高度差不影响分组。
 pub fn rows_from_rects(rects: &[Rect]) -> Vec<Vec<usize>> {
     let mut order: Vec<usize> = (0..rects.len()).collect();
     order.sort_by(|&a, &b| {
-        (rects[a].y + rects[a].h * 0.5)
-            .partial_cmp(&(rects[b].y + rects[b].h * 0.5))
+        rects[a]
+            .y
+            .partial_cmp(&rects[b].y)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut rows: Vec<Vec<usize>> = Vec::new();
@@ -355,9 +406,13 @@ pub fn rows_from_rects(rects: &[Rect]) -> Vec<Vec<usize>> {
         let r = &rects[idx];
         let start_new = match rows.last() {
             Some(row) => {
-                let prev = &rects[row[0]];
-                let tol = 0.6 * prev.h.min(r.h).max(24.0);
-                (r.y + r.h * 0.5) - (prev.y + prev.h * 0.5) > tol
+                let row_top = row.iter().map(|&i| rects[i].y).fold(f32::MAX, f32::min);
+                let min_h = row
+                    .iter()
+                    .map(|&i| rects[i].h.min(r.h))
+                    .fold(f32::MAX, f32::min);
+                let tol = 0.6 * min_h.max(24.0);
+                r.y - row_top > tol
             }
             None => true,
         };
@@ -609,61 +664,25 @@ pub fn flow_layout(rects: &mut [Rect], vx: f32, vy: f32, vw: f32, vh: f32) -> Ve
     order
 }
 
+/// 工作区能容纳的最大整行栅栏高度(与 snap_fence_size 同一套全局格距)。
+/// "夹回屏幕"必须落在整行边界:夹到原始 vh 会留下最多一行高的非整行
+/// 空白(2026-09-16 用户实拍"栅栏高≈屏幕高时底部一节空白"的成因之一)。
+pub fn max_whole_row_h(vh: f32) -> f32 {
+    let (title_h, pad) = chrome(dpi_scale());
+    let rows = (((vh - title_h - pad * 2.0) / cell_h()).floor() as usize).max(1);
+    title_h + rows as f32 * cell_h() + pad * 2.0 + 2.0
+}
+
 /// 多显示器版含屏:每个矩形按中心点就近夹回对应显示器工作区
 /// (必要时缩小尺寸),支持栅栏分布在多台显示器上。
+/// 只做夹回,不解重叠:夹回(高度收缩/上移)引入的跨行重叠若在此用
+/// push_away 解,单轴最小位移会选水平推出,把上一行整体挤向右
+/// (2026-09-16 用户实拍"第一行被挤走、每行都乱套")——重叠统一交给
+/// 调用方的行级联+超屏整行收缩(push_settle ⑥)纵向解决。
 pub fn fit_to_monitors(rects: &mut [Rect], areas: &[(f32, f32, f32, f32)]) {
     if rects.is_empty() || areas.is_empty() {
         return;
     }
-    for _ in 0..4 {
-        for r in rects.iter_mut() {
-            let cx = r.x + r.w * 0.5;
-            let cy = r.y + r.h * 0.5;
-            let best = areas.iter().min_by(|a, b| {
-                let da = area_center_dist(cx, cy, a);
-                let db = area_center_dist(cx, cy, b);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let Some(&(vx, vy, vw, vh)) = best else {
-                return;
-            };
-            if r.w > vw {
-                r.w = vw;
-            }
-            if r.h > vh {
-                r.h = vh;
-            }
-            if r.x < vx {
-                r.x = vx;
-            } else if r.x + r.w > vx + vw {
-                r.x = vx + vw - r.w;
-            }
-            if r.y < vy {
-                r.y = vy;
-            } else if r.y + r.h > vy + vh {
-                r.y = vy + vh - r.h;
-            }
-        }
-        // After clamping, re-resolve any overlaps that were introduced.
-        let mut moved = false;
-        for i in 0..rects.len() {
-            for j in (i + 1)..rects.len() {
-                if conflicts_gap(&rects[i], &rects[j]) {
-                    let pushed = push_away(&rects[i], &rects[j]);
-                    if pushed != rects[j] {
-                        rects[j] = pushed;
-                        moved = true;
-                    }
-                }
-            }
-        }
-        if !moved {
-            break;
-        }
-    }
-    // 边界硬约束:上面的解重叠可能把栅栏重新推出屏幕。
-    // 最后无条件再夹回一轮(不再解重叠),保证任何情况栅栏都不出四边;
-    // 若仍重叠,宁可见重叠也不出屏。
     for r in rects.iter_mut() {
         let cx = r.x + r.w * 0.5;
         let cy = r.y + r.h * 0.5;
@@ -679,7 +698,8 @@ pub fn fit_to_monitors(rects: &mut [Rect], areas: &[(f32, f32, f32, f32)]) {
             r.w = vw;
         }
         if r.h > vh {
-            r.h = vh;
+            // 高度向下取整到整行(不足一行放不下就不放),不留半行空白
+            r.h = max_whole_row_h(vh);
         }
         if r.x < vx {
             r.x = vx;
@@ -776,6 +796,11 @@ pub fn shrink_to_fit(r: &Rect, others: &[Rect]) -> Rect {
 
 /// 被拖栅栏自己让位：与 others 冲突时只推自己（其它栅栏位置不变），
 /// 再夹回屏幕。用于「挤压后其它栅栏不动、只调整被拖栅栏」。
+/// **屏幕边缘死锁解（2026-09-16）**：push_away 选最小位移轴,在屏幕边缘
+/// 该方向可能出屏,fit_to_screen 夹回会让重叠复活(右缘 A+拖入 B:向右
+/// 推→出屏→夹回→又叠上)。故夹回后仍有冲突时,改用"屏内可行方向"重推:
+/// 四方向各试,只保留推出后**完整落在工作区内**的,取位移最小者;无可行
+/// 方向(物理放不下)才保留重叠。中央场景第一阶段已无冲突,此阶段为 no-op。
 pub fn avoid_overlap(r: &Rect, others: &[Rect], vx: f32, vy: f32, vw: f32, vh: f32) -> Rect {
     let mut nr = *r;
     for _ in 0..16 {
@@ -795,7 +820,66 @@ pub fn avoid_overlap(r: &Rect, others: &[Rect], vx: f32, vy: f32, vw: f32, vh: f
     }
     let mut tmp = [nr];
     fit_to_screen(&mut tmp, vx, vy, vw, vh);
-    tmp[0]
+    nr = tmp[0];
+    for _ in 0..16 {
+        let mut moved = false;
+        for o in others {
+            if o.w <= 0.0 || o.h <= 0.0 {
+                continue;
+            }
+            if conflicts_gap(&nr, o) {
+                if let Some(pushed) = push_away_in_screen(&nr, o, vx, vy, vw, vh) {
+                    nr = pushed;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    nr
+}
+
+/// 屏内约束版推出:右/左/下/上四方向各算推出量,只保留推出后完整落在
+/// 工作区内的方向,取位移最小;无可行方向返回 None。
+fn push_away_in_screen(
+    rect: &Rect,
+    anchor: &Rect,
+    vx: f32,
+    vy: f32,
+    vw: f32,
+    vh: f32,
+) -> Option<Rect> {
+    let candidates = [
+        anchor.x + anchor.w + GAP - rect.x, // 向右
+        rect.x + rect.w + GAP - anchor.x,   // 向左
+        anchor.y + anchor.h + GAP - rect.y, // 向下
+        rect.y + rect.h + GAP - anchor.y,   // 向上
+    ];
+    let mut best: Option<Rect> = None;
+    let mut best_d = f32::MAX;
+    for (k, &push) in candidates.iter().enumerate() {
+        if push <= 0.0 {
+            continue;
+        }
+        let mut c = *rect;
+        match k {
+            0 => c.x += push,
+            1 => c.x -= push,
+            2 => c.y += push,
+            _ => c.y -= push,
+        }
+        let inside = c.x >= vx - 0.5
+            && c.x + c.w <= vx + vw + 0.5
+            && c.y >= vy - 0.5
+            && c.y + c.h <= vy + vh + 0.5;
+        if inside && push < best_d {
+            best_d = push;
+            best = Some(c);
+        }
+    }
+    best
 }
 
 // ---------- 基础几何 ----------
@@ -980,7 +1064,7 @@ pub fn category_table() -> Vec<CategoryDef> {
     }
     g.as_ref().unwrap().clone()
 }
-/// 更新分类表缓存(持久化由 ui 层 update_stored_settings 负责)
+/// 更新分类表缓存(持久化由 settings 模块 update_stored_settings 负责)
 pub fn set_category_table(t: Vec<CategoryDef>) {
     *CATEGORY_TABLE.lock().unwrap() = Some(t);
 }
@@ -1198,7 +1282,9 @@ pub fn hit_test_with_metrics(
         return Hit::None;
     }
     // 倒三角小块本身优先(小块内点击=操作菜单);小块之外的角/边热区
-    // 仍归缩放拖拽。小块几何与 render.rs draw_title 保持一致:
+    // 仍归缩放拖拽。小块几何与 render.rs draw_title 保持一致(2026-09-16
+    // 实证:渲染目标 dpiX/Y=96 即坐标即物理像素,标题区刻意用未缩放常量
+    // ——勿再"修复"成 metrics 缩放,那会让小块/文字在高分屏放大失真):
     // 26×16,距右缘 3,垂直中心=标题文字中心
     let chip_cy = (4.0 + TITLE_H - 2.0) * 0.5;
     let chip_x0 = w - 3.0 - 26.0;
@@ -1460,8 +1546,9 @@ pub struct Settings {
     /// 分类名/栅栏标题是用户数据,不随语言变。
     #[serde(default = "default_lang")]
     pub lang: String,
-    /// 一次性首启引导(2026-09-11):false=启动末尾弹出引导窗;窗口任何关闭
-    /// 路径(OK/X)都写 true——用户约定"最多只出现一次"。
+    /// 首启引导(2026-09-11;2026-09-16 语义改为"用户勾选了不再提示"):
+    /// false=启动末尾弹出引导窗;关闭时勾选了"不再提示"复选框才写 true,
+    /// 不勾则下次启动再次弹出。
     #[serde(default)]
     pub first_run_done: bool,
     /// 用户手动删除的分类栅栏墓碑(分类名→删除时刻 epoch ms):删除后该
@@ -1583,18 +1670,43 @@ pub fn load_settings_from(path: &std::path::Path) -> Settings {
                 .and_then(|b| b.as_bool())
                 .map(|b| if b { "auto" } else { "free" })
                 .unwrap_or("auto");
-            Settings {
+            let mut s = Settings {
                 align_mode: mode.into(),
-                render_mode: default_render_mode(),
-                auto_category: default_auto_category(),
-                desktop_state: default_desktop_state(),
-                z_guard: default_z_guard(),
-                show_chrome: false,
-                lang: default_lang(),
-                first_run_done: false,
-                deleted_category_at: Default::default(),
-                categories: default_categories(),
+                ..Settings::default()
+            };
+            // 迁移不丢老字段(2026-09-16 修复):旧文件里新版认识的其他字段
+            // 原样回填——旧实现整表默认,老用户(v0.1.0/0.1.1)升级会丢
+            // show_chrome/desktop_state/render_mode 等既有设置
+            if let Some(v) = &legacy {
+                if let Some(x) = v.get("render_mode").and_then(|x| x.as_str()) {
+                    s.render_mode = x.into();
+                }
+                if let Some(x) = v.get("auto_category").and_then(|x| x.as_bool()) {
+                    s.auto_category = x;
+                }
+                if let Some(x) = v.get("desktop_state").and_then(|x| x.as_str()) {
+                    s.desktop_state = x.into();
+                }
+                if let Some(x) = v.get("z_guard").and_then(|x| x.as_bool()) {
+                    s.z_guard = x;
+                }
+                if let Some(x) = v.get("show_chrome").and_then(|x| x.as_bool()) {
+                    s.show_chrome = x;
+                }
+                if let Some(x) = v.get("lang").and_then(|x| x.as_str()) {
+                    s.lang = x.into();
+                }
+                if let Some(x) = v.get("first_run_done").and_then(|x| x.as_bool()) {
+                    s.first_run_done = x;
+                }
+                if let Some(x) = v
+                    .get("deleted_category_at")
+                    .and_then(|x| serde_json::from_value(x.clone()).ok())
+                {
+                    s.deleted_category_at = x;
+                }
             }
+            s
         }
     }
 }
@@ -1638,7 +1750,11 @@ pub fn save_settings(s: &Settings) {
 /// 可注入路径版本(单测用),其余行为与 save_settings 完全一致
 pub fn save_settings_to(path: &std::path::Path, s: &Settings) {
     let json = serde_json::to_string_pretty(s).unwrap_or_default();
-    let _ = atomic_write(path, &json);
+    // 设置落盘失败=用户偏好丢失(调用方不查结果);单测注入临时路径走同一
+    // 函数,成功路径零输出。
+    if let Err(e) = atomic_write(path, &json) {
+        crate::logging::log(&format!("settings save failed: {e}"));
+    }
 }
 
 /// DeskFence 接管会话标记。它只表示本程序曾临时隐藏过原生桌面图标，
@@ -1819,15 +1935,26 @@ pub fn load_config() -> Vec<Fence> {
     if !p.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&p)
+    let loaded = std::fs::read_to_string(&p)
         .ok()
-        .and_then(|s| serde_json::from_str::<Vec<Fence>>(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str::<Vec<Fence>>(&s).ok());
+    // 损坏的 config.json 静默回默认布局,且下一次落盘会把坏文件覆盖掉——
+    // 用户"布局全丢"将无迹可查,留一行现场(仅 boot 加载,不刷屏)。
+    if loaded.is_none() {
+        crate::logging::log("config.json unreadable, falling back to default layout");
+    }
+    loaded.unwrap_or_default()
 }
 
 pub fn save_config(fences: &[Fence]) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(fences).unwrap_or_default();
-    atomic_write(&config_path(), &json)
+    let r = atomic_write(&config_path(), &json);
+    // 布局落盘失败=用户调整丢失;调用方全部 let _ 丢弃结果,在唯一的
+    // 写入点集中记一行,免得到处补检查。
+    if let Err(e) = &r {
+        crate::logging::log(&format!("config.json save failed: {e}"));
+    }
+    r
 }
 
 pub fn build_global_config(files: &[FileItem]) -> Vec<Fence> {
@@ -2743,6 +2870,67 @@ mod tests {
     }
 
     #[test]
+    fn resize_drop_rect_north_respects_limit() {
+        // 松手=预览所见(2026-09-16):北向底边钉住、顶边不越下限、高度整行
+        // 且不超"底边到下限";南向顶边钉住、底不出屏
+        set_dpi_scale(1.0);
+        set_cell_pads(43.0, 54.0);
+        set_icon_size(32.0); // cells 75x86, chrome(26,6), min_h=126
+        let cur = Rect {
+            x: 0.0,
+            y: 500.0,
+            w: 156.0,
+            h: 344.0,
+        };
+        let bot = cur.y + cur.h; // 844
+        let r = resize_drop_rect(cur, true, 600.0, 1208.0);
+        assert!(r.y >= 600.0 - 0.5, "y={} 越过下限", r.y);
+        assert!((r.y + r.h - bot).abs() < 0.5, "底边应钉住");
+        assert!(r.h <= bot - 600.0 + 0.5);
+        // 南向:顶边钉住,底不出屏
+        let cur2 = Rect {
+            x: 0.0,
+            y: 1080.0,
+            w: 156.0,
+            h: 344.0,
+        };
+        let r2 = resize_drop_rect(cur2, false, 0.0, 1208.0);
+        assert!((r2.y - cur2.y).abs() < 0.5, "顶边应钉住");
+        assert!(r2.y + r2.h <= 1208.0 + 0.5, "底边出屏");
+    }
+
+    #[test]
+    fn rescale_preserves_rows_and_cols() {
+        // 行列保持(2026-09-16):旧格距下 2列×4行 的矩形,换算到新格距后
+        // 行列数不变、像素跟随;换回去可逆
+        set_dpi_scale(1.0);
+        set_cell_pads(43.0, 54.0);
+        set_icon_size(32.0); // cells 75 x 86
+        let (title_h, pad) = chrome(1.0);
+        let old_h = title_h + 4.0 * cell_h() + pad * 2.0 + 2.0;
+        let old_w = 2.0 * cell_w() + pad * 2.0 + 2.0;
+        let mut rects = vec![Rect {
+            x: 10.0,
+            y: 20.0,
+            w: old_w,
+            h: old_h,
+        }];
+        let (ocw, och) = (cell_w(), cell_h());
+        set_icon_size(48.0); // cells 91 x 102
+        rescale_rects_to_cells(&mut rects, ocw, och);
+        let (t2, p2) = chrome(1.0);
+        assert!((rects[0].w - (2.0 * cell_w() + p2 * 2.0 + 2.0)).abs() < 0.5); // 仍是 2 列
+        assert!((rects[0].h - (t2 + 4.0 * cell_h() + p2 * 2.0 + 2.0)).abs() < 0.5); // 仍是 4 行
+        assert_eq!(rects[0].x, 10.0); // 位置不动
+                                      // 换回旧格距可逆
+        let (ncw, nch) = (cell_w(), cell_h());
+        set_icon_size(32.0);
+        rescale_rects_to_cells(&mut rects, ncw, nch);
+        assert!((rects[0].w - old_w).abs() < 0.5);
+        assert!((rects[0].h - old_h).abs() < 0.5);
+    }
+
+    #[test]
     fn suggested_rect_preserves_position_and_size() {
         assert_eq!(
             suggested_rect(-1920, 80, -1520, 380),
@@ -3123,6 +3311,37 @@ mod tests {
             s
         );
         assert!(s.x >= -0.01 && s.x + s.w <= 1920.01, "in screen {:?}", s);
+    }
+
+    #[test]
+    fn avoid_overlap_screen_edge_no_revival() {
+        // 屏幕边缘死锁解(2026-09-16):A 贴右缘,B 拖到与 A 重叠——旧的
+        // 最小位移轴选中"向右推",出屏后 fit 夹回=重叠复活。现在必须
+        // 无重叠且完整在屏内(改推屏内可行方向)。
+        let a = Rect {
+            x: 1700.0,
+            y: 100.0,
+            w: 200.0,
+            h: 300.0,
+        };
+        let b = Rect {
+            x: 1750.0,
+            y: 150.0,
+            w: 200.0,
+            h: 300.0,
+        };
+        let s = avoid_overlap(&b, &[a], 0.0, 0.0, 1920.0, 1208.0);
+        assert!(!conflicts_gap(&s, &a), "边缘重叠复活: {:?} vs {:?}", s, a);
+        assert!(
+            s.x >= -0.01 && s.x + s.w <= 1920.01,
+            "out of screen {:?}",
+            s
+        );
+        assert!(
+            s.y >= -0.01 && s.y + s.h <= 1208.01,
+            "out of screen {:?}",
+            s
+        );
     }
 
     #[test]

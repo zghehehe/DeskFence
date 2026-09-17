@@ -1,22 +1,17 @@
 //! 窗口管理与交互：栅栏窗口、命中测试、移动/缩放/滚动、右键菜单、刷新(重命名子系统见 rename.rs)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use windows::core::BOOL;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, ScreenToClient, HBRUSH, HDC, HFONT,
-    HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{ScreenToClient, HBRUSH};
 use windows::Win32::System::Com::CoInitializeEx;
 use windows::Win32::System::Ole::RevokeDragDrop;
-use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, ReleaseCapture, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LEFT,
@@ -25,233 +20,43 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAW,
 };
-// windows 0.52 未导出的 WinEvent 标志,按 WinUser.h 补定义
+// windows crate 未导出的 WinEvent 标志(0.62 仍缺),按 WinUser.h 补定义
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::drag::*;
+use crate::envhealth::*;
+use crate::hosts::*;
 use crate::iconcache::{load_icon_cache_file, save_icon_cache_file_now};
+use crate::logging::log;
 use crate::menu::{delete_fence_ex, quit_app, set_render_mode, show_tray_menu};
-use crate::model::{self, Fence, FileItem, Hit, Rect};
+use crate::metrics::*;
+use crate::model::{self, Fence, FileItem, Rect};
+use crate::monitors::*;
 use crate::ole;
+use crate::present::*;
 use crate::rename::*;
 use crate::render;
-use crate::render::{IconBuffer, Renderer, Surface};
+use crate::render::{Renderer, Surface};
 use crate::selfheal::*;
+use crate::settings::*;
 use crate::shell;
-
-fn class_name() -> PCWSTR {
-    static W: OnceLock<Vec<u16>> = OnceLock::new();
-    let v = W.get_or_init(|| "DeskFenceFence\0".encode_utf16().collect());
-    PCWSTR::from_raw(v.as_ptr())
-}
-
-pub(crate) fn tray_class_name() -> PCWSTR {
-    static W: OnceLock<Vec<u16>> = OnceLock::new();
-    let v = W.get_or_init(|| "DeskFenceTray\0".encode_utf16().collect());
-    PCWSTR::from_raw(v.as_ptr())
-}
-
-pub(crate) fn guide_class_name() -> PCWSTR {
-    static W: OnceLock<Vec<u16>> = OnceLock::new();
-    let v = W.get_or_init(|| "DeskFenceGuide\0".encode_utf16().collect());
-    PCWSTR::from_raw(v.as_ptr())
-}
-
-/// 菜单前台宿主专用类:历史上复用栅栏类,外部探针与自家 drag_elevate_anchor
-/// 的兄弟栅栏扫描都会把它误当真栅栏(2026-08-28 wdprobe 实测数出 6 个"栅栏")。
-fn menu_host_class_name() -> PCWSTR {
-    static W: OnceLock<Vec<u16>> = OnceLock::new();
-    let v = W.get_or_init(|| "DeskFenceMenuHost\0".encode_utf16().collect());
-    PCWSTR::from_raw(v.as_ptr())
-}
-
-pub(crate) fn hinstance() -> HINSTANCE {
-    unsafe {
-        HINSTANCE(
-            windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-                .unwrap_or_default()
-                .0,
-        )
-    }
-}
-
-fn deskfence_icon() -> HICON {
-    // PCWSTR(1) = MakeIntResourceW(1),即 DeskFence.rc 里 ID=1 的图标资源。
-    // 不能按 clippy 建议换成 ptr::dangling()(地址=对齐值 2,会查错资源)
-    #[allow(clippy::manual_dangling_ptr)]
-    unsafe {
-        LoadIconW(hinstance(), PCWSTR(1usize as *const u16)).unwrap_or_default()
-    }
-}
-
-/// 对齐模式(三档):"auto"=固定间隔自动对齐(默认,实时挤压+等距流式);
-/// "grid"=按图标格宽/高的整数倍步进停靠;"free"=完全自由移动。
-static ALIGN_MODE: Mutex<String> = Mutex::new(String::new());
-pub fn align_mode() -> String {
-    {
-        let g = ALIGN_MODE.lock().unwrap();
-        if !g.is_empty() {
-            return g.clone();
-        }
-    }
-    let m = model::load_settings().align_mode;
-    *ALIGN_MODE.lock().unwrap() = m.clone();
-    m
-}
-/// 统一的设置落盘入口:读 settings.json → 就地改一个字段 → 原子写回。
-/// 旧实现是 5 处 set_*_stored 各自手工重建 Settings 逐字段拷贝,新增字段
-/// 漏改任意一处=静默把该字段写回默认值(实锤:每次开关托盘设置都会把
-/// deleted_category_at 墓碑表整个清空,已删的分类栅栏随后被缺类补建复活)。
-/// 收敛后新增 Settings 字段无需改这里,任何部分更新天然保留其余字段。
-pub(crate) fn update_stored_settings(f: impl FnOnce(&mut model::Settings)) {
-    let mut s = model::load_settings();
-    f(&mut s);
-    model::save_settings(&s);
-}
-
-/// 写入对齐档位并立即持久化到设置文件
-pub(crate) fn set_align_mode_stored(mode: &str) {
-    *ALIGN_MODE.lock().unwrap() = mode.to_string();
-    update_stored_settings(|s| s.align_mode = mode.to_string());
-}
-pub fn auto_align_on() -> bool {
-    align_mode() == "auto"
-}
-pub fn grid_align_on() -> bool {
-    align_mode() == "grid"
-}
-
-/// 渲染模式:"transparent"=透明窗口(默认);"precise"=精确模式。
-/// 2026-08-26 起两模式共用同一渲染管线(透明底+seeded GDI ClearType 文字),
-/// 区别仅剩启动守卫:精确模式等首帧壁纸种子就绪再呈现,透明模式立即呈现
-/// (种子缺失时黑种子兜底)。菜单勾选文案保留两档供用户选择。
-static RENDER_MODE: Mutex<String> = Mutex::new(String::new());
-pub fn render_mode() -> String {
-    {
-        let g = RENDER_MODE.lock().unwrap();
-        if !g.is_empty() {
-            return g.clone();
-        }
-    }
-    let m = model::load_settings().render_mode;
-    *RENDER_MODE.lock().unwrap() = m.clone();
-    m
-}
-pub(crate) fn set_render_mode_stored(mode: &str) {
-    *RENDER_MODE.lock().unwrap() = mode.to_string();
-    update_stored_settings(|s| s.render_mode = mode.to_string());
-}
-
-/// 桌面状态(持久化):normal=栅栏显示 / zen=纯净(只剩壁纸) / native=原生图标。
-/// 切换即落盘,启动按此恢复;所有 Settings 落盘点都要带上当前值。
-static DESKTOP_STATE: Mutex<String> = Mutex::new(String::new());
-pub fn desktop_state() -> String {
-    {
-        let g = DESKTOP_STATE.lock().unwrap();
-        if !g.is_empty() {
-            return g.clone();
-        }
-    }
-    let m = model::load_settings().desktop_state;
-    *DESKTOP_STATE.lock().unwrap() = m.clone();
-    m
-}
-pub(crate) fn set_desktop_state_stored(mode: &str) {
-    *DESKTOP_STATE.lock().unwrap() = mode.to_string();
-    update_stored_settings(|s| s.desktop_state = mode.to_string());
-}
-
-/// 自动分类开关(2026-09-09 起单一真相=model 的线程局部缓存,boot 预热;
-/// false=自定义分类模式:文件只进被拖入的栅栏,未归位文件进兜底"其他")
-pub fn auto_category() -> bool {
-    model::auto_category()
-}
-pub(crate) fn set_auto_category_stored(v: bool) {
-    model::set_auto_category(v);
-    update_stored_settings(|s| s.auto_category = v);
-}
-
-/// z 守卫设置(缓存读取,模式同上):菜单落盘点需要带上当前值。
-/// 2026-09-08 起暴露为托盘开关(异常降级用),缓存需可写。
-static Z_GUARD: Mutex<Option<bool>> = Mutex::new(None);
-pub(crate) fn z_guard_setting() -> bool {
-    let mut g = Z_GUARD.lock().unwrap();
-    if let Some(v) = *g {
-        return v;
-    }
-    let v = model::load_settings().z_guard;
-    *g = Some(v);
-    v
-}
-
-/// 常显栅栏边框线(托盘开关,默认关=悬停/拖拽才浮现,2026-09-01 用户新增):
-/// 开=全部栅栏常显边框/标题/角手柄,便于观察布局边界;关=无边框常显基线。
-static SHOW_CHROME: AtomicBool = AtomicBool::new(false);
-
-pub fn chrome_always_on() -> bool {
-    SHOW_CHROME.load(Ordering::Relaxed)
-}
-pub(crate) fn set_show_chrome_stored(on: bool) {
-    SHOW_CHROME.store(on, Ordering::Relaxed);
-    update_stored_settings(|s| s.show_chrome = on);
-}
-
-/// 界面语言设置("auto"/"zh"/"en",默认 auto,2026-09-11):有效语言缓存在
-/// lang::EFFECTIVE 原子量,启动预热;切换时同步改原子量+落盘。菜单每次
-/// 现建、面板每次现开,查表即时生效,无需重启。
-pub fn lang_setting_value() -> String {
-    model::load_settings().lang
-}
-pub(crate) fn set_lang_stored(v: &str) {
-    crate::lang::set_effective(crate::lang::resolve(v, crate::lang::system_prefers_zh()));
-    update_stored_settings(|s| s.lang = v.to_string());
-}
-
-/// 分类栅栏删除墓碑:删除时刻 epoch ms。墓碑在位的分类不再被缺类补建
-/// 复活,除非之后出现该类的新文件(mtime 晚于墓碑)——那时清除墓碑并
-/// 正常补建,保留"首次出现该类文件会自动新建"的原设计。
-fn category_tombstone_at(cat: &str) -> Option<u64> {
-    model::load_settings().deleted_category_at.get(cat).copied()
-}
-pub(crate) fn set_category_tombstone(cat: &str) {
-    let mut s = model::load_settings();
-    s.deleted_category_at
-        .insert(cat.to_string(), model::epoch_ms());
-    model::save_settings(&s);
-}
-pub(crate) fn clear_category_tombstone(cat: &str) {
-    let mut s = model::load_settings();
-    if s.deleted_category_at.remove(cat).is_some() {
-        model::save_settings(&s);
-    }
-}
-/// 重建"已收纳(pinned)"路径表(自定义分类模式的数据源)
-pub(crate) fn rebuild_pins() {
-    let s = state().lock().unwrap();
-    model::rebuild_pinned_registry(&s.fences);
-}
-
-/// 精确模式是否生效(用户开启)。动态壁纸检测已退役(2026-08-26):ink 常驻
-/// 后背景实时透出、阴影背景无关,动态壁纸不再构成降级理由;两模式共用同一
-/// 条 seeded 文字管线,区别仅剩启动守卫(精确模式等首帧种子就绪再呈现)。
-pub fn precise_mode_on() -> bool {
-    render_mode() == "precise"
-}
+use crate::state::*;
+use crate::wallpaper::{
+    capture_fallback_due, is_black_frame, load_wallpaper_cache, save_wallpaper_cache,
+    wallpaper_changed_under_fences,
+};
+use crate::winids::*;
 
 const TIMER_GLOBAL: usize = 1;
 /// 悬停延迟提交定时器（图标高亮与原生桌面一致需悬停 ~400ms 才出现）
 pub(crate) const TIMER_HOVER: usize = 2;
 const TIMER_ANIMATION: usize = 3;
-/// 壁纸追赶定时器:精确模式快照缺失时以 200ms 节奏重捕获,
-/// 就绪后一次性整帧重绘,避免栅栏先出 D2D 文字帧再切换成 ClearType+阴影
-const TIMER_WALLPAPER_CATCHUP: usize = 5;
 /// 壁纸跟随定时器:Themes 目录事件后 250ms 防抖再捕获比对,
 /// 未变化则短重试(Explorer 分多步写缓存、DWM 切换略有延迟)
 const TIMER_WALLPAPER_FOLLOW: usize = 6;
 /// 桌面态快速自检定时器:三指手势的窗口扫动不发任何 WinEvent,
 /// 恢复过渡的检测只能靠轮询(见 zcheck_fences_now 注释)
 const TIMER_DESKTOP_WATCH: usize = 7;
-pub(crate) const EM_SETSEL: u32 = 0x00B1;
 pub(crate) const RENAME_COMMIT_MSG: u32 = WM_USER + 1;
 pub(crate) const RENAME_CANCEL_MSG: u32 = WM_USER + 2;
 
@@ -270,170 +75,9 @@ const WM_DL3_WALLPAPER_DIRTY: u32 = WM_APP + 6;
 /// 后台扫描完成:扫描线程投递,UI 线程在托盘消息里应用结果(apply_pending_scan)
 const WM_DL3_SCAN_APPLY: u32 = WM_APP + 8;
 /// 全局 z 序事件触发的高速自检请求(WinEvent 回调合并投递)
-pub(crate) const WM_DL3_ZCHECK: u32 = WM_APP + 7;
-/// windows 0.52 crate 未导出,按 Win32 头文件补定义
+/// windows crate 未导出(0.62 仍缺),按 Win32 头文件补定义
 const WM_MOUSELEAVE: u32 = 0x02A3;
-pub(crate) static TRAY_HWND: OnceLock<HWND> = OnceLock::new();
-/// 菜单前台宿主窗口(1x1 隐形):菜单前台化的目标,避免提升栅栏窗口 z 序
-pub(crate) static MENU_HOST_HWND: OnceLock<HWND> = OnceLock::new();
-
-/// 菜单 owner 用的前台宿主;尚未创建时回退到调用方窗口
-pub fn menu_host_or(fallback: HWND) -> HWND {
-    MENU_HOST_HWND.get().copied().unwrap_or(fallback)
-}
-static TASKBAR_CREATED_MSG: OnceLock<u32> = OnceLock::new();
 static TICK_COUNT: AtomicU32 = AtomicU32::new(0);
-fn taskbar_created_msg() -> u32 {
-    *TASKBAR_CREATED_MSG.get_or_init(|| unsafe {
-        let name = shell::wide("TaskbarCreated");
-        RegisterWindowMessageW(PCWSTR::from_raw(name.as_ptr()))
-    })
-}
-pub(crate) struct UiState {
-    pub renderer: Option<Renderer>,
-    pub fences: Vec<Fence>,
-    pub files: Vec<FileItem>,
-    pub icon_cache: HashMap<String, IconBuffer>,
-    pub windows: HashMap<u32, HWND>,
-    pub metrics: HashMap<u32, model::DpiMetrics>,
-    pub surfaces: HashMap<u32, Surface>,
-    /// Fence ids whose most recent UpdateLayeredWindow call succeeded.
-    pub presented: HashSet<u32>,
-    /// Fence ids successfully inserted behind a currently valid desktop host.
-    pub attached: HashSet<u32>,
-    pub hover: HashMap<u32, Option<usize>>,
-    /// 悬停延迟生效中的待提交悬停(原生桌面高亮有 ~400ms 悬停延迟)
-    pub hover_pending: HashMap<u32, Option<usize>>,
-    pub hover_hit: HashMap<u32, Hit>,
-    /// Explorer 风格文件选择，以规范路径为稳定身份；跨栅栏多选也不会因排序变化丢失。
-    pub selected_paths: HashSet<String>,
-    pub focused_path: Option<String>,
-    pub selection_anchor: Option<String>,
-    pub marquee: Option<(f32, f32, f32, f32)>,
-    pub active_fence: Option<u32>,
-    /// 鼠标是否悬停在某个栅栏窗口上(决定是否浮现卡片/标题/滚动条)
-    pub fence_hover: HashMap<u32, bool>,
-    /// 栅栏卡片悬停的延迟提交标记(与图标 hover 同款 400ms 延迟)
-    pub fence_hover_pending: HashMap<u32, bool>,
-    pub drag: Option<Drag>,
-    pub rename_fence: Option<u32>,
-    pub rename_edit: Option<HWND>,
-    /// 文件就地重命名的 EDIT 窗口（图标名标签上的编辑框）
-    pub file_rename_edit: Option<HWND>,
-    /// Target-fence metrics and stable cell centers for active file editors.
-    pub rename_metrics: HashMap<isize, model::DpiMetrics>,
-    pub rename_centers: HashMap<isize, i32>,
-    pub rename_fonts: HashMap<isize, HFONT>,
-    /// 拖动节流：上次真正重排时的鼠标位置（用于抑制高频 WM_MOUSEMOVE 抖动）
-    pub drag_settle_x: f32,
-    pub drag_settle_y: f32,
-    /// resize 时间节流:上次表面重建时刻(毫秒),限制重建频率保证 1:1 跟手不卡顿
-    pub last_resize_ms: u64,
-    /// 栅栏移动时间节流:上次移动呈现时刻(毫秒),逐像素跟随但限频
-    pub last_move_ms: u64,
-    /// 拖动中内容重渲染(壁纸种子重烘焙)节拍:上次全量 refresh_fence 时刻。
-    /// 位置跟随已由"已有像素重呈现"逐帧完成,内容重烘焙降到 ~30fps。
-    pub last_drag_render_ms: u64,
-    /// 内部图标拖拽残影:被拖图标(半透明)跟随鼠标的屏幕坐标绘制在 overlay 上
-    pub drag_ghost: Option<(Vec<String>, f32, f32)>,
-    /// 拖拽实时预览(松手生效,取消回滚)
-    pub ghost_preview: Option<GhostPreview>,
-    /// 插入指示线(屏幕坐标 x,y,w,h;w<=h 为竖线=水平邻居间,否则横线)。
-    /// 拖动中被拖对象自由跟手、其余完全不动,只有此线提示松手后的插入位置。
-    pub insert_line: Option<(f32, f32, f32, f32)>,
-    /// 图标拖拽悬停在回收站图标上(松手=删除到回收站,不重排)
-    pub trash_target: bool,
-    pub guide_hwnd: Option<HWND>,
-    pub guide_surface: Option<Surface>,
-    pub arrival_animations: Vec<ArrivalAnimation>,
-    /// 精确模式:各桌面宿主的壁纸快照(屏幕坐标)与上次捕获时刻(节流用)
-    pub wallpapers: Vec<render::WallpaperPixels>,
-    pub wallpaper_ms: u64,
-    /// 壁纸捕获连续失败次数(≥2 触发精确模式自动回退透明)
-    pub wallpaper_fails: u32,
-    /// 壁纸已失效待重捕获的时刻(0=无待办)。ink 常驻后快照只作文字种子,
-    /// 重捕获走"懒化"路径:淡入结束+足够安静才执行,不与用户交互赛跑
-    pub wallpaper_dirty_since: u64,
-    /// z 链失位防抖计数:连续两拍失位才修。菜单开合瞬间系统瞬态窗(EdgeUi
-    /// 输入条/第三方软件全屏钩子窗/cloaked CoreWindow)会短暂插进宿主与栅栏之间
-    /// 又立刻退出;单拍误判即整链 SetWindowPos=DWM 重合成闪屏(2026-08-27 用户
-    /// 实感)。真浮出带会连续多拍命中,自愈延迟仅 ~1-2s。
-    pub walk_strikes: HashMap<u32, WalkStrike>,
-    /// strike 最近一次推进的墙钟时刻:global_tick 在 needs_represent 路径会
-    /// 同秒二次调用 ensure_all_attached,不限速则一秒推两拍,"3 拍≈3 秒"
-    /// 的防抖语义失真(2026-08-28 实测 Win+D 沉底 1.4s 即修,与设计意图不符)。
-    pub walk_strike_ms: HashMap<u32, u64>,
-    /// 走查最新结论:所有栅栏健康且带内无可见外来窗(=桌面态)。
-    /// 桌面态下 TIMER_DESKTOP_WATCH 以 250ms 节奏跑高速自检——三指手势
-    /// 恢复不发任何 WinEvent,只有轮询能及时兜住(2026-08-28 实测)。
-    pub band_quiet: bool,
-    /// 批量呈现抑制位(show_all_fences 置位):true 期间 refresh_fence_impl
-    /// 跳过 ShowWindow/SHOWWINDOW——先把全部栅栏表面画完并向隐藏窗提交
-    /// ULW,循环结束一次批量放行。否则"画完一个亮一个",首末栅栏相差
-    /// 整个串行绘制时长,启动时有明显扫过感。
-    pub defer_show_until_batch: bool,
-    /// 每个非隐藏栅栏最近一次"全部就绪"(z 在带+已呈现+窗口可见)的时刻。
-    /// attached 集合每 tick 全清重建,防抖期内失位栅栏会短暂缺席;z-chain
-    /// 防抖窗口(≤3 tick≈3s)不能让 reconcile 的保底恢复误判"没有任何
-    /// 就绪栅栏"而把原生桌面放出来(2026-08-27 实测 1-2s 原生闪现),
-    /// 因此就绪判定对 8s 内健康的栅栏放行。
-    pub last_healthy_ms: HashMap<u32, u64>,
-}
-
-pub(crate) fn state() -> &'static Mutex<UiState> {
-    static S: OnceLock<Mutex<UiState>> = OnceLock::new();
-    S.get_or_init(|| {
-        Mutex::new(UiState {
-            renderer: None,
-            fences: Vec::new(),
-            files: Vec::new(),
-            icon_cache: HashMap::new(),
-            windows: HashMap::new(),
-            metrics: HashMap::new(),
-            surfaces: HashMap::new(),
-            presented: HashSet::new(),
-            attached: HashSet::new(),
-            walk_strikes: HashMap::new(),
-            walk_strike_ms: HashMap::new(),
-            band_quiet: false,
-            defer_show_until_batch: false,
-            last_healthy_ms: HashMap::new(),
-            hover: HashMap::new(),
-            hover_pending: HashMap::new(),
-            hover_hit: HashMap::new(),
-            selected_paths: HashSet::new(),
-            focused_path: None,
-            selection_anchor: None,
-            marquee: None,
-            active_fence: None,
-            fence_hover: HashMap::new(),
-            fence_hover_pending: HashMap::new(),
-            drag: None,
-            rename_fence: None,
-            rename_edit: None,
-            file_rename_edit: None,
-            rename_metrics: HashMap::new(),
-            rename_centers: HashMap::new(),
-            rename_fonts: HashMap::new(),
-            drag_settle_x: 0.0,
-            drag_settle_y: 0.0,
-            last_resize_ms: 0,
-            last_move_ms: 0,
-            last_drag_render_ms: 0,
-            drag_ghost: None,
-            ghost_preview: None,
-            insert_line: None,
-            trash_target: false,
-            guide_hwnd: None,
-            guide_surface: None,
-            arrival_animations: Vec::new(),
-            wallpapers: Vec::new(),
-            wallpaper_ms: 0,
-            wallpaper_fails: 0,
-            wallpaper_dirty_since: 0,
-        })
-    })
-}
 
 /// Clear all transient interaction state before a fence lifecycle change.
 fn clear_all_interaction(s: &mut UiState) {
@@ -480,150 +124,28 @@ pub(crate) fn clear_fence_interaction(s: &mut UiState, fence_id: u32) {
 }
 
 pub(crate) fn finish_interaction_cleanup() {
+    // SAFETY: ReleaseCapture 只作用于当前线程的鼠标捕获状态，无指针参数。
     unsafe {
         let _ = ReleaseCapture();
     }
     let s = state().lock().unwrap();
     if s.arrival_animations.is_empty() {
         if let Some(tray) = TRAY_HWND.get().copied() {
+            // SAFETY: tray 是本进程创建的托盘窗口，句柄存活至退出；
+            // 纯定时器调用，无指针参数。
             unsafe {
-                let _ = KillTimer(tray, TIMER_ANIMATION);
+                let _ = KillTimer(Some(tray), TIMER_ANIMATION);
             }
         }
     }
     if s.drag_ghost.is_none() && s.arrival_animations.is_empty() {
         if let Some(hwnd) = s.guide_hwnd {
+            // SAFETY: guide_hwnd 是本进程创建的引导窗（销毁时 wndproc 清槽），
+            // 槽位非 None 即窗口仍在。
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
-    }
-}
-
-pub fn log(line: &str) {
-    let dir = model::config_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let p = dir.join("run.log");
-    // 轮转:超 4MB 归档为 run.log.old(覆盖旧档),防长期运行无限增长。
-    if let Ok(meta) = std::fs::metadata(&p) {
-        if meta.len() > 4 * 1024 * 1024 {
-            let old = dir.join("run.log.old");
-            let _ = std::fs::remove_file(&old);
-            let _ = std::fs::rename(&p, &old);
-        }
-    }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(p)
-    {
-        // 本地日期+时间:run.log 跨多次启动追加,只有时分秒无法区分天,
-        // 排查偶发问题时对不上用户操作的时刻(2026-08-28 排查实证)。
-        let st = unsafe { GetLocalTime() };
-        let _ = writeln!(
-            f,
-            "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] {}",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, line
-        );
-    }
-}
-
-/// 系统 DPI 缩放系数（进程已 SetProcessDPIAware，坐标系为物理像素）
-fn dpi_scale() -> f32 {
-    unsafe { GetDpiForSystem() as f32 / 96.0 }.max(1.0)
-}
-
-/// 与桌面图标一致的物理像素尺寸：优先实测桌面列表视图的图标格距
-/// （LVM_GETITEMSPACING 返回值即格宽/格高，跨进程可用、不受注册表值过期影响）。
-/// 注意:水平方向格宽可直接拆分；垂直格高包含标题带，不能把它
-/// 当作纯图标留白再次相加。失败时回退到当前注册表值。
-fn current_icon_size() -> f32 {
-    if let Some((cell_w_px, cell_h_px)) = probe_desktop_item_spacing() {
-        // 图标本体:注册表 IconSize(Explorer 在 Ctrl+滚轮时会写入;缺失=默认32)×DPI。
-        // 用实测格距反推留白,保证格宽格高与原生逐像素一致
-        // (垂直格高含文字区,不能用注册表 IconVerticalSpacing 直接算)
-        let icon = shell::desktop_icon_size() * dpi_scale();
-        if (16.0..=256.0).contains(&icon) && cell_w_px > icon && cell_h_px > icon {
-            let pad_x = ((cell_w_px - icon) / dpi_scale()).clamp(16.0, 96.0);
-            // Explorer's vertical spacing includes the caption band. Keep the
-            // measured cell height instead of adding the icon size twice.
-            let pad_y = (cell_h_px / dpi_scale() - icon / dpi_scale()).clamp(16.0, 96.0);
-            model::set_cell_pads(pad_x, pad_y);
-            return icon.round();
-        }
-        log(&format!(
-            "listview spacing {cell_w_px}x{cell_h_px} vs icon {icon} implausible; fallback"
-        ));
-    }
-    (shell::desktop_icon_size() * dpi_scale()).round()
-}
-
-/// The desktop icon preference is stored in logical pixels. WM_DPICHANGED must
-/// use the target window's DPI rather than the process/system DPI so freshly
-/// requested Shell icons and the model grid agree after a monitor crossing.
-fn icon_size_for_dpi(scale: f32) -> f32 {
-    (shell::desktop_icon_size() * scale).round()
-}
-
-/// 实测桌面 SysListView32 的图标格距（物理像素）。
-/// LVM_GETITEMSPACING = LVM_FIRST(0x1000) + 51，返回值 LOWORD=cx HIWORD=cy。
-fn metrics_for_window(hwnd: HWND) -> model::DpiMetrics {
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    // 用初始化时实测的桌面格距（LVM_GETITEMSPACING 反推）保证栅栏格距与原生
-    // 桌面逐像素一致；注册表 IconSpacing 多数机器上不反映真实格高（垂直格高
-    // 含标题带），直接用会让栅栏垂直间距偏离原生桌面。
-    let (pad_x, pad_y) = model::cell_pads();
-    model::DpiMetrics::new(dpi, icon_size_for_dpi(dpi as f32 / 96.0), pad_x, pad_y)
-}
-
-/// 探测结果缓存:probe 要向桌面 SysListView32 跨进程发 LVM_GETITEMSPACING,
-/// 会唤醒 Explorer 宿主窗口工作——菜单等前台切换后宿主的这次重绘表现为
-/// 栅栏区域整面 ~4% 亮度跳变(用户看到的"点桌面关菜单闪一下")。
-/// 2026-08-26 改为**粘性缓存**:键=(注册表 IconSize, 系统 DPI 缩放)——
-/// 格距只在这些输入变化时才会变(Ctrl+滚轮写注册表,换显示器/DPI 改缩放),
-/// 键不变就永不重发探测,把对宿主的骚扰从每 10s 一次降到"配置变化时一次"。
-/// sync_icon_size 的跟随能力不受影响:用户 Ctrl+滚轮 → 注册表变化 → 键失配
-/// → 恰好探测一次并重算格距。
-/// 图标格距探测缓存:键=(注册表 IconSize, 系统 DPI),值=(格距, 残余偏移)
-type SpacingCache = Option<((f32, u32), (f32, f32))>;
-static ITEM_SPACING_CACHE: Mutex<SpacingCache> = Mutex::new(None);
-
-fn probe_desktop_item_spacing() -> Option<(f32, f32)> {
-    let key = (shell::desktop_icon_size(), unsafe {
-        (GetDpiForSystem() as u32).max(96)
-    });
-    {
-        let cache = ITEM_SPACING_CACHE.lock().unwrap();
-        if let Some((k, v)) = *cache {
-            if k == key {
-                return Some(v);
-            }
-        }
-    }
-    let lv = desktop_listview()?;
-    unsafe {
-        let mut res = LRESULT(0);
-        let ok = SendMessageTimeoutW(
-            lv,
-            0x1033,
-            WPARAM(0),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG,
-            200,
-            Some((&mut res.0 as *mut isize).cast()),
-        );
-        if ok.0 == 0 || res.0 == 0 {
-            return None;
-        }
-        let cx = (res.0 & 0xFFFF) as f32;
-        let cy = ((res.0 >> 16) & 0xFFFF) as f32;
-        if cx < 40.0 || cy < 40.0 || cx > 512.0 || cy > 512.0 {
-            return None;
-        }
-        let v = (cx, cy);
-        *ITEM_SPACING_CACHE.lock().unwrap() = Some((key, v));
-        Some(v)
     }
 }
 
@@ -678,6 +200,11 @@ fn sync_icon_size() {
             "icon size synced to {}; fences rescaled to match",
             want
         ));
+        // 格子变大后原矩形可能放不下:先 settle 归一再解重叠
+        settle_all_fences();
+        resolve_overlaps_by_rows();
+        // 运行中重算后同步刷新 sidecar(保存时格距已变)
+        save_layout_cells();
         show_all_fences();
     }
 }
@@ -706,23 +233,36 @@ fn rebuild_render_resources() {
 
 pub fn init() -> bool {
     let t0 = resize_now_ms();
+    // SAFETY: 两个调用均无指针参数。进程级 DPI 感知只需启动时设置一次；
+    // CoInitializeEx 把主线程初始化为 STA——后续全部 shell/COM 调用与窗口
+    // 消息循环都在主线程，正是该初始化所覆盖的线程；失败只记一行日志
+    // （后续壁纸签名轮询等 COM 能力各自静默降级），成功类结果（含
+    // S_FALSE"已初始化"）无害忽略。
     unsafe {
         // Per-monitor v2 keeps physical pixels crisp when a fence moves between monitors.
         // Fall back for older Windows builds without changing any desktop setting.
         if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_err() {
             let _ = SetProcessDPIAware();
         }
-        let _ = CoInitializeEx(
+        let hr = CoInitializeEx(
             None,
             windows::Win32::System::Com::COINIT_APARTMENTTHREADED
                 | windows::Win32::System::Com::COINIT_DISABLE_OLE1DDE,
         );
+        if hr.is_err() {
+            log(&format!(
+                "main thread CoInitializeEx failed: 0x{:08X}",
+                hr.0
+            ));
+        }
     }
     // 必须在设置 DPI awareness 之后读 DPI，否则系统会按未感知返回 96。
     // 顺序：先设 DPI 与注册表留白，再实测图标尺寸（实测成功会同步覆盖留白为精确值）
     model::set_dpi_scale(dpi_scale());
     let (pad_x, pad_y) = shell::desktop_cell_pads();
-    model::set_cell_pads(pad_x, pad_y);
+    // 注册表 IconVerticalSpacing 不随 Ctrl+滚轮更新,极易过时(可能给出
+    // <标签带的留白);钳到 MIN_PAD_Y,防栅栏内行与行重叠
+    model::set_cell_pads(pad_x, pad_y.max(model::MIN_PAD_Y));
     model::set_icon_size(current_icon_size());
     // 系统右键菜单里的"重命名"改由栅栏内就地编辑完成
     shell::set_rename_request_hook(crate::rename::on_shell_rename_request);
@@ -738,11 +278,27 @@ pub fn init() -> bool {
         }
     }
     register_class();
+    // 诊断一行:图标/格距/留白(2026-09-16 排查"图标没跟中图标"时缺地面
+    // 真值;注册表 Bag 值+实测格距都在这里留痕)
+    log(&format!(
+        "boot metrics: icon={}px cells {}x{} pads {:.0}x{:.0} (registry IconSize={})",
+        model::icon_size(),
+        model::cell_w(),
+        model::cell_h(),
+        model::cell_pads().0,
+        model::cell_pads().1,
+        shell::desktop_icon_size()
+    ));
     log(&format!("boot init done ({}ms)", resize_now_ms() - t0));
     true
 }
 
 fn register_class() {
+    // SAFETY(整块): 四个 wndproc 都是 unsafe extern "system" fn，签名与
+    // WNDPROC 一致；类名字符串来自 winids.rs 的 NUL 结尾静态宽字符缓冲，
+    // 终身有效；hinstance() 是本进程模块实例，进程内有效；hCursor/
+    // hbrBackground 置空是 WNDCLASSW 允许的"无默认"（分层窗口不用类画刷）。
+    // 重复注册同名类的失败被容忍（返回错误即可）。
     unsafe {
         let wc = WNDCLASSW {
             style: CS_DBLCLKS,
@@ -751,8 +307,8 @@ fn register_class() {
             cbWndExtra: 0,
             hInstance: hinstance(),
             hIcon: deskfence_icon(),
-            hCursor: HCURSOR(0),
-            hbrBackground: HBRUSH(0),
+            hCursor: HCURSOR(std::ptr::null_mut()),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: class_name(),
         };
@@ -764,8 +320,8 @@ fn register_class() {
             cbWndExtra: 0,
             hInstance: hinstance(),
             hIcon: deskfence_icon(),
-            hCursor: HCURSOR(0),
-            hbrBackground: HBRUSH(0),
+            hCursor: HCURSOR(std::ptr::null_mut()),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: tray_class_name(),
         };
@@ -777,8 +333,8 @@ fn register_class() {
             cbWndExtra: 0,
             hInstance: hinstance(),
             hIcon: deskfence_icon(),
-            hCursor: HCURSOR(0),
-            hbrBackground: HBRUSH(0),
+            hCursor: HCURSOR(std::ptr::null_mut()),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: guide_class_name(),
         };
@@ -792,271 +348,13 @@ fn register_class() {
             cbWndExtra: 0,
             hInstance: hinstance(),
             hIcon: deskfence_icon(),
-            hCursor: HCURSOR(0),
-            hbrBackground: HBRUSH(0),
+            hCursor: HCURSOR(std::ptr::null_mut()),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: menu_host_class_name(),
         };
         let _ = RegisterClassW(&wc4);
     }
-}
-
-// ---------------- 桌面宿主(WorkerW 收养) ----------------
-
-/// 可收养栅栏窗口的桌面宿主:带图标的 WorkerW/Progman(主屏)或
-/// 通过 0x052C 消息生成的每显示器 WorkerW(副屏)。坐标为屏幕坐标。
-#[derive(Clone, Copy)]
-pub(crate) struct HostInfo {
-    pub(crate) hwnd: HWND,
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-    pub(crate) w: f32,
-    pub(crate) h: f32,
-    pub(crate) primary: bool,
-    /// 宿主是否可见:Explorer 重启重建期间 WorkerW 可能短暂隐藏,
-    /// 收养到隐藏宿主会导致栅栏不可见,必须过滤。
-    pub(crate) visible: bool,
-}
-
-static HOSTS_CACHE: OnceLock<Mutex<(std::time::Instant, Vec<HostInfo>)>> = OnceLock::new();
-
-fn invalidate_hosts_cache() {
-    if let Some(cache) = HOSTS_CACHE.get() {
-        let mut c = cache.lock().unwrap();
-        c.0 = std::time::Instant::now() - std::time::Duration::from_secs(10);
-    }
-}
-
-/// 桌面宿主列表(带 500ms 缓存,拖动高频调用不重复枚举窗口)
-pub(crate) fn desktop_hosts() -> Vec<HostInfo> {
-    {
-        if let Some(cache) = HOSTS_CACHE.get() {
-            let c = cache.lock().unwrap();
-            if c.0.elapsed() < std::time::Duration::from_millis(1000) {
-                return c.1.clone();
-            }
-        }
-    }
-    let hosts = refresh_hosts();
-    let cache = HOSTS_CACHE.get_or_init(|| Mutex::new((std::time::Instant::now(), Vec::new())));
-    let mut c = cache.lock().unwrap();
-    *c = (std::time::Instant::now(), hosts.clone());
-    hosts
-}
-
-unsafe extern "system" fn enum_workerw_host(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &mut *(lparam.0 as *mut (Vec<HostInfo>, HWND));
-    let mut buf = [0u16; 256];
-    if GetClassNameW(hwnd, &mut buf) > 0 {
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        if String::from_utf16_lossy(&buf[..end]) == "WorkerW" {
-            let mut r: RECT = std::mem::zeroed();
-            let _ = GetWindowRect(hwnd, &mut r);
-            ctx.0.push(HostInfo {
-                hwnd,
-                x: r.left as f32,
-                y: r.top as f32,
-                w: (r.right - r.left) as f32,
-                h: (r.bottom - r.top) as f32,
-                primary: hwnd == ctx.1,
-                visible: IsWindowVisible(hwnd).as_bool(),
-            });
-        }
-    }
-    BOOL(1)
-}
-
-fn refresh_hosts() -> Vec<HostInfo> {
-    let primary = desktop_shell_window().unwrap_or(HWND(0));
-    let mut hosts: Vec<HostInfo> = Vec::new();
-    unsafe {
-        let mut ctx = (hosts, primary);
-        let _ = EnumWindows(
-            Some(enum_workerw_host),
-            LPARAM(&mut ctx as *mut (Vec<HostInfo>, HWND) as isize),
-        );
-        hosts = ctx.0;
-    }
-    // 老路径主桌面是 Progman(非 WorkerW):补一个 primary 宿主
-    if primary.0 != 0 && !hosts.iter().any(|h| h.hwnd == primary) {
-        let mut r: RECT = unsafe { std::mem::zeroed() };
-        unsafe {
-            let _ = GetWindowRect(primary, &mut r);
-        }
-        hosts.push(HostInfo {
-            hwnd: primary,
-            x: r.left as f32,
-            y: r.top as f32,
-            w: (r.right - r.left) as f32,
-            h: (r.bottom - r.top) as f32,
-            primary: true,
-            visible: unsafe { IsWindowVisible(primary).as_bool() },
-        });
-    }
-    hosts.sort_by_key(|h| !h.primary);
-    hosts
-}
-
-/// 为栅栏选择宿主:中心点落在哪个【可见】宿主就收养到哪;都不覆盖时返回 None
-/// (窗口暂缓创建,由全局定时器在宿主就绪后补挂,绝不复用 HWND_TOP 回退)。
-pub(crate) fn host_for_rect(rect: &Rect, hosts: &[HostInfo]) -> Option<HostInfo> {
-    let cx = rect.x + rect.w * 0.5;
-    let cy = rect.y + rect.h * 0.5;
-    hosts
-        .iter()
-        .filter(|h| h.visible)
-        .find(|h| cx >= h.x && cx < h.x + h.w && cy >= h.y && cy < h.y + h.h)
-        .copied()
-}
-
-/// DWM cloaked 判定:窗口"可见"位有效但 DWM 不合成其像素——物理上遮不住任何东西。
-/// 典型:SystemSettings/TextInputHost 的全屏 CoreWindow(cloak=2)、Shell 经验宿主、
-/// 某些安全/管控软件钩子层的全屏瞬态。菜单开合瞬间它们被塞进宿主与栅栏之间,曾触发整链
-/// 重排(每次=z 序重排闪屏),必须跳过。
-pub(crate) fn window_is_cloaked(w: HWND) -> bool {
-    let mut cloaked: u32 = 0;
-    let ok = unsafe {
-        DwmGetWindowAttribute(
-            w,
-            DWMWA_CLOAKED,
-            &mut cloaked as *mut u32 as *mut _,
-            std::mem::size_of::<u32>() as u32,
-        )
-    }
-    .is_ok();
-    ok && cloaked != 0
-}
-
-/// 拖拽提升锚点:被拖栅栏需要压过其他兄弟栅栏(拖过邻居时不被盖住),
-/// 但绝不能高于正常窗口——HWND_TOP 曾把它顶到整个 z 栈顶端(浮窗)。
-/// 返回"最高兄弟栅栏"的句柄(插到它之后=兄弟之上、正常窗口之下);
-/// 没有其他兄弟栅栏时返回 None(无需提升)。
-pub(crate) fn drag_elevate_anchor(host: HWND, dragged: HWND) -> Option<HWND> {
-    let mut anchor: Option<HWND> = None;
-    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-    for _ in 0..64 {
-        if w.0 == 0 {
-            break;
-        }
-        if w == dragged {
-            w = unsafe { GetWindow(w, GW_HWNDPREV) };
-            continue;
-        }
-        // 只沿"连续的兄弟栅栏段"向上找;段结束(遇到非栅栏窗)即停
-        let mut cls_buf = [0u16; 32];
-        let n = unsafe { GetClassNameW(w, &mut cls_buf) };
-        let is_fence = n == 14
-            && cls_buf[..14]
-                == [
-                    0x44, 0x65, 0x73, 0x6B, 0x46, 0x65, 0x6E, 0x63, 0x65, 0x46, 0x65, 0x6E, 0x63,
-                    0x65,
-                ];
-        if !is_fence {
-            break;
-        }
-        anchor = Some(w);
-        w = unsafe { GetWindow(w, GW_HWNDPREV) };
-    }
-    anchor
-}
-
-/// 当前鼠标屏幕坐标（拖动位移必须用屏幕坐标，
-/// 因为窗口移动后 WM_MOUSEMOVE 的客户区坐标会随之变化，造成抖动/拖不动）。
-pub(crate) fn screen_cursor() -> (f32, f32) {
-    unsafe {
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        (pt.x as f32, pt.y as f32)
-    }
-}
-
-/// 刷新所有栅栏窗口（位置/尺寸/内容），用于自动对齐重排后
-pub(crate) fn refresh_all_fences() {
-    let ids: Vec<u32> = state()
-        .lock()
-        .unwrap()
-        .fences
-        .iter()
-        .map(|f| f.id)
-        .collect();
-    for id in ids {
-        refresh_fence(id);
-    }
-}
-
-pub(crate) fn create_fence_window(s: &mut UiState, fence_id: u32, hosts: &[HostInfo]) -> bool {
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-        return false;
-    };
-    if s.windows.contains_key(&fence_id) {
-        return true;
-    }
-    let hinstance = hinstance();
-    let w = fence.rect.w.round() as i32;
-    let h = fence.rect.h.round() as i32;
-    // 保持顶层分层 WS_POPUP,由桌面宿主持有,不是 WS_CHILD/SetParent。
-    // owned popup 必须在 owner 之上,避免显示桌面后被再次压到壁纸下面。
-    // 普通应用之下的上界仍由 band 就位维护;找不到宿主则延迟创建。
-    let host = host_for_rect(&fence.rect, hosts);
-    if host.is_none() {
-        log(&format!("no desktop host yet, defer fence {}", fence_id));
-        return false;
-    }
-    let Some(owner) = desktop_shell_window() else {
-        return false;
-    };
-    let _zcreate = z_scope(ZIntent::Create);
-    let hwnd = unsafe {
-        CreateWindowExW(
-            // 栅栏始终不参与前台激活；这样点击菜单外的桌面空白只会关闭
-            // TrackPopupMenu，不会在 Explorer 与分层栅栏之间切换激活层导致闪屏。
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class_name(),
-            PCWSTR::null(),
-            WS_POPUP,
-            0,
-            0,
-            w,
-            h,
-            owner,
-            HMENU(0),
-            hinstance,
-            None,
-        )
-    };
-    if hwnd.0 == 0 {
-        log(&format!("create window failed id={}", fence_id));
-        return false;
-    }
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, fence_id as isize);
-        ole::register_drop_target(hwnd, fence_id);
-        // owned 关系约束宿主下界;锚点限制应用上界,不能跨过最低可见应用窗。
-        // 无安全锚点时不使用 HWND_TOP/topmost,留待下一轮就位。
-        let insert_after = match host.and_then(|h| band_attach_anchor(h.hwnd, hwnd)) {
-            Some(a) => Some(a),
-            None => band_attach_anchor(owner, hwnd),
-        };
-        let mut attached = false;
-        if let Some(after) = insert_after {
-            attached = SetWindowPos(
-                hwnd,
-                after,
-                fence.rect.x.round() as i32,
-                fence.rect.y.round() as i32,
-                w,
-                h,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-            .is_ok();
-        }
-        if attached {
-            s.attached.insert(fence_id);
-        }
-    }
-    s.windows.insert(fence_id, hwnd);
-    s.metrics.insert(fence_id, metrics_for_window(hwnd));
-    true
 }
 
 /// 壁纸快照例行重捕获的最大间隔(兜底)。壁纸变化的主路径是事件驱动:
@@ -1120,13 +418,9 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
     for host in hosts.iter().filter(|h| h.visible) {
         match shell::capture_window_pixels(host.hwnd) {
             Ok((px, w, ph)) => {
-                let all_dark = px
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .take(4096)
-                    .all(|c| c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 255);
-                if all_dark && w > 64 && ph > 64 {
+                // 黑帧=换壁纸过渡期暂态(判定见 is_black_frame 注释):
+                // 不是捕获失败,绝不能计入 wallpaper_fails
+                if is_black_frame(&px, w, ph) {
                     // 壁纸切换过渡期 DWM 会给宿主刷纯黑:这是暂态内容,
                     // 不是捕获失败——绝不能计入 wallpaper_fails(会堆积触发
                     // "回退透明"误落盘),也不能当日志刷屏。节流记录一次即可。
@@ -1149,7 +443,7 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
             Err(reason) => {
                 fail_dbg.push(format!(
                     "hwnd=0x{:x} {}x{}: {}",
-                    host.hwnd.0, host.w as i32, host.h as i32, reason
+                    host.hwnd.0 as usize, host.w as i32, host.h as i32, reason
                 ));
             }
         }
@@ -1198,165 +492,6 @@ fn ensure_wallpaper(s: &mut UiState) -> bool {
 /// "捕获到纯黑过渡帧"的节流日志时间戳
 static EMPTY_CAPTURE_LOG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 最近一次用户交互(菜单开/关、桌面点击)的时刻。壁纸捕获在交互后
-/// 2.5s 内主动推迟:宿主在前台切换后的未稳定态下被 PrintWindow 强制
-/// 重绘会闪 ±4% 亮度,稳态则无感。
-pub static LAST_INTERACTION_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-pub fn mark_interaction() {
-    LAST_INTERACTION_MS.store(resize_now_ms(), Ordering::Relaxed);
-}
-
-/// 比较新旧快照内容。**带每通道 8 的容差**:PrintWindow 捕获的壁纸亮度
-/// 存在 ~4% 的时序波动(ICC/伽马路径),逐字节严格比较会把波动当成
-/// "壁纸变了",触发无谓的全量重绘——栅栏区域整面 4% 亮度先跳再回,
-/// 正是用户看到的"闪"。真换壁纸是整图替换,容差不影响判别。
-/// 比较新旧快照在"栅栏覆盖区域"内是否有实质变化(每通道 8 容差,理由:
-/// PrintWindow 捕获亮度存在 ~4% 时序波动,严格比较会把波动当成变化)。
-/// 栅栏区域之外的变化(如动态时钟壁纸的分钟跳动)不影响渲染——ink 常驻
-/// 下快照只作标签种子,栅栏外的壁纸像素从不参与任何绘制——因此不触发
-/// 重绘与缓存落盘,避免时钟壁纸下的每分钟空转(全量重绘+9MB 落盘+闪风险)。
-/// 宿主几何(数量/尺寸/原点)变化仍视为整体变化;无栅栏时退化为全图比较。
-fn wallpaper_changed_under_fences(
-    old: &[render::WallpaperPixels],
-    new: &[render::WallpaperPixels],
-    fences: &[Fence],
-) -> bool {
-    if old.len() != new.len() {
-        return true;
-    }
-    for (a, b) in old.iter().zip(new.iter()) {
-        if a.w != b.w || a.h != b.h || a.origin_x != b.origin_x || a.origin_y != b.origin_y {
-            return true;
-        }
-    }
-    if fences.is_empty() {
-        return old
-            .iter()
-            .zip(new.iter())
-            .any(|(a, b)| px_differs(&a.px, &b.px));
-    }
-    for f in fences {
-        let fl = f.rect.x.round() as i32;
-        let ft = f.rect.y.round() as i32;
-        let fr = fl + f.rect.w.round() as i32;
-        let fb = ft + f.rect.h.round() as i32;
-        for (a, b) in old.iter().zip(new.iter()) {
-            let x0 = (fl - a.origin_x).max(0);
-            let y0 = (ft - a.origin_y).max(0);
-            let x1 = (fr - a.origin_x).min(a.w as i32);
-            let y1 = (fb - a.origin_y).min(a.h as i32);
-            if x1 <= x0 || y1 <= y0 {
-                continue;
-            }
-            for y in y0..y1 {
-                let row_a = ((y as u32 * a.w + x0 as u32) as usize) * 4;
-                let row_b = ((y as u32 * b.w + x0 as u32) as usize) * 4;
-                let len = (x1 - x0) as usize * 4;
-                if px_differs(&a.px[row_a..row_a + len], &b.px[row_b..row_b + len]) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn px_differs(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return true;
-    }
-    for (pa, pb) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
-        if pa[0].abs_diff(pb[0]) > 8 || pa[1].abs_diff(pb[1]) > 8 || pa[2].abs_diff(pb[2]) > 8 {
-            return true;
-        }
-    }
-    false
-}
-
-/// 壁纸快照持久化缓存(二进制):启动直接加载,免去"原生图标还可见时的
-/// 现场捕获"——捕获要么拍到图标残影,要么得闪烁隐藏图标;缓存让首帧
-/// 立即可用且干净,新鲜捕获在栅栏接管桌面(图标已隐藏)后由例行重捕获完成。
-/// 格式: "DFWP" u32 ver | u32 count | 每项 { i32 x, i32 y, u32 w, u32 h, u64 len, BGRA }
-fn wallpaper_cache_path() -> std::path::PathBuf {
-    model::config_dir().join("wallpaper.bin")
-}
-
-pub(crate) fn save_wallpaper_cache(caps: &[render::WallpaperPixels]) {
-    use std::io::Write;
-    let mut buf: Vec<u8> = Vec::with_capacity(64);
-    buf.extend_from_slice(b"DFWP");
-    buf.extend_from_slice(&1u32.to_le_bytes());
-    buf.extend_from_slice(&(caps.len() as u32).to_le_bytes());
-    for c in caps {
-        buf.extend_from_slice(&c.origin_x.to_le_bytes());
-        buf.extend_from_slice(&c.origin_y.to_le_bytes());
-        buf.extend_from_slice(&c.w.to_le_bytes());
-        buf.extend_from_slice(&c.h.to_le_bytes());
-        buf.extend_from_slice(&(c.px.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&c.px);
-    }
-    let path = wallpaper_cache_path();
-    let tmp = path.with_extension("bin.tmp");
-    let ok = std::fs::File::create(&tmp)
-        .and_then(|mut f| {
-            f.write_all(&buf)?;
-            f.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .is_ok();
-    if !ok {
-        log("wallpaper cache save failed");
-    }
-}
-
-fn load_wallpaper_cache() -> Option<Vec<render::WallpaperPixels>> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(wallpaper_cache_path()).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    if buf.len() < 12 || &buf[0..4] != b"DFWP" {
-        return None;
-    }
-    let ver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-    if ver != 1 {
-        return None;
-    }
-    let count = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
-    let mut caps = Vec::with_capacity(count.min(8));
-    let mut off = 12usize;
-    for _ in 0..count {
-        if off + 24 > buf.len() {
-            return None;
-        }
-        let origin_x = i32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
-        let origin_y = i32::from_le_bytes(buf[off + 4..off + 8].try_into().ok()?);
-        let w = u32::from_le_bytes(buf[off + 8..off + 12].try_into().ok()?);
-        let h = u32::from_le_bytes(buf[off + 12..off + 16].try_into().ok()?);
-        let len = u64::from_le_bytes(buf[off + 16..off + 24].try_into().ok()?) as usize;
-        off += 24;
-        if w == 0 || h == 0 || w > 16384 || h > 16384 || len != (w as usize) * (h as usize) * 4 {
-            return None;
-        }
-        if off + len > buf.len() {
-            return None;
-        }
-        caps.push(render::WallpaperPixels {
-            px: buf[off..off + len].to_vec(),
-            w,
-            h,
-            origin_x,
-            origin_y,
-        });
-        off += len;
-    }
-    if caps.is_empty() {
-        None
-    } else {
-        Some(caps)
-    }
-}
-
 /// 壁纸变化(手动换壁纸/主题切换/幻灯片轮换)时请求重捕获。保留旧快照
 /// (栅栏不呈现退化帧),清零节流哨兵,并同时武装追赶与跟随定时器:
 /// 跟随定时器做"捕获-比对-变了才重绘",捕获到过渡黑帧时自动重试。
@@ -1378,8 +513,9 @@ static WALLPAPER_FOLLOW_RETRIES: std::sync::atomic::AtomicU32 =
 fn arm_wallpaper_follow() {
     WALLPAPER_FOLLOW_RETRIES.store(0, Ordering::Relaxed);
     if let Some(&tray) = TRAY_HWND.get() {
+        // SAFETY: tray 是本进程托盘窗口；纯定时器调用，无指针参数。
         unsafe {
-            let _ = SetTimer(tray, TIMER_WALLPAPER_FOLLOW, 250, None);
+            let _ = SetTimer(Some(tray), TIMER_WALLPAPER_FOLLOW, 250, None);
         }
     }
 }
@@ -1398,34 +534,14 @@ fn wallpaper_follow_tick(hwnd: HWND) {
     };
     let n = WALLPAPER_FOLLOW_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
     if changed || n >= 12 {
+        // SAFETY: hwnd 是收到 WM_TIMER 的托盘窗口（本进程所有），纯定时器调用。
         unsafe {
-            let _ = KillTimer(hwnd, TIMER_WALLPAPER_FOLLOW);
+            let _ = KillTimer(Some(hwnd), TIMER_WALLPAPER_FOLLOW);
         }
         WALLPAPER_FOLLOW_RETRIES.store(0, Ordering::Relaxed);
         if changed {
             log("wallpaper follow: content changed -> redraw fences");
             refresh_all_fences();
-        }
-    }
-}
-
-/// 启动阶段首帧呈现日志只打一次的闸门
-static BOOT_FIRST_PRESENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static WALLPAPER_CATCHUP_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static WALLPAPER_CATCHUP_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// 武装壁纸追赶定时器(200ms)。幂等:已武装时直接返回,避免每次刷新
-/// 重置计时周期导致永不触发。定时器到点在托盘窗口线程回调,与所有
-/// 调用方同线程,无需加锁。
-fn arm_wallpaper_catchup() {
-    if WALLPAPER_CATCHUP_ARMED.load(Ordering::Relaxed) {
-        return;
-    }
-    if let Some(&tray) = TRAY_HWND.get() {
-        if unsafe { SetTimer(tray, TIMER_WALLPAPER_CATCHUP, 200, None) } != 0 {
-            WALLPAPER_CATCHUP_ARMED.store(true, Ordering::Relaxed);
-            WALLPAPER_CATCHUP_TRIES.store(0, Ordering::Relaxed);
         }
     }
 }
@@ -1445,8 +561,9 @@ fn wallpaper_catchup_tick(hwnd: HWND) {
         !s.wallpapers.is_empty()
     };
     if ok {
+        // SAFETY: hwnd 是托盘窗口（本进程所有），纯定时器调用。
         unsafe {
-            let _ = KillTimer(hwnd, TIMER_WALLPAPER_CATCHUP);
+            let _ = KillTimer(Some(hwnd), TIMER_WALLPAPER_CATCHUP);
         }
         WALLPAPER_CATCHUP_ARMED.store(false, Ordering::Relaxed);
         log(&format!(
@@ -1457,310 +574,15 @@ fn wallpaper_catchup_tick(hwnd: HWND) {
         refresh_all_fences();
         reconcile_desktop_icons();
     } else if tries >= 150 {
+        // SAFETY: 同上：托盘窗口的定时器，纯调用无指针参数。
         unsafe {
-            let _ = KillTimer(hwnd, TIMER_WALLPAPER_CATCHUP);
+            let _ = KillTimer(Some(hwnd), TIMER_WALLPAPER_CATCHUP);
         }
         WALLPAPER_CATCHUP_ARMED.store(false, Ordering::Relaxed);
         log("wallpaper catch-up gave up; steady tick takes over");
     }
 }
 
-fn refresh_fence_impl(s: &mut UiState, fence_id: u32) {
-    // 启动守卫标记:精确模式在首帧种子就绪前不呈现新帧(借用 fence 前先取出)
-    let precise = precise_mode_on();
-    // 注意:此处不再 ensure_wallpaper。PrintWindow(RENDERFULLCONTENT) 抓桌面宿主
-    // 会强制桌面重绘,点击/菜单收尾触发的栅栏刷新会因此闪整个桌面。
-    // 壁纸快照只由全局定时器(3s 节流+内容和校验)更新,刷新栅栏永远用现有快照。
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-        return;
-    };
-    let Some(hwnd) = s.windows.get(&fence_id).copied() else {
-        return;
-    };
-    let Some(renderer) = &s.renderer else { return };
-    if fence.hidden {
-        // 我们主动隐藏时标记，避免被 WM_WINDOWPOSCHANGING 的"防最小化"拦截误伤
-        INTENTIONAL_HIDE.store(true, Ordering::SeqCst);
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-        INTENTIONAL_HIDE.store(false, Ordering::SeqCst);
-        return;
-    }
-    // 精确模式下壁纸快照未就绪时绝不呈现新帧:
-    // - 首帧未出:保持原生桌面(原生文字本就带阴影,观感无缝),快照就绪后
-    //   一次到位,消除"启动 1-3 秒后阴影才出现"的中间态;
-    // - 已有旧帧(壁纸刚失效/重捕获暂败):保留旧帧,等快照跟上再整帧重绘,
-    //   避免文字在 ClearType 与 D2D 之间来回切换。
-    // 拖拽中不适用(交互连续性优先)。
-    if precise && s.wallpapers.is_empty() && s.drag.is_none() {
-        arm_wallpaper_catchup();
-        return;
-    }
-    // 顶层窗口:直接使用屏幕坐标。defer_show_until_batch 批量呈现期间跳过
-    // 显示动作:先对所有栅栏完成绘制+向隐藏窗提交 ULW(UpdateLayeredWindow
-    // 对隐藏窗口同样有效,像素暂存),由调用方循环结束后一并放行。
-    if !s.defer_show_until_batch {
-        let _z = z_scope(ZIntent::Show);
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            // 强制置前显示:仅 SW_SHOW 有时不足以让分层窗口重新可见,
-            // 这里显式 SWP_SHOWWINDOW 兜底(问题「显示全部不生效」)。
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                fence.rect.x.round() as i32,
-                fence.rect.y.round() as i32,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE,
-            );
-        }
-    }
-    let w = fence.rect.w.ceil() as u32;
-    let h = fence.rect.h.ceil() as u32;
-    if w < 2 || h < 2 {
-        return;
-    }
-    let needs_new = match s.surfaces.get(&fence_id) {
-        Some(sf) => sf.w != w || sf.h != h,
-        None => true,
-    };
-    if needs_new {
-        s.presented.remove(&fence_id);
-        if let Some(old) = s.surfaces.remove(&fence_id) {
-            render::release_surface(old);
-        }
-        if let Some(sf) = render::create_surface(&renderer.factory, w, h) {
-            s.surfaces.insert(fence_id, sf);
-        } else {
-            log(&format!("surface create failed fence {}", fence_id));
-            return;
-        }
-    }
-    let metrics = s
-        .windows
-        .get(&fence_id)
-        .copied()
-        .map(metrics_for_window)
-        .unwrap_or_else(model::DpiMetrics::system);
-    s.metrics.insert(fence_id, metrics);
-    let items = model::display_list(fence, &s.files);
-    let lay = model::layout_with_metrics(fence, items.len(), &metrics);
-    let hover = *s.hover.get(&fence_id).unwrap_or(&None);
-    // fence_hovered 在渲染侧仅控制 chrome 显隐;托盘"显示栅栏边框线"打开时
-    // 全部栅栏常显边框(无边框常显基线的可观察模式)
-    let fence_hovered = *s.fence_hover.get(&fence_id).unwrap_or(&false) || chrome_always_on();
-    let active = matches!(&s.drag, Some(d) if d.fence_id == fence_id
-        && matches!(d.mode, DragMode::Move | DragMode::Resize { .. }));
-    let marquee = s.marquee;
-    // 种子快照:选出覆盖本栅栏中心的那块壁纸(精确模式必有;透明模式有则
-    // 边缘色更准,无则黑种子兜底——两种渲染模式共用同一条 seeded 文字管线)
-    let cx = fence.rect.x + fence.rect.w * 0.5;
-    let cy = fence.rect.y + fence.rect.h * 0.5;
-    let wp_for_fence = s.wallpapers.iter().find(|wp| {
-        cx >= wp.origin_x as f32
-            && cx < (wp.origin_x + wp.w as i32) as f32
-            && cy >= wp.origin_y as f32
-            && cy < (wp.origin_y + wp.h as i32) as f32
-    });
-    let Some(surf_ref) = s.surfaces.get(&fence_id) else {
-        // 防御(2026-09-08):上方 needs_new 分支正常已保证表面存在;万一未来
-        // 路径破坏该不变式,跳过本帧留痕即可,不 panic 整个进程(图标还在
-        // 隐藏态,进程一死用户看到的就是"程序凭空消失")
-        log(&format!("draw skip: surface missing fence {fence_id}"));
-        return;
-    };
-    let t_draw0 = resize_now_ms();
-    let jobs = render::draw_fence(
-        &surf_ref.target,
-        renderer,
-        fence,
-        &metrics,
-        &lay,
-        &items,
-        &mut s.icon_cache,
-        hover,
-        &s.selected_paths,
-        s.focused_path.as_deref(),
-        fence_hovered,
-        active,
-        marquee,
-        // 正在就地重命名的成员:标签由编辑框替代(与原生一致)
-        FILE_RENAME_PATH.lock().unwrap().as_deref(),
-        // 入场动画中的成员:落地前不在栅栏里露脸(先落在桌面格,再飞入)
-        &s.arrival_animations
-            .iter()
-            .map(|a| a.path.clone())
-            .collect::<Vec<String>>(),
-    );
-    let t_draw = resize_now_ms() - t_draw0;
-    let pos = POINT {
-        x: fence.rect.x.round() as i32,
-        y: fence.rect.y.round() as i32,
-    };
-    let t_gdi0 = resize_now_ms();
-    // ink 常驻:统一 seeded GDI ClearType 文字。有快照=真实底色种子(逐位
-    // 同原生),无=黑种子兜底;墨水外像素保持透明,背景透出实时壁纸
-    render::gdi_draw_labels_seeded(surf_ref, &jobs, wp_for_fence, pos.x, pos.y);
-    let t_gdi = resize_now_ms() - t_gdi0;
-    let t_pres0 = resize_now_ms();
-    let ok = render::present_surface(surf_ref, hwnd, pos.x, pos.y);
-    let t_pres = resize_now_ms() - t_pres0;
-    if BOOT_VERBOSE.load(Ordering::Relaxed) && (t_draw > 100 || t_gdi > 100 || t_pres > 100) {
-        log(&format!(
-            "boot slow draw fence {}: draw={}ms gdi={}ms present={}ms items={}",
-            fence_id,
-            t_draw,
-            t_gdi,
-            t_pres,
-            items.len()
-        ));
-    }
-    if ok {
-        let first_ever = BOOT_FIRST_PRESENT.swap(false, Ordering::Relaxed);
-        if first_ever {
-            log(&format!(
-                "boot first fence presented (id={}, seeded={}, {}ms)",
-                fence_id,
-                wp_for_fence.is_some(),
-                resize_now_ms()
-            ));
-        }
-        s.presented.insert(fence_id);
-    } else {
-        s.presented.remove(&fence_id);
-        log(&format!("present failed fence {}", fence_id));
-    }
-}
-
-/// 刷新单个栅栏
-pub fn present_fence_only(fence_id: u32) {
-    let mut s = state().lock().unwrap();
-    let Some(fence) = s.fences.iter().find(|f| f.id == fence_id) else {
-        return;
-    };
-    let Some(hwnd) = s.windows.get(&fence_id).copied() else {
-        return;
-    };
-    let Some(surface) = s.surfaces.get(&fence_id) else {
-        return;
-    };
-    let ok = render::present_existing_surface(
-        surface,
-        hwnd,
-        fence.rect.x.round() as i32,
-        fence.rect.y.round() as i32,
-    );
-    if ok {
-        s.presented.insert(fence_id);
-    } else {
-        s.presented.remove(&fence_id);
-        log(&format!("present existing failed fence {fence_id}"));
-    }
-}
-
-pub(crate) fn refresh_fence(fence_id: u32) {
-    let t0 = resize_now_ms();
-    let hosts = desktop_hosts();
-    let mut s = state().lock().unwrap();
-    if !s.windows.contains_key(&fence_id) {
-        create_fence_window(&mut s, fence_id, &hosts);
-    }
-    if s.windows.contains_key(&fence_id) {
-        refresh_fence_impl(&mut s, fence_id);
-    }
-    if BOOT_VERBOSE.load(Ordering::Relaxed) {
-        log(&format!(
-            "boot refresh_fence {} took {}ms (icons_cum={}ms/{}miss)",
-            fence_id,
-            resize_now_ms() - t0,
-            render::ICON_EXTRACT_MS.load(Ordering::Relaxed),
-            render::ICON_EXTRACT_COUNT.load(Ordering::Relaxed)
-        ));
-    }
-}
-
-pub(crate) fn ensure_fence_window(id: u32) {
-    let hosts = desktop_hosts();
-    let mut s = state().lock().unwrap();
-    if !s.windows.contains_key(&id) {
-        create_fence_window(&mut s, id, &hosts);
-    }
-}
-
-/// 启动阶段第一次全量刷新的逐栅栏计时开关(启动结束关闭,避免常态刷日志)
-static BOOT_VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// 用一次性小表面预热渲染管线:D2D 设备/画刷/壁纸位图创建、GDI 字体与
-/// DrawShadowText 动态加载的首次使用合计可达 300-900ms。趁主线程等待
-/// 后台 shell 预热 join 的空闲窗口先烧掉,真正首帧只剩纯绘制成本。
-fn warm_renderer_scratch() {
-    let t0 = resize_now_ms();
-    let mut guard = state().lock().unwrap();
-    // 经 Deref 的 MutexGuard 无法做字段级分裂借用,先重借用为 &mut UiState
-    let s: &mut UiState = &mut guard;
-    let Some(renderer) = &s.renderer else { return };
-    let Some(sf) = render::create_surface(&renderer.factory, 96, 96) else {
-        return;
-    };
-    let dummy = Fence {
-        id: 0,
-        title: String::new(),
-        category: String::new(),
-        pinned: Vec::new(),
-        item_order: Vec::new(),
-        rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 90.0,
-            h: 90.0,
-        },
-        collapsed: false,
-        scroll_rows: 0,
-        locked: false,
-        hidden: false,
-        manual_size: false,
-        sort_mode: String::new(),
-    };
-    let metrics = model::DpiMetrics::system();
-    let lay = model::layout_with_metrics(&dummy, 0, &metrics);
-    let wp = s.wallpapers.first();
-    let _ = render::draw_fence(
-        &sf.target,
-        renderer,
-        &dummy,
-        &metrics,
-        &lay,
-        &[],
-        &mut s.icon_cache,
-        None,
-        &std::collections::HashSet::new(),
-        None,
-        false,
-        false,
-        None,
-        None,
-        &[],
-    );
-    // 空作业时标签绘制会早退,补一个 1 字符作业触发
-    // DrawShadowText 加载 + 字体创建 + ClearType 首次栅格化(含种子路径)
-    let warm_job = [render::GdiLabelJob {
-        text: "W".into(),
-        x: 2.0,
-        y: 2.0,
-        w: 60.0,
-        h: 30.0,
-    }];
-    render::gdi_draw_labels_seeded(&sf, &warm_job, wp, 0, 0);
-    render::release_surface(sf);
-    log(&format!(
-        "boot renderer warm-up took {}ms",
-        resize_now_ms() - t0
-    ));
-}
-
-/// 完整恢复 DeskFence 桌面：重新发现 Explorer 宿主、重新挂接/创建窗口、
 /// 重绘每个栅栏，最后才决定是否临时隐藏原生图标。它是 Win+D、托盘
 /// “显示全部”和 Explorer 重建后的统一恢复入口。
 pub fn show_all_fences() {
@@ -1797,6 +619,10 @@ pub fn show_all_fences() {
         windows
     };
     for h in orphaned {
+        // SAFETY: h 是刚从 state.windows 摘下的孤儿栅栏窗口（本进程创建、
+        // 摘除后不再有任何引用）；先注销 OLE 拖放注册再销毁——销毁后注册
+        // 将指向已死窗口；DestroyWindow 投递 WM_DESTROY 走 fence_wndproc
+        // 的清理路径（同线程，同步完成）。
         unsafe {
             let _ = RevokeDragDrop(h);
             let _ = DestroyWindow(h);
@@ -1846,6 +672,8 @@ pub fn show_all_fences() {
             }
             if let Some(h) = s.windows.get(&f.id) {
                 let _z = z_scope(ZIntent::Show);
+                // SAFETY: h 是本进程栅栏窗口；z_scope(ZIntent::Show) 声明
+                // 这是自家显示操作，放行 z 守卫（守卫只否决外部重排）。
                 unsafe {
                     let _ = ShowWindow(*h, SW_SHOWNOACTIVATE);
                 }
@@ -1978,18 +806,8 @@ fn remove_empty_category_fences() {
 static SCAN_INFLIGHT: AtomicBool = AtomicBool::new(false);
 /// 扫描期间又来了重扫请求:本轮应用完再补一轮,收敛到最新状态
 static SCAN_REQUEUED: AtomicBool = AtomicBool::new(false);
-/// 扫描快照代际:内存文件列表被 rescan 之外的路径同步改写(改名提交/分类
-/// 规则应用)时 +1,使在途快照作废——否则陈旧结果会把改名前的旧路径/旧
-/// 分类写回内存(同步时代不存在此窗口,扫描与改写同线程串行)
-static SCAN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 后台线程产出的扫描结果(带取值时的代际),等 UI 线程取走应用(单槽)
 static SCAN_RESULT: Mutex<Option<(u64, Vec<FileItem>)>> = Mutex::new(None);
-
-/// 使在途扫描快照作废(内存文件列表被绕过 rescan 直接改写时必须调用:
-/// 改名提交、分类规则应用;拖拽删除走 mark_scan_removed 已内置)。
-pub(crate) fn invalidate_pending_scans() {
-    SCAN_EPOCH.fetch_add(1, Ordering::Relaxed);
-}
 
 /// 异步重扫入口:文件系统枚举+显示名解析(~百 ms 级 shell 调用,4 线程并行)
 /// 全部搬到后台线程,结果经 WM_DL3_SCAN_APPLY 回 UI 线程应用——UI 线程不再
@@ -2003,15 +821,18 @@ pub fn rescan() {
         SCAN_REQUEUED.store(true, Ordering::Relaxed);
         return;
     }
-    let epoch = SCAN_EPOCH.load(Ordering::Relaxed);
+    let epoch = scan_epoch();
     std::thread::spawn(move || {
         let files = with_recycle_bin(shell::scan_desktop());
         *SCAN_RESULT.lock().unwrap() = Some((epoch, files));
         // TRAY_HWND 在托盘初始化时创建,rescan 的全部调用方都在其后;万一
         // 未就绪,结果留在槽里由 global_tick 兜底应用
         if let Some(tray) = TRAY_HWND.get().copied() {
+            // SAFETY: 后台扫描线程对 UI 线程窗口的唯一合法触碰方式=
+            // PostMessage 异步投递（消息由 UI 线程消息泵处理）；无指针参数，
+            // 无共享内存。
             unsafe {
-                let _ = PostMessageW(tray, WM_DL3_SCAN_APPLY, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(tray), WM_DL3_SCAN_APPLY, WPARAM(0), LPARAM(0));
             }
         }
     });
@@ -2021,7 +842,7 @@ pub fn rescan() {
 /// 仅供改名提交使用——它已把内存文件列表同步到新路径,rescan 只为缺类
 /// 补建+收敛,且迁移动画必须在应用之后排队(异步版做不到这个顺序)。
 pub fn rescan_now() {
-    invalidate_pending_scans(); // 在途异步快照已过时,丢弃(见 SCAN_EPOCH)
+    invalidate_pending_scans(); // 在途异步快照已过时,丢弃(见 state.rs SCAN_EPOCH)
     apply_scan(with_recycle_bin(shell::scan_desktop()));
 }
 
@@ -2029,7 +850,7 @@ pub fn rescan_now() {
 /// 代际失配的陈旧快照直接丢弃;应用完毕清 INFLIGHT,期间有新请求
 /// (REQUEUED)则再起一轮。
 fn apply_pending_scan() {
-    let cur = SCAN_EPOCH.load(Ordering::Relaxed);
+    let cur = scan_epoch();
     let pending = SCAN_RESULT.lock().unwrap().take();
     if let Some((epoch, files)) = pending {
         if epoch == cur {
@@ -2210,7 +1031,7 @@ fn apply_scan(mut files: Vec<FileItem>) {
     show_all_fences();
 }
 
-/// 默认栅栏尺寸:2 列宽 × 5 行高(用户指定;内容超出自动滚动)
+/// 默认栅栏尺寸:2 列宽 × 4 行高(与 build_global_config 同规则;内容超出自动滚动)
 pub(crate) fn default_fence_size() -> (f32, f32) {
     let (title_h, pad) = model::chrome(model::dpi_scale());
     (
@@ -2267,6 +1088,9 @@ fn with_recycle_bin(mut files: Vec<FileItem>) -> Vec<FileItem> {
 }
 
 fn client_area_animations_enabled() -> bool {
+    // SAFETY: SPI_GETCLIENTAREAANIMATION 契约要求 pvParam 指向 BOOL；
+    // enabled 是栈变量，调用期间有效；失败路径不写并返回 false（视为
+    // 系统禁用动画，保守跳过动画只出最终帧）。
     unsafe {
         let mut enabled = BOOL(1);
         SystemParametersInfoW(
@@ -2441,8 +1265,9 @@ fn start_arrival_animations(added_paths: &[String]) {
     s.arrival_animations.extend(pending);
     ensure_guide_window(&mut s);
     if let Some(tray) = TRAY_HWND.get().copied() {
+        // SAFETY: tray 是本进程托盘窗口；纯定时器调用，无指针参数。
         unsafe {
-            let _ = SetTimer(tray, TIMER_ANIMATION, 16, None);
+            let _ = SetTimer(Some(tray), TIMER_ANIMATION, 16, None);
         }
     }
     refresh_guide(&mut s);
@@ -2505,8 +1330,9 @@ pub(crate) fn queue_migration_animations(moves: &[(String, u32, f32, f32)]) {
         refresh_fence(id);
     }
     if let Some(tray) = TRAY_HWND.get().copied() {
+        // SAFETY: tray 是本进程托盘窗口；纯定时器调用，无指针参数。
         unsafe {
-            let _ = SetTimer(tray, TIMER_ANIMATION, 16, None);
+            let _ = SetTimer(Some(tray), TIMER_ANIMATION, 16, None);
         }
     }
 }
@@ -2531,12 +1357,14 @@ fn tick_arrival_animations() {
         refresh_guide(&mut s);
         if s.arrival_animations.is_empty() {
             if let Some(tray) = TRAY_HWND.get().copied() {
+                // SAFETY: tray 是本进程托盘窗口；纯定时器调用，无指针参数。
                 unsafe {
-                    let _ = KillTimer(tray, TIMER_ANIMATION);
+                    let _ = KillTimer(Some(tray), TIMER_ANIMATION);
                 }
             }
             if s.drag_ghost.is_none() {
                 if let Some(hwnd) = s.guide_hwnd {
+                    // SAFETY: guide_hwnd 是本进程引导窗，槽位非 None 即窗口仍在。
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_HIDE);
                     }
@@ -2553,6 +1381,8 @@ fn tick_arrival_animations() {
 /// 启动初始化
 pub fn startup() {
     log(&format!("boot begin ({}ms)", resize_now_ms()));
+    // 拖入落位回调注入:ole 保持纯 COM 胶水(零上层依赖),drag 在此注册
+    ole::set_fence_drop_cb(crate::drag::on_fence_drop_cb);
     // 崩溃恢复:上次运行隐藏了桌面图标但进程已死 → 先恢复原生图标
     if let Some(pid) = model::load_icons_marker() {
         if pid != std::process::id() {
@@ -2561,6 +1391,9 @@ pub fn startup() {
             log("restored desktop icons from previous dead session");
         }
     }
+    // 自启迁移(2026-09-16):老版本只有 Run 键自启,升级后一次性迁到计划
+    // 任务(登录即触发,绕过 Run 键排队);迁移完成后此函数零开销
+    shell::migrate_autostart_to_task();
     // 启动关键路径并行化:显示名解析(54 文件 ~1.3s)与图标提取
     // (.lnk/exe 单个可达 ~180ms)都是纯 shell 调用,与壁纸捕获/配置加载
     // 无数据依赖。这里先做纯文件系统扫描(~20ms),把 shell 部分全部丢给
@@ -2753,6 +1586,10 @@ pub fn startup() {
                     sort_mode: model::default_sort_mode(),
                 });
             }
+            // 首启即默认布局(2026-09-16):与托盘"恢复默认布局"同一排列
+            // (第一行、左对齐、顶对齐、GAP)。此前 build_global_config 的
+            // 写死横排超屏后被逐个夹回右缘=用户看到"乱七八糟"
+            apply_default_layout(&mut s.fences);
             let _ = n_files;
         } else {
             // 非空配置启动:分类规则可能已变(如 md 文档→代码)而文件集合没变,
@@ -2762,6 +1599,22 @@ pub fn startup() {
                 log(&format!(
                     "boot created missing category fences: {created_cats:?}"
                 ));
+            }
+            // 跨会话/跨机器行列保持(2026-09-16):config 存像素,保存时的格距
+            // 记在 sidecar;当前格距不同(图标尺寸/机器变了)则按"列数×行数"
+            // 等比换算——不然 4 行的栅栏在变小后会漂成 5/6 行
+            if let Some((ocw, och)) = load_layout_cells() {
+                let (cw, ch) = (model::cell_w(), model::cell_h());
+                if (ocw - cw).abs() > 0.5 || (och - ch).abs() > 0.5 {
+                    let mut rects: Vec<Rect> = s.fences.iter().map(|f| f.rect).collect();
+                    model::rescale_rects_to_cells(&mut rects, ocw, och);
+                    for (f, r) in s.fences.iter_mut().zip(rects) {
+                        f.rect = r;
+                    }
+                    log(&format!(
+                        "boot rescaled fences {ocw:.0}x{och:.0} -> {cw:.0}x{ch:.0} (rows/cols preserved)"
+                    ));
+                }
             }
         }
     }
@@ -2779,12 +1632,15 @@ pub fn startup() {
         resize_now_ms()
     ));
     settle_all_fences();
-    if !created_cats.is_empty() {
-        // 与 rescan 一致:补建后立即持久化(settle 之后的矩形才是最终位置)
+    if !created_cats.is_empty() || config_was_empty {
+        // 与 rescan 一致:补建/首启后立即持久化(settle 之后的矩形才是
+        // 最终位置);首启不落盘的话 config.json 直到用户首次交互才存在
         let s = state().lock().unwrap();
         let _ = model::save_config(&s.fences);
     }
     refit_auto_fence_heights();
+    // 重叠兜底:换机/换图标尺寸夹回后若仍有栅栏相交,按整行收缩到放得下
+    resolve_overlaps_by_rows();
     log(&format!("boot pre-show done ({}ms)", resize_now_ms()));
     show_all_fences(); // 桌面壳未就绪时暂缓,由全局定时器自动补挂
     log(&format!("boot first pass done ({}ms)", resize_now_ms()));
@@ -2814,8 +1670,11 @@ pub fn startup() {
             log(&format!("env-check at boot: ISSUES\n{report}"));
         }
     }
-    // 一次性首启引导(2026-09-11):first_run_done=false 才弹,任何关闭路径
-    // 都写 true;栅栏已呈现、托盘已就绪后出现,不再早于桌面接管
+    // 行列保持 sidecar 记当前格距(下次启动对比用)
+    save_layout_cells();
+    // 首启引导(2026-09-11):first_run_done=false 才弹;关闭时勾选"不再提示"
+    // 才写 true(2026-09-16 起),否则下次启动仍弹;栅栏已呈现、托盘已就绪后
+    // 出现,不再早于桌面接管
     crate::firstrun::maybe_show();
 }
 
@@ -2838,30 +1697,30 @@ fn finish_rename_if_clicked_outside() {
         return;
     }
     let mut pt = POINT::default();
+    // SAFETY: pt 是栈上输出指针，调用期间有效；失败保持 (0,0)，
+    // 由 point_in_window_rect 判为"在编辑框外"前已被真实左键按下条件拦住。
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
     if let Some(edit) = fence_edit {
         if !point_in_window_rect(edit, pt.x, pt.y) {
+            // SAFETY: edit 是本进程的就地改名编辑框；PostMessage 异步提交，
+            // 由编辑框自身的 wndproc 串行处理，无指针参数。
             unsafe {
-                let _ = PostMessageW(edit, RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(edit), RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
             }
         }
     }
     if let Some(edit) = file_edit {
         if !point_in_window_rect(edit, pt.x, pt.y) {
             log("COMMIT via timer fallback");
+            // SAFETY: 同上：本进程文件改名编辑框的异步提交，无指针参数。
             unsafe {
-                let _ = PostMessageW(edit, FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(edit), FILE_RENAME_COMMIT_MSG, WPARAM(0), LPARAM(0));
             }
         }
     }
 }
-
-fn fence_needs_presentation(hidden: bool, presented: bool, has_surface: bool) -> bool {
-    !hidden && (!presented || !has_surface)
-}
-
 /// 全局自愈:定时器与显示变化时调用。
 /// 1) 修复窗口与桌面宿主的挂接(启动竞态/Explorer 重启后自动补挂);
 /// 2) 协调原生图标可见性;3) 图标尺寸/主题跟随;4) 桌面文件刷新。
@@ -2950,7 +1809,9 @@ fn global_tick() {
         // 登录早期/壁纸切换过渡期的瞬态失败绝不能把"精确"误落盘成"透明"
         let capture_failed = state()
             .try_lock()
-            .map(|s| s.wallpapers.is_empty() && s.wallpaper_fails >= 2 && resize_now_ms() > 10_000)
+            .map(|s| {
+                capture_fallback_due(!s.wallpapers.is_empty(), s.wallpaper_fails, resize_now_ms())
+            })
             .unwrap_or(false);
         if capture_failed {
             set_render_mode("transparent");
@@ -3024,94 +1885,21 @@ fn global_tick() {
 
 // ---------------- 托盘图标 ----------------
 
-pub(crate) static DESKTOP_ICONS_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// User explicitly requested native desktop icons to remain visible.
 static NATIVE_DESKTOP_OVERRIDE: AtomicBool = AtomicBool::new(false);
-/// 纯净态:用户主动"隐藏全部栅栏"——栅栏与原生图标都隐藏,桌面只剩壁纸。
-/// 图标协调逻辑在此状态下不因"无栅栏呈现"而恢复原生图标(那正是旧的
-/// "隐藏栅栏=回到原生桌面"重复感的来源)。仅在本次运行内生效,重启回正常态。
-pub(crate) static ZEN_MODE: AtomicBool = AtomicBool::new(false);
 
 /// 图标缓存落盘调度状态(见 global_tick 内说明)
 static ICON_EXTRACT_SEEN: AtomicU64 = AtomicU64::new(0);
 static ICON_SAVE_DIRTY_MS: AtomicU64 = AtomicU64::new(0);
-
-unsafe extern "system" fn find_workerw_lv(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let slot: &mut Option<HWND> = &mut *(lparam.0 as *mut Option<HWND>);
-    if slot.is_some() {
-        return BOOL(0);
-    }
-    let mut buf = [0u16; 256];
-    if GetClassNameW(hwnd, &mut buf) > 0 {
-        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        let cls = String::from_utf16_lossy(&buf[..end]);
-        // DefView 可能挂在 Progman 直下,也可能挂在任一 WorkerW 下(壁纸切换后),
-        // 两种都接受 —— 实测某些环境下 FindWindowW("Progman") 会失败,必须靠枚举兜底
-        if cls == "WorkerW" || cls == "Progman" {
-            // 局部 Vec 保持字符串存活，避免临时指针悬垂（use-after-free）
-            let defview_cls = shell::wide("SHELLDLL_DefView");
-            let defview = FindWindowExW(hwnd, None, PCWSTR::from_raw(defview_cls.as_ptr()), None);
-            if defview.0 != 0 {
-                let lv_cls = shell::wide("SysListView32");
-                let lv = FindWindowExW(defview, None, PCWSTR::from_raw(lv_cls.as_ptr()), None);
-                if lv.0 != 0 {
-                    *slot = Some(lv);
-                    return BOOL(0);
-                }
-            }
-        }
-    }
-    BOOL(1)
-}
-
-/// 查找桌面图标列表（SysListView32，Progman 或 WorkerW）
-fn desktop_listview() -> Option<HWND> {
-    unsafe {
-        let progman_cls = shell::wide("Progman");
-        let defview_cls = shell::wide("SHELLDLL_DefView");
-        let lv_cls = shell::wide("SysListView32");
-        let progman = FindWindowW(PCWSTR::from_raw(progman_cls.as_ptr()), None);
-        if progman.0 != 0 {
-            let defview =
-                FindWindowExW(progman, None, PCWSTR::from_raw(defview_cls.as_ptr()), None);
-            if defview.0 != 0 {
-                let lv = FindWindowExW(defview, None, PCWSTR::from_raw(lv_cls.as_ptr()), None);
-                if lv.0 != 0 {
-                    return Some(lv);
-                }
-            }
-        }
-        let mut slot: Option<HWND> = None;
-        let _ = EnumWindows(
-            Some(find_workerw_lv),
-            LPARAM(&mut slot as *mut Option<HWND> as isize),
-        );
-        slot
-    }
-}
-
-/// 桌面壳窗口(WorkerW 或 Progman),用作顶层栅栏的 owner 和 z 序下界。
-/// SetWindowPos 的锚点必须在其上方;直接锚此窗口表示放在它下面。
-pub(crate) fn desktop_shell_window() -> Option<HWND> {
-    let lv = desktop_listview()?;
-    unsafe {
-        let defview = GetParent(lv);
-        if defview.0 != 0 {
-            let parent = GetParent(defview);
-            if parent.0 != 0 {
-                return Some(parent);
-            }
-            return Some(defview);
-        }
-        None
-    }
-}
 
 fn set_desktop_icons_visible(visible: bool) -> bool {
     let Some(lv) = desktop_listview() else {
         log("desktop listview not found");
         return false;
     };
+    // SAFETY: lv 是桌面图标列表视图（Explorer 的 SHELLDLL_DefView 子窗口，
+    // desktop_listview 现查现用，句柄在调用期间有效）；ShowWindow 只切
+    // 可见位，不触碰该窗口的其他资源。
     unsafe {
         let _ = ShowWindow(lv, if visible { SW_SHOW } else { SW_HIDE });
     }
@@ -3153,254 +1941,6 @@ fn any_fence_presented_on_desktop() -> bool {
                     *s.last_healthy_ms.get(&f.id).unwrap_or(&0),
                 ) < 8000)
     })
-}
-
-// ---------------- 环境体检与自愈(2026-08-29 教训产品化) ----------------
-// 长时间运行/重度使用后,Explorer 桌面层可能被弄脏(双实例互殴、僵尸窗口、
-// 宿主链异常),同一份代码表现随之漂移。把排查工具的能力内建为默认配置:
-// 启动时自动体检记日志;托盘提供"体检"(诊断报告)与"修复桌面环境"
-// (重启 Explorer 重建桌面层,栅栏经 TaskbarCreated 路径自动重挂)。
-
-/// 环境体检(只读)。返回 (是否健康, 中文报告)。
-pub fn env_health_report() -> (bool, String) {
-    let mut ok = true;
-    let mut lines: Vec<String> = Vec::new();
-    // 1) 多余 DeskFence 进程(自身已持锁,其余皆僵尸)
-    let stale = shell::pids_by_name("deskfence.exe");
-    if stale.is_empty() {
-        lines.push("实例: 单实例 ✓".into());
-    } else {
-        ok = false;
-        lines.push(format!(
-            "实例: 检测到 {} 个多余 DeskFence 进程 {:?}(重启本程序可自动清理)",
-            stale.len(),
-            stale
-        ));
-    }
-    // 2) 桌面宿主
-    match desktop_shell_window() {
-        Some(h) => lines.push(format!("桌面宿主: 就绪 0x{:x} ✓", h.0)),
-        None => {
-            ok = false;
-            lines.push("桌面宿主: 未找到(Explorer 桌面层未就绪)".into());
-        }
-    }
-    // 3) 孤儿 DeskFence 窗口(死去实例的遗留)
-    let me = std::process::id();
-    let orphans;
-    unsafe {
-        unsafe extern "system" fn enum_orphan(h: HWND, l: LPARAM) -> BOOL {
-            let (me, count) = unsafe {
-                let p = l.0 as *mut (u32, usize);
-                (&(*p).0, &mut (*p).1)
-            };
-            let mut buf = [0u16; 32];
-            let n = unsafe { GetClassNameW(h, &mut buf) };
-            let cls = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-            if cls.starts_with("DeskFence") {
-                let mut pid = 0u32;
-                unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(
-                        h,
-                        Some(&mut pid),
-                    )
-                };
-                if pid != *me {
-                    *count += 1;
-                }
-            }
-            BOOL(1)
-        }
-        let mut ctx = (me, 0usize);
-        let _ = EnumWindows(Some(enum_orphan), LPARAM(&mut ctx as *mut _ as isize));
-        orphans = ctx.1;
-    }
-    if orphans == 0 {
-        lines.push("窗口: 无孤儿窗口 ✓".into());
-    } else {
-        ok = false;
-        lines.push(format!(
-            "窗口: 检测到 {orphans} 个孤儿 DeskFence 窗口(建议\"修复桌面环境\")"
-        ));
-    }
-    // 4) 栅栏在带内(仅 normal 态判定)。zen/native 态栅栏有意全部隐藏,
-    // total=0 不能构成 fault——2026-08-31 教训:zen 态被此判定恒判 fault,
-    // env-watchdog 以 10 分钟限速反复重启 Explorer(一天 3 次),勿回退。
-    if desktop_state() == "normal" {
-        let host = desktop_shell_window();
-        let in_band;
-        let total;
-        {
-            let s = state().lock().unwrap();
-            total = s.fences.iter().filter(|f| !f.hidden).count();
-            let mut good = 0usize;
-            if let Some(host) = host {
-                for h in s.windows.values() {
-                    let mut w = unsafe { GetWindow(host, GW_HWNDPREV) };
-                    for _ in 0..600 {
-                        if w.0 == 0 {
-                            break;
-                        }
-                        if w == *h {
-                            good += 1;
-                            break;
-                        }
-                        w = unsafe { GetWindow(w, GW_HWNDPREV) };
-                    }
-                }
-            }
-            in_band = good;
-        }
-        if total > 0 && in_band == total {
-            lines.push(format!("栅栏: {in_band}/{total} 在桌面层内 ✓"));
-        } else {
-            ok = false;
-            lines.push(format!(
-                "栅栏: {in_band}/{total} 在桌面层内(自愈未完成或受阻)"
-            ));
-        }
-    } else {
-        lines.push(format!("栅栏: 桌面态 {} 栅栏按状态隐藏 ✓", desktop_state()));
-    }
-    // 5) 原生图标与接管状态一致性(仅提示,协调器每秒会修)
-    if DESKTOP_ICONS_HIDDEN.load(Ordering::Relaxed) {
-        if let Some(lv) = desktop_listview() {
-            if unsafe { IsWindowVisible(lv).as_bool() } {
-                lines.push("图标: 原生图标意外可见(将在 1 秒内自动隐藏)".into());
-            } else {
-                lines.push("图标: 接管正常 ✓".into());
-            }
-        }
-    }
-    (ok, lines.join("\n"))
-}
-
-/// 托盘动作:弹出环境体检报告。
-#[allow(dead_code)] // 手动入口已按用户要求移出托盘菜单,保留函数作文档
-fn env_health_dialog() {
-    let (ok, report) = env_health_report();
-    let title = if ok {
-        "DeskFence 环境体检:健康"
-    } else {
-        "DeskFence 环境体检:发现问题"
-    };
-    log(&format!("env-check by user: ok={ok}\n{report}"));
-    let t = shell::wide(title);
-    let m = shell::wide(&format!("{report}\n\n(本报告已写入日志)"));
-    unsafe {
-        let _ = MessageBoxW(
-            None,
-            PCWSTR::from_raw(m.as_ptr()),
-            PCWSTR::from_raw(t.as_ptr()),
-            MB_OK | MB_SETFOREGROUND,
-        );
-    }
-}
-
-/// 托盘动作:修复桌面环境——重启 Explorer 重建桌面层(垃圾层/钩子层/
-/// 僵尸托盘全部清零),本程序靠 TaskbarCreated 路径自动重挂栅栏与托盘。
-/// 在后台线程执行,避免阻塞 UI。
-#[allow(dead_code)]
-fn env_repair() {
-    let t = shell::wide("DeskFence 修复桌面环境");
-    let m = shell::wide(
-        "将重启资源管理器以重建桌面层(已打开的文件夹窗口会关闭,\n\
-         屏幕会闪黑约 1-2 秒),栅栏与图标接管将自动恢复。\n\n继续?",
-    );
-    let choice = unsafe {
-        MessageBoxW(
-            None,
-            PCWSTR::from_raw(m.as_ptr()),
-            PCWSTR::from_raw(t.as_ptr()),
-            MB_OKCANCEL | MB_ICONWARNING | MB_SETFOREGROUND,
-        )
-    };
-    if choice != IDOK {
-        return;
-    }
-    env_repair_internal("user");
-}
-
-/// 重建桌面层:重启 Explorer,栅栏经 TaskbarCreated 路径自动重挂,
-/// 托盘图标自动重建。由托盘"修复桌面环境"与环境自稳 watchdog 共用。
-fn env_repair_internal(reason: &str) {
-    log(&format!(
-        "env-repair({reason}): restarting explorer to rebuild desktop band"
-    ));
-    std::thread::spawn(|| {
-        // 让 UI 先消化掉调用上下文(消息框/自检),再动 Explorer
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let remain = shell::terminate_by_name("explorer.exe", 5000);
-        if !remain.is_empty() {
-            log(&format!("env-repair: explorer pids {:?} resisted", remain));
-        }
-        shell::start_explorer();
-        // 等新宿主就绪(TaskbarCreated 会走重挂路径,这里只做日志收尾)
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if desktop_shell_window().is_some() {
-                log("env-repair: desktop host rebuilt");
-                return;
-            }
-        }
-        log("env-repair: host not seen in 15s (Explorer may still be starting)");
-    });
-}
-
-// ---------------- 环境自稳 watchdog(默认保证,非用户自救) ----------------
-// 运行期间持续体检(30s 节奏):宿主消失/栅栏持续无法归位/接管被破坏等
-// 异常**持续超过宽限期**(自愈已有充足时间修复瞬态)即自动重建桌面层。
-// 限额防风暴:两次重建至少间隔 10 分钟,每次运行最多 3 次,超限只记日志。
-static WATCHDOG_FAULT_SINCE_MS: AtomicU64 = AtomicU64::new(0);
-static WATCHDOG_LAST_RECOVERY_MS: AtomicU64 = AtomicU64::new(0);
-static WATCHDOG_RECOVERIES: AtomicU32 = AtomicU32::new(0);
-const WATCHDOG_GRACE_MS: u64 = 90_000;
-const WATCHDOG_MIN_INTERVAL_MS: u64 = 600_000;
-const WATCHDOG_MAX_RECOVERIES: u32 = 3;
-
-fn env_watchdog_tick() {
-    let (ok, report) = env_health_report();
-    let now = resize_now_ms();
-    if ok {
-        WATCHDOG_FAULT_SINCE_MS.store(0, Ordering::Relaxed);
-        return;
-    }
-    // 首次发现异常记起点;持续不足宽限期则等自愈工作
-    let since = {
-        let prev = WATCHDOG_FAULT_SINCE_MS.load(Ordering::Relaxed);
-        if prev == 0 {
-            WATCHDOG_FAULT_SINCE_MS.store(now, Ordering::Relaxed);
-            log(&format!(
-                "env-watchdog: fault started, waiting self-heal ({report})"
-            ));
-            now
-        } else {
-            prev
-        }
-    };
-    if now.saturating_sub(since) < WATCHDOG_GRACE_MS {
-        return;
-    }
-    let last = WATCHDOG_LAST_RECOVERY_MS.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < WATCHDOG_MIN_INTERVAL_MS {
-        return;
-    }
-    let count = WATCHDOG_RECOVERIES.load(Ordering::Relaxed);
-    if count >= WATCHDOG_MAX_RECOVERIES {
-        if count == WATCHDOG_MAX_RECOVERIES {
-            log("env-watchdog: recovery cap reached, logging only");
-            WATCHDOG_RECOVERIES.store(count + 1, Ordering::Relaxed);
-        }
-        return;
-    }
-    WATCHDOG_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-    WATCHDOG_LAST_RECOVERY_MS.store(now, Ordering::Relaxed);
-    WATCHDOG_FAULT_SINCE_MS.store(0, Ordering::Relaxed);
-    log(&format!(
-        "env-watchdog: sustained fault beyond grace, auto-rebuilding desktop band (recovery #{})",
-        count + 1
-    ));
-    env_repair_internal("watchdog");
 }
 
 /// 协调原生桌面图标可见性。任何栅栏宿主/呈现状态异常都优先恢复原生图标，
@@ -3500,6 +2040,10 @@ pub(crate) fn restore_desktop_icons() {
     model::clear_icons_marker();
 }
 
+/// # Safety
+/// 引导窗（拖拽残影/入场动画 overlay）的窗口过程，register_class 注册、
+/// 系统在 UI 线程同步回调；本实现不解引用消息参数，仅对销毁消息清理
+/// state 槽位，其余交 DefWindowProcW 透传（raw 参数按窗口过程契约有效）。
 unsafe extern "system" fn guide_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -3516,15 +2060,24 @@ unsafe extern "system" fn guide_wndproc(
             }
         }
     }
+    // SAFETY: 参数原样透传给默认过程，按 wndproc 契约有效；hwnd 是本类窗口。
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// # Safety
+/// 托盘窗口的窗口过程（register_class 注册，系统在 UI 线程同步回调）。
+/// hwnd 是本进程托盘窗口；体内 unsafe 操作只使用栈上参数（GetCursorPos
+/// 的栈 POINT、DefWindowProcW 透传 raw 消息参数）与本进程窗口句柄，
+/// 无跨调用指针。
 unsafe extern "system" fn tray_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // SAFETY(整块): 各分支按消息契约使用参数——TRAY_MSG 的坐标现取
+    // (栈 pt)、定时器 id 来自本进程 SetTimer、WM_CLOSE 走自家 quit_app；
+    // 未识别消息交 DefWindowProcW 透传。
     unsafe {
         if msg == taskbar_created_msg() {
             // Explorer rebuilt its taskbar and desktop host. Keep the native desktop
@@ -3587,6 +2140,12 @@ unsafe extern "system" fn tray_wndproc(
             apply_pending_scan();
             return LRESULT(0);
         }
+        if msg == crate::winids::WM_DL3_RESCAN {
+            // shell 动词(删除/移动等)在应用背后改了桌面:经消息异步请求重扫,
+            // shell 模块因此不反向依赖 ui(2026-09-17 断上行边)
+            rescan();
+            return LRESULT(0);
+        }
         if msg == WM_SETTINGCHANGE {
             rebuild_render_resources();
             invalidate_hosts_cache();
@@ -3627,7 +2186,7 @@ unsafe extern "system" fn tray_wndproc(
                 .map(|s| s.rename_edit.is_some() || s.file_rename_edit.is_some())
                 .unwrap_or(false);
             if !any_edit {
-                let _ = KillTimer(hwnd, TIMER_RENAME_WATCH);
+                let _ = KillTimer(Some(hwnd), TIMER_RENAME_WATCH);
             }
             return LRESULT(0);
         }
@@ -3641,6 +2200,11 @@ unsafe extern "system" fn tray_wndproc(
 }
 
 fn add_tray_icon(hwnd: HWND) {
+    // SAFETY: n 是 zeroed+手工填段的栈结构，cbSize 按契约填实际大小；
+    // szTip 为 zeroed 定长 128 数组,循环 take(127) 有界复制——终止由
+    // zeroed 的末项兜底保证(即使未来 tooltip 文本更长,截断后仍必 NUL
+    // 结尾);hWnd 是本进程托盘窗口,hIcon 是 deskfence_icon() 的进程
+    // 终身图标句柄。
     unsafe {
         let mut n: NOTIFYICONDATAW = std::mem::zeroed();
         n.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -3660,6 +2224,10 @@ fn add_tray_icon(hwnd: HWND) {
 }
 
 fn init_tray() {
+    // SAFETY(整块): 类名是 winids 的静态 NUL 宽串，hinstance 是本进程模块
+    // 实例；两个辅助窗 lpParam=None、创建失败返回 null（随后判空降级为
+    // 无托盘，不触空句柄）；ShowWindow/SetTimer 作用于刚创建的本进程窗口，
+    // 定时器回调 None=WM_TIMER 进 tray_wndproc（同线程分发）。
     unsafe {
         // 托盘宿主窗口:1x1、点击穿透的工具窗口。
         // 关键约束 1:必须"可见"才能被 SetForegroundWindow 前台化(隐藏窗口
@@ -3676,12 +2244,13 @@ fn init_tray() {
             GetSystemMetrics(SM_CYSCREEN) - 2,
             1,
             1,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
             None,
-        );
-        if hwnd.0 == 0 {
+            None,
+            Some(hinstance()),
+            None,
+        )
+        .unwrap_or_default();
+        if hwnd.0.is_null() {
             log("tray window create failed");
             return;
         }
@@ -3702,21 +2271,32 @@ fn init_tray() {
             GetSystemMetrics(SM_CYSCREEN) - 2,
             1,
             1,
-            HWND(0),
-            HMENU(0),
-            hinstance(),
             None,
-        );
-        if menu_host.0 != 0 {
+            None,
+            Some(hinstance()),
+            None,
+        )
+        .unwrap_or_default();
+        if !menu_host.0.is_null() {
             let _ = ShowWindow(menu_host, SW_SHOWNOACTIVATE);
             let _ = MENU_HOST_HWND.set(menu_host);
+        } else {
+            // 菜单前台化宿主建不出来:菜单仍能用(menu_host_or 回退栅栏窗口
+            // 做 owner),但前台化降级,僵尸菜单风险上升——值得留一行现场。
+            log("menu host window create failed; menus fall back to fence-owner foregrounding");
         }
         // 全局低频自愈定时器：窗口挂接/图标协调/主题跟随/文件刷新。
         // 目录变化由 watcher 置位，避免在拖动期间以 100ms 频率扫描和重挂窗口。
-        let _ = SetTimer(hwnd, TIMER_GLOBAL, 1000, None);
+        // 失败=整个秒级心跳停摆(自愈/协调全静默死亡),必须记日志。
+        if SetTimer(Some(hwnd), TIMER_GLOBAL, 1000, None) == 0 {
+            log("global tick timer create failed");
+        }
         // 桌面态快速自检:仅当走查判定 band_quiet(桌面态)时才做实事,
-        // 正常使用(带内有可见外来窗)空转,零成本。
-        let _ = SetTimer(hwnd, TIMER_DESKTOP_WATCH, 250, None);
+        // 正常使用(带内有可见外来窗)空转,零成本。失败=显示桌面恢复降级
+        // 为秒级走查,同样静默,记日志。
+        if SetTimer(Some(hwnd), TIMER_DESKTOP_WATCH, 250, None) == 0 {
+            log("desktop watch timer create failed");
+        }
         // 全局 z 序事件钩子:显示桌面等批量重排的毫秒级触发器(详见
         // zorder_event_cb 注释),高速自检走 WM_DL3_ZCHECK 合并投递。
         install_zorder_hooks();
@@ -3727,6 +2307,9 @@ fn init_tray() {
 pub fn run_message_loop() -> i32 {
     loop {
         let mut msg = MSG::default();
+        // SAFETY: msg 是栈上消息结构，GetMessageW 阻塞等待本线程队列
+        // （主线程=创建全部窗口的线程）；panel_message 只读 msg 快照；
+        // Translate/Dispatch 把同一栈副本交给系统，调用期间有效。
         unsafe {
             let r = GetMessageW(&mut msg, None, 0, 0);
             if r.0 == 0 {
@@ -3740,81 +2323,31 @@ pub fn run_message_loop() -> i32 {
             if crate::cats_panel::panel_message(&msg) {
                 continue;
             }
-            TranslateMessage(&msg);
+            let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
     0
 }
 
-// ---------------- 撤销 / 键盘微调 / 键盘钩子 ----------------
-
-static UNDO_STACK: OnceLock<Mutex<Vec<Vec<Fence>>>> = OnceLock::new();
-
-fn undo_stack() -> &'static Mutex<Vec<Vec<Fence>>> {
-    UNDO_STACK.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// 压入当前布局快照(布局类操作前调用,支持撤销)
-pub(crate) fn push_undo() {
-    let snap = state().lock().unwrap().fences.clone();
-    let mut u = undo_stack().lock().unwrap();
-    if u.last().map(|l| *l == snap).unwrap_or(false) {
-        return;
-    }
-    u.push(snap);
-    if u.len() > 20 {
-        u.remove(0);
-    }
-}
-
-/// 拖动/缩放前压入"拖动前"快照(拖动过程中矩形已被实时更新)。
-/// 调用方已持有 state 锁时传入其克隆的快照,避免同线程重复加锁死锁。
-pub(crate) fn push_undo_snapshot(mut snap: Vec<Fence>, fence_id: u32, rect: Rect) {
-    if let Some(f) = snap.iter_mut().find(|f| f.id == fence_id) {
-        f.rect = rect;
-    }
-    let mut u = undo_stack().lock().unwrap();
-    if u.last().map(|l| *l == snap).unwrap_or(false) {
-        return;
-    }
-    u.push(snap);
-    if u.len() > 20 {
-        u.remove(0);
-    }
-}
-
-pub(crate) fn undo_layout() {
-    let snap = undo_stack().lock().unwrap().pop();
-    if let Some(fences) = snap {
-        if fences.is_empty() {
-            log("ignored empty undo snapshot to prevent blank desktop");
-            return;
-        }
-        {
-            let mut s = state().lock().unwrap();
-            s.fences = fences;
-        }
-        // Snapshots are already valid layouts; do not "settle" them again or
-        // the restored positions cease to be the exact previous operation.
-        {
-            let s = state().lock().unwrap();
-            let _ = model::save_config(&s.fences);
-        }
-        show_all_fences();
-        log("layout undo applied");
-    }
-}
+// ---------------- 键盘微调 / 键盘钩子 ----------------
 
 /// 方向键微调栅栏位置(光标悬停在栅栏上时生效;Ctrl = 1px 微调,否则按图标网格步进)
-static LL_HOOK: OnceLock<HHOOK> = OnceLock::new();
+static LL_HOOK: SyncHandle<OnceLock<HHOOK>> = SyncHandle(OnceLock::new());
 
 fn fence_id_for_hwnd(hwnd: HWND) -> Option<u32> {
     let s = state().try_lock().ok()?;
     s.windows.iter().find(|(_, h)| **h == hwnd).map(|(k, _)| *k)
 }
 
+/// # Safety
+/// WH_KEYBOARD_LL 低级键盘钩子回调，系统在**安装钩子的线程**（主线程）
+/// 同步调用。ncode==HC_ACTION 时 lparam 指向系统所有的
+/// KBDLLHOOKSTRUCT，回调期间可读；实现只读它、经 PostMessageW 把业务
+/// 转交托盘窗口，不持有指针快速返回（低级钩子超时会被系统摘除）。
 unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY(整块): lparam 解引用依据钩子契约（见 fn 的 Safety 段）；
+    // 其余调用无指针参数；CallNextHookEx 原样传参保持钩子链。
     unsafe {
         if ncode as u32 == HC_ACTION {
             let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
@@ -3836,7 +2369,7 @@ unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: L
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let under = WindowFromPoint(pt);
-                    if under.0 != 0 {
+                    if !under.0.is_null() {
                         if let Some(id) = fence_id_for_hwnd(under) {
                             if let Some(&th) = TRAY_HWND.get() {
                                 let has_selection = state()
@@ -3845,7 +2378,7 @@ unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: L
                                     .unwrap_or(false);
                                 // 仅无选择时保留旧的方向键移动栅栏行为；选中图标后方向键导航。
                                 let _ = PostMessageW(
-                                    th,
+                                    Some(th),
                                     if is_arrow
                                         && !has_selection
                                         && (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000)
@@ -3887,11 +2420,16 @@ unsafe extern "system" fn ll_keyboard_proc(ncode: i32, wparam: WPARAM, lparam: L
 }
 
 fn install_keyboard_hook() {
+    // SAFETY: ll_keyboard_proc 是匹配 HOOKPROC ABI 的钩子函数；
+    // hinstance 是本进程模块（低级钩子要求回调在本进程内）；thread id 0
+    // =全局钩子（低级钩子在安装线程回调，即主线程的消息循环里）；
+    // 句柄存 OnceLock 单次安装，退出由 uninstall_keyboard_hook 摘除。
     unsafe {
         if LL_HOOK.get().is_none() {
-            if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), hinstance(), 0)
+            if let Ok(h) =
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_keyboard_proc), Some(hinstance()), 0)
             {
-                if h.0 != 0 {
+                if !h.0.is_null() {
                     let _ = LL_HOOK.set(h);
                 }
             }
@@ -3901,6 +2439,8 @@ fn install_keyboard_hook() {
 
 pub(crate) fn uninstall_keyboard_hook() {
     if let Some(h) = LL_HOOK.get() {
+        // SAFETY: h 是 SetWindowsHookExW 返回、存于 OnceLock 的合法句柄，
+        // 只在退出路径摘除一次。
         unsafe {
             let _ = UnhookWindowsHookEx(*h);
         }
@@ -3909,20 +2449,27 @@ pub(crate) fn uninstall_keyboard_hook() {
 
 // ---------------- 全局鼠标钩子(桌面空白点击清除选择态) ----------------
 
-static LL_MOUSE_HOOK: OnceLock<HHOOK> = OnceLock::new();
+static LL_MOUSE_HOOK: SyncHandle<OnceLock<HHOOK>> = SyncHandle(OnceLock::new());
 
 /// 栅栏窗口是 WS_EX_NOACTIVATE 的独立 HWND,点击桌面空白时事件直接进入
 /// Explorer 的 WorkerW/Progman,本程序收不到任何消息,于是被选中的图标
 /// 高亮会一直残留。用 WH_MOUSE_LL 监听左键按下:落点不在任何栅栏内且命中
 /// 桌面宿主窗口时,通知托盘窗口清除选择(与原生 Explorer 行为一致)。
+///
+/// # Safety
+/// WH_MOUSE_LL 低级鼠标钩子回调，系统在安装钩子的线程（主线程）同步
+/// 调用。ncode==HC_ACTION 时 lparam 指向系统所有的 MSLLHOOKSTRUCT，
+/// 回调期间可读；实现只读坐标并 PostMessage 给托盘窗口，快速返回。
 unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY(整块): lparam 解引用依据钩子契约（见 fn 的 Safety 段）；
+    // PostMessage 无指针参数；CallNextHookEx 原样传参保持钩子链。
     unsafe {
         if ncode as u32 == HC_ACTION && wparam.0 as u32 == WM_LBUTTONDOWN {
             crate::ui::mark_interaction();
             let mm = &*(lparam.0 as *const MSLLHOOKSTRUCT);
             if let Some(&tray) = TRAY_HWND.get() {
                 let _ = PostMessageW(
-                    tray,
+                    Some(tray),
                     WM_DL3_CLEAR_SEL,
                     WPARAM(mm.pt.x as usize),
                     LPARAM(mm.pt.y as isize),
@@ -3934,10 +2481,14 @@ unsafe extern "system" fn ll_mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPAR
 }
 
 fn install_mouse_hook() {
+    // SAFETY: ll_mouse_proc 是匹配 HOOKPROC ABI 的钩子函数；低级鼠标钩子
+    // 在安装线程回调（主线程）；句柄存 OnceLock 单次安装，退出由
+    // uninstall_mouse_hook 摘除。
     unsafe {
         if LL_MOUSE_HOOK.get().is_none() {
-            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), hinstance(), 0) {
-                if h.0 != 0 {
+            if let Ok(h) = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), Some(hinstance()), 0)
+            {
+                if !h.0.is_null() {
                     let _ = LL_MOUSE_HOOK.set(h);
                 }
             }
@@ -3947,6 +2498,8 @@ fn install_mouse_hook() {
 
 pub(crate) fn uninstall_mouse_hook() {
     if let Some(h) = LL_MOUSE_HOOK.get() {
+        // SAFETY: h 是 SetWindowsHookExW 返回、存于 OnceLock 的合法句柄，
+        // 只在退出路径摘除一次。
         unsafe {
             let _ = UnhookWindowsHookEx(*h);
         }
@@ -3966,15 +2519,18 @@ fn point_in_any_fence(s: &UiState, x: i32, y: i32) -> bool {
 
 /// 落点处是否为桌面宿主(WorkerW/Progman/桌面图标视图)
 fn point_on_desktop_host(x: i32, y: i32) -> bool {
+    // SAFETY: pt 是栈坐标；GetClassNameW 的 buf 是 64-u16 栈缓冲，API
+    // 至多写 buf.len() 项并返回实写长度（n 已 max(0) 防负数切片）；
+    // GetAncestor 只查询 z 链上的既有窗口，空根已判空回退原 hwnd。
     unsafe {
         let pt = POINT { x, y };
         let mut hwnd = WindowFromPoint(pt);
-        if hwnd.0 == 0 {
+        if hwnd.0.is_null() {
             return false;
         }
         // 命中的可能是桌面的 SysListView32 子窗口,取根窗口再判类名
         let root = GetAncestor(hwnd, GA_ROOT);
-        if root.0 != 0 {
+        if !root.0.is_null() {
             hwnd = root;
         }
         let mut buf = [0u16; 64];
@@ -4078,17 +2634,22 @@ pub(crate) fn set_all_hidden(hidden: bool) {
     }
 }
 
-static INTENTIONAL_HIDE: AtomicBool = AtomicBool::new(false);
-
 // ---------------- WndProc ----------------
 
+/// # Safety
+/// 栅栏窗口与菜单宿主窗口（复用本过程）的窗口过程，register_class 注册、
+/// 系统在 UI 线程同步回调。hwnd 是本进程创建的对应类窗口；GWLP_USERDATA
+/// 存 fence_id（0=无 id 窗口，如菜单宿主，走默认路径）。函数体内对
+/// lparam 的裸解引用按各消息契约成立：WM_WINDOWPOSCHANGING/CHANGED 的
+/// lparam 指向系统所有的 WINDOWPOS（窗口过程调用帧内可读写，改 flags 正是
+/// 该消息的预期用法）；WM_DPICHANGED 的 lparam 指向建议 RECT（可读）。
 unsafe extern "system" fn fence_wndproc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let fence_id = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32;
+    let fence_id = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u32;
     if matches!(
         msg,
         WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
@@ -4115,6 +2676,8 @@ unsafe extern "system" fn fence_wndproc(
                 .unwrap_or(false);
             let stale = !dragging && {
                 let mut real = POINT::default();
+                // SAFETY: real 是栈上输出指针，GetCursorPos/ScreenToClient
+                // 均在调用期间完成读写；hwnd 是本窗口。
                 unsafe {
                     let _ = GetCursorPos(&mut real);
                     let _ = ScreenToClient(hwnd, &mut real);
@@ -4140,8 +2703,9 @@ unsafe extern "system" fn fence_wndproc(
                 s.fence_hover_pending.remove(&fence_id);
                 s.fence_hover.insert(fence_id, false).unwrap_or(false)
             };
+            // SAFETY: hwnd 是本窗口；纯定时器调用，无指针参数。
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_HOVER);
+                let _ = KillTimer(Some(hwnd), TIMER_HOVER);
             }
             if was {
                 refresh_fence(fence_id);
@@ -4184,8 +2748,9 @@ unsafe extern "system" fn fence_wndproc(
         WM_TIMER => {
             if wparam.0 == TIMER_HOVER {
                 // 悬停延迟到期：提交 pending 悬停并重绘
+                // SAFETY: hwnd 是本窗口；纯定时器调用，无指针参数。
                 unsafe {
-                    let _ = KillTimer(hwnd, TIMER_HOVER);
+                    let _ = KillTimer(Some(hwnd), TIMER_HOVER);
                 }
                 let mut s = match state().try_lock() {
                     Ok(g) => g,
@@ -4226,6 +2791,8 @@ unsafe extern "system" fn fence_wndproc(
             let suggested = if lparam.0 == 0 {
                 None
             } else {
+                // SAFETY: WM_DPICHANGED 契约：lparam 非空时指向建议 RECT，
+                // 窗口过程调用帧内可读；仅读四个坐标标量。
                 let r = unsafe { *(lparam.0 as *const RECT) };
                 model::suggested_rect(r.left, r.top, r.right, r.bottom)
             };
@@ -4260,6 +2827,9 @@ unsafe extern "system" fn fence_wndproc(
                 s.metrics.insert(fence_id, new_metrics);
             }
             if let Some(rect) = target {
+                // SAFETY: hwnd 是本栅栏窗口；坐标来自系统建议+新 metrics
+                // 重算；SWP_NOZORDER|NOACTIVATE=纯移动缩放，不重排 z
+                // （owned 栅栏不得带动 owner，也不触发 z 守卫）。
                 let _ = unsafe {
                     SetWindowPos(
                         hwnd,
@@ -4297,6 +2867,9 @@ unsafe extern "system" fn fence_wndproc(
             // 回退：即使 WM_WINDOWPOSCHANGING 拦截失败，也兜底恢复
             if wparam.0 as u32 == SIZE_MINIMIZED {
                 let _z = z_scope(ZIntent::Restore);
+                // SAFETY: hwnd 是本窗口；z_scope(ZIntent::Restore) 声明
+                // 自家恢复操作；第二个 SetWindowPos 只做 NOZORDER 的
+                // 重新定位请求（清理最小化残留状态），无副作用参数。
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                     let _ = SetWindowPos(
@@ -4314,8 +2887,11 @@ unsafe extern "system" fn fence_wndproc(
         }
         WM_WINDOWPOSCHANGING => {
             // 调整 owned 栅栏不能带动 Explorer owner 的层级。
-            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0 {
-                let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+            if unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 0 {
+                // SAFETY: WM_WINDOWPOSCHANGING 契约：lparam 指向系统所有的
+                // WINDOWPOS，窗口过程内可写；置 SWP_NOOWNERZORDER 是该消息
+                // 的预期用法（阻止 owned 调整联动 owner）。
+                let wp = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
                 wp.flags |= SWP_NOOWNERZORDER;
             }
             // 阻止 Win+D / Win+M 对栅栏的摆布:栅栏常驻桌面,不参与窗口管理。
@@ -4325,7 +2901,9 @@ unsafe extern "system" fn fence_wndproc(
             // 的 z 无关紧要,却会被 IME 子系统周期性重排——否决它只会招来
             // 无限重试的对抗循环(2026-08-28 实测 0xf05d6 每 3-5s 一次)。
             if !INTENTIONAL_HIDE.load(Ordering::SeqCst) && !z_intent_active() {
-                let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+                // SAFETY: 同消息契约：WINDOWPOS 在窗口过程内可写，改 flags
+                // （否决外部隐藏/z 重排）是该消息的预期用法。
+                let wp = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
                 if (wp.flags.0 & SWP_HIDEWINDOW.0) != 0 && (wp.flags.0 & SWP_SHOWWINDOW.0) == 0 {
                     wp.flags.0 &= !SWP_HIDEWINDOW.0;
                     wp.flags.0 |= SWP_SHOWWINDOW.0;
@@ -4336,7 +2914,7 @@ unsafe extern "system" fn fence_wndproc(
                     wp.flags.0 |= SWP_NOZORDER.0;
                     log(&format!(
                         "z-guard: external z change vetoed h=0x{:x} after=0x{:x} flags=0x{:x}",
-                        hwnd.0, wp.hwndInsertAfter.0, wp.flags.0
+                        hwnd.0 as usize, wp.hwndInsertAfter.0 as usize, wp.flags.0
                     ));
                 }
             }
@@ -4351,14 +2929,16 @@ unsafe extern "system" fn fence_wndproc(
                 && !z_intent_active()
                 && unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } != 0
             {
-                let wp = &*(lparam.0 as *const WINDOWPOS);
+                // SAFETY: WM_WINDOWPOSCHANGED 契约：lparam 指向已应用的
+                // WINDOWPOS，窗口过程内只读；仅取字段做日志与判定。
+                let wp = unsafe { &*(lparam.0 as *const WINDOWPOS) };
                 log(&format!(
                     "z-guard: external pos-changed h=0x{:x} after=0x{:x} flags=0x{:x}",
-                    hwnd.0, wp.hwndInsertAfter.0, wp.flags.0
+                    hwnd.0 as usize, wp.hwndInsertAfter.0 as usize, wp.flags.0
                 ));
                 fence_reanchor_if_below_host(hwnd);
             }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_SYSCOMMAND => {
             if (wparam.0 & 0xFFF0) == SC_MINIMIZE as usize {
@@ -4383,6 +2963,8 @@ unsafe extern "system" fn fence_wndproc(
                 s.attached.remove(&fence_id);
                 s.fence_hover.remove(&fence_id);
             }
+            // SAFETY: hwnd 是本窗口；销毁前注销 OLE 拖放注册（注册与窗口
+            // 生命周期配对，create 时 register_drop_target 建立）。
             unsafe {
                 let _ = RevokeDragDrop(hwnd);
             }
@@ -4390,115 +2972,5 @@ unsafe extern "system" fn fence_wndproc(
         }
         _ => {}
     }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-// ---------------- 输入处理 ----------------
-
-/// 屏幕工作区（不含任务栏）
-pub(crate) fn work_area() -> (f32, f32, f32, f32) {
-    let mut r: RECT = unsafe { std::mem::zeroed() };
-    unsafe {
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut r as *mut RECT as *mut _),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-    }
-    (
-        r.left as f32,
-        r.top as f32,
-        (r.right - r.left) as f32,
-        (r.bottom - r.top) as f32,
-    )
-}
-
-/// 矩形所在显示器的工作区(多显示器:磁吸/含屏按各自屏幕进行)
-pub(crate) fn work_area_for_rect(r: &Rect) -> (f32, f32, f32, f32) {
-    unsafe {
-        let rc = RECT {
-            left: r.x.round() as i32,
-            top: r.y.round() as i32,
-            right: (r.x + r.w).round() as i32,
-            bottom: (r.y + r.h).round() as i32,
-        };
-        let mon = MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST);
-        let mut mi: MONITORINFO = std::mem::zeroed();
-        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut mi).as_bool() {
-            let w = mi.rcWork;
-            return (
-                w.left as f32,
-                w.top as f32,
-                (w.right - w.left) as f32,
-                (w.bottom - w.top) as f32,
-            );
-        }
-    }
-    work_area()
-}
-
-unsafe extern "system" fn enum_monitor_cb(
-    mon: HMONITOR,
-    _dc: HDC,
-    _rc: *mut RECT,
-    lparam: LPARAM,
-) -> BOOL {
-    let areas = &mut *(lparam.0 as *mut Vec<(f32, f32, f32, f32)>);
-    let mut mi: MONITORINFO = std::mem::zeroed();
-    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-    if GetMonitorInfoW(mon, &mut mi).as_bool() {
-        let w = mi.rcWork;
-        areas.push((
-            w.left as f32,
-            w.top as f32,
-            (w.right - w.left) as f32,
-            (w.bottom - w.top) as f32,
-        ));
-    }
-    BOOL(1)
-}
-
-/// 所有显示器的工作区(settle/含屏用)
-pub(crate) fn all_work_areas() -> Vec<(f32, f32, f32, f32)> {
-    let mut areas: Vec<(f32, f32, f32, f32)> = Vec::new();
-    unsafe {
-        let _ = EnumDisplayMonitors(
-            HDC::default(),
-            None,
-            Some(enum_monitor_cb),
-            LPARAM(&mut areas as *mut Vec<(f32, f32, f32, f32)> as isize),
-        );
-    }
-    if areas.is_empty() {
-        areas.push(work_area());
-    }
-    areas
-}
-
-#[cfg(test)]
-mod presentation_tests {
-    use super::fence_needs_presentation;
-
-    #[test]
-    fn healthy_surface_does_not_depend_on_z_attachment() {
-        assert!(!fence_needs_presentation(false, true, true));
-    }
-
-    #[test]
-    fn missing_presentation_or_surface_is_recovered() {
-        assert!(fence_needs_presentation(false, false, true));
-        assert!(fence_needs_presentation(false, true, false));
-        assert!(fence_needs_presentation(false, false, false));
-    }
-
-    #[test]
-    fn hidden_fences_are_not_represented() {
-        for presented in [false, true] {
-            for has_surface in [false, true] {
-                assert!(!fence_needs_presentation(true, presented, has_surface));
-            }
-        }
-    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
