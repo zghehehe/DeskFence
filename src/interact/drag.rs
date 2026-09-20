@@ -1834,6 +1834,9 @@ pub(crate) fn update_ghost_preview(s: &mut UiState, fence_id: u32, x: f32, y: f3
             s.trash_target = over_bin;
         }
         if over_bin {
+            // 悬停删除目标=不存在"插入位置"语义:撤掉指示线(update_ghost 随后
+            // 重绘 overlay 即时消失),同时断掉松手删除后残线的状态源。
+            s.insert_line = None;
             return false;
         }
     }
@@ -1960,6 +1963,11 @@ pub(crate) fn handle_lbuttonup(_hwnd: HWND, fence_id: u32, x: f32, y: f32) {
                     .map(|p| p.dragged_paths.clone())
                     .unwrap_or_default();
                 s.trash_target = false;
+                // 悬停回收站期间插入线被 update_ghost_preview 原样保留(删除目标
+                // 不是插入位):此分支必须一并清掉,否则末尾的 update_overlay 见
+                // insert_line 仍为 Some 会把残线常驻重绘在 topmost overlay 上,
+                // 永久浮在所有应用上方(2026-09-20 用户实踩)。
+                s.insert_line = None;
                 rollback_ghost_preview(&mut s);
                 s.marquee = None;
                 let hwnd = s
